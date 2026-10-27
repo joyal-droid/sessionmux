@@ -72,7 +72,7 @@ Sessionmux does this instead:
 
 | On the desktop: mini tray | On the desktop: panel open |
 | --- | --- |
-| ![A soft violet and blue wallpaper with the Sessionmux mini tray at the bottom right, showing the demo accounts Work, Personal and Client](docs/screenshots/desktop-tray.png) | ![The Sessionmux Accounts panel open beside the mini tray on a soft violet and blue wallpaper, showing the demo accounts Work, Personal and Client](docs/screenshots/desktop-panel.png) |
+| ![A desktop with a black and white wallpaper of soft sweeping ribbons and a taskbar at the bottom, the Sessionmux mini tray snapped to the right edge showing the demo accounts Work, Personal and Client](docs/screenshots/desktop-tray.png) | ![The same black and white desktop with the taskbar at the bottom and the Sessionmux Accounts panel open beside the mini tray, showing the demo accounts Work, Personal and Client](docs/screenshots/desktop-panel.png) |
 
 | Accounts | Sessions | Settings |
 | --- | --- | --- |

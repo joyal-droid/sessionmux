@@ -26,14 +26,17 @@
   pictures of Sessionmux on a clean desktop.
 
 .DESCRIPTION
-  The desktop is the soft gradient wallpaper alone: no taskbar, no icons, no other windows. The
-  demo-fixture captures from docs\screenshots are placed on it at their native size (never
-  scaled), so the app stays pixel-sharp, each with a soft shadow and a 1 px light inner border:
-    desktop-tray.png   the mini tray (bubble-tray.png) snapped to the right edge, with one chip
+  The desktop is New-Desktop from mockup-common.ps1: a black and white wallpaper with translucent
+  ribbons and a 48 px taskbar of plain vector glyphs along the bottom edge; no desktop icons and
+  no window but Sessionmux's own. The demo-fixture captures from docs\screenshots are placed on it
+  at their native size (never scaled), so the app stays pixel-sharp, each with a soft shadow and
+  a 1 px light inner border:
+    desktop-tray.png   the mini tray (bubble-tray.png) snapped to the right edge about a third of
+                       the way down, with one chip
     desktop-panel.png  the same scene with the Accounts panel (panel-accounts.png) open beside
-                       it, with one chip next to "Add account"
-  The work area ends 48 px above the bottom edge, where the taskbar would be. The drawing helpers
-  are in mockup-common.ps1. Regenerate after the captures change, from the repository root:
+                       it, with one chip level with the panel's tabs
+  The work area ends at the taskbar. The drawing helpers are in mockup-common.ps1. Regenerate
+  after the captures change, from the repository root:
 
     .\scripts\compress-png.ps1
     .\scripts\make-desktop-mockups.ps1
@@ -51,38 +54,32 @@ Add-Type -AssemblyName System.Drawing
 
 $W = 1600; $H = 1000
 $WorkBottom = $H - 48
-$Margin = 12          # distance of the mini tray from the screen edge and from the work area's end
+$Margin = 12          # distance of the mini tray from the right edge of the screen
 $PanelGap = 12        # gap between the mini tray and the panel
 $ChipGap = 24         # distance of a chip from the UI it describes
-$AddAccountRow = 0.946   # vertical centre of the "Add account" row, as a fraction of the panel height
-
-# The blobs sit away from the lower right, so the mini tray and the panel stand on the light base.
-$Blobs = @(
-    @{ X = 0.10; Y = 0.12; R = 0.50; Color = '#7C3AED'; Alpha = 0.58 },
-    @{ X = 0.55; Y = 1.00; R = 0.50; Color = '#2563EB'; Alpha = 0.50 },
-    @{ X = 0.92; Y = 0.10; R = 0.45; Color = '#C7D2FE'; Alpha = 0.95 },
-    @{ X = 0.95; Y = 0.80; R = 0.35; Color = '#EEF2FF'; Alpha = 0.90 }
-)
+$TrayRow = 0.40       # vertical centre of the mini tray, as a fraction of the work area height
+$TabsRow = 0.057      # vertical centre of the panel's tabs, as a fraction of the panel height
 
 $tray = Read-Image (Join-Path $Screenshots 'bubble-tray.png')
 $panel = Read-Image (Join-Path $Screenshots 'panel-accounts.png')
 $pill = Get-OpaqueBounds $tray
 $radius = Get-CaptureRadius $panel
 
-# Mini tray: the pill sits $Margin px from the right edge and from the end of the work area.
+# Mini tray: the pill sits $Margin px from the right edge, centred on $TrayRow.
 $trayX = $W - $Margin - $pill.Right
-$trayY = $WorkBottom - $Margin - $pill.Bottom
+$trayY = [int]($TrayRow * $WorkBottom - $pill.Y - $pill.Height / 2)
 $pillLeft = $trayX + $pill.X
 $pillTop = $trayY + $pill.Y
 $pillBottom = $trayY + $pill.Bottom
 # Panel: left of the pill with $PanelGap, centred on it and clamped into the work area, as the
-# app places it; here the clamp keeps its bottom level with the pill.
+# app places it.
 $panelX = $pillLeft - $PanelGap - $panel.Width
 $panelY = [int](($pillTop + $pillBottom) / 2 - $panel.Height / 2)
-if ($panelY + $panel.Height -gt $pillBottom) { $panelY = $pillBottom - $panel.Height }
-if ($panelY -lt $Margin) { throw 'the panel capture does not fit in the work area' }
+if ($panelY + $panel.Height -gt $WorkBottom) { $panelY = $WorkBottom - $panel.Height }
+if ($panelY -lt 0) { $panelY = 0 }
+if ($panelY + $panel.Height -gt $WorkBottom) { throw 'the panel capture does not fit in the work area' }
 
-$wallpaper = New-Wallpaper $W $H $Blobs
+$wallpaper = New-Desktop $W $H
 
 function Save-Mockup([string]$name, [bool]$withPanel) {
     $bmp = New-Object System.Drawing.Bitmap($wallpaper)
@@ -91,7 +88,7 @@ function Save-Mockup([string]$name, [bool]$withPanel) {
         Set-Quality $g
         if ($withPanel) {
             Draw-Window $g $panel $panelX $panelY $radius
-            [void](Draw-Chip $g 'Google and Apple sign-in' ($panelX - $ChipGap) ($panelY + $AddAccountRow * $panel.Height) -AlignRight)
+            [void](Draw-Chip $g 'Move Claude Code sessions' ($panelX - $ChipGap) ($panelY + $TabsRow * $panel.Height) -AlignRight)
         } else {
             [void](Draw-Chip $g 'Switch without logging out' ($pillLeft - $ChipGap) (($pillTop + $pillBottom) / 2) -AlignRight)
         }
