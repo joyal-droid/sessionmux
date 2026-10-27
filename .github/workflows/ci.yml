@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Weekly, so new RustSec advisories against an unchanged Cargo.lock are reported.
+  schedule:
+    - cron: '0 6 * * 1'
+
+# Every job only reads the repository; a job that needs more says so itself.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Updated by hand together with release.yml (Dependabot does not track it).
+  RUST_TOOLCHAIN: '1.99.1'
+
+# Every action is pinned to a full commit SHA; the comment names the release it belongs to.
+# Dependabot (.github/dependabot.yml) proposes updates to these pins.
+jobs:
+  fmt:
+    name: Format
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --component rustfmt
+          rustup default $env:RUST_TOOLCHAIN
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --component clippy
+          rustup default $env:RUST_TOOLCHAIN
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # rustsec/audit-check reports the advisories it finds as a check run.
+      checks: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        continue-on-error: false
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    name: Build, test and smoke
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal
+          rustup default $env:RUST_TOOLCHAIN
+
+      # Same flags as installer\build.ps1: no absolute path of the runner may end up in the exe,
+      # the PE timestamp is deterministic (/Brepro) and the build date is the commit date.
+      # Set before the cache step so the cache key follows the flags.
+      - name: Remap build paths and fix the build date
+        shell: pwsh
+        run: |
+          $userProfile = $env:USERPROFILE
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $userProfile '.cargo' }
+          $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $userProfile '.rustup' }
+          $pairs = @(@($userProfile, '/home'), @($cargoHome, '/cargo'), @($rustupHome, '/rustc'), @($env:GITHUB_WORKSPACE, '/src'))
+          $flags = @($pairs | ForEach-Object { "--remap-path-prefix=$([IO.Path]::GetFullPath($_[0]).TrimEnd('\'))=$($_[1])" })
+          $flags += '-Clink-arg=/DEBUG:NONE'
+          $flags += '-Clink-arg=/Brepro'
+          $value = $flags -join ' '
+          Write-Host "RUSTFLAGS: $value"
+          "RUSTFLAGS=$value" >> $env:GITHUB_ENV
+          $epoch = [long](git log -1 --format=%ct)
+          $date = [DateTimeOffset]::FromUnixTimeSeconds($epoch).UtcDateTime.ToString('yyyy-MM-dd')
+          Write-Host "SOURCE_DATE_EPOCH: $epoch, SESSIONMUX_BUILD_DATE: $date"
+          "SOURCE_DATE_EPOCH=$epoch" >> $env:GITHUB_ENV
+          "SESSIONMUX_BUILD_DATE=$date" >> $env:GITHUB_ENV
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Privacy scan
+        shell: pwsh
+        env:
+          # Extra words for the privacy scan that are kept out of the repository (optional secret).
+          SESSIONMUX_PRIVACY_TERMS: ${{ secrets.SESSIONMUX_PRIVACY_TERMS }}
+        run: |
+          & .\scripts\check-binary-privacy.ps1 target\release\Sessionmux.exe (Get-ChildItem docs -Recurse -Filter *.png).FullName
+          exit $LASTEXITCODE
+
+      - name: SHA-256 of Sessionmux.exe
+        shell: pwsh
+        run: (Get-FileHash -Algorithm SHA256 -LiteralPath target\release\Sessionmux.exe).Hash.ToLowerInvariant()
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Smoke
+        shell: pwsh
+        env:
+          SESSIONMUX_SMOKE_FIXTURE: '1'
+        run: |
+          # Sessionmux.exe is a GUI-subsystem exe: start it explicitly and wait for its exit code.
+          $p = Start-Process -FilePath 'target\release\Sessionmux.exe' -ArgumentList '--smoke' -NoNewWindow -PassThru
+          $null = $p.Handle
+          if (-not $p.WaitForExit(90000)) { $p.Kill(); Write-Error 'smoke run timed out'; exit 1 }
+          Write-Host "smoke exit code: $($p.ExitCode)"
+          exit $p.ExitCode
+
+      - name: Upload smoke captures
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: smoke-captures
+          path: smoke/*.png
+          if-no-files-found: warn

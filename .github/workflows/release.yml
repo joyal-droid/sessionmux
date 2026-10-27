@@ -1,0 +1,303 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+# Read-only by default. Only the publish job, which runs no build code, asks for more.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The Rust release used for published builds. Updated by hand (Dependabot does not track it);
+  # BUILDINFO.txt in every release records it together with the MSVC and NSIS versions.
+  RUST_TOOLCHAIN: '1.99.1'
+  # makensis version installed from Chocolatey; the build stops if a different one is found.
+  NSIS_VERSION: '3.10'
+
+# Every action is pinned to a full commit SHA; the comment names the release it belongs to.
+jobs:
+  checks:
+    name: Tag, tests and lints
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          # full history, so the tagged commit can be checked against main
+          fetch-depth: 0
+
+      - name: Check the tag against Cargo.toml
+        id: version
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $line = Select-String -Path Cargo.toml -Pattern '^\s*version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"' | Select-Object -First 1
+          $version = $line.Matches[0].Groups[1].Value
+          if ("v$version" -ne $env:TAG) {
+            Write-Error "tag $env:TAG does not match Cargo.toml version $version"
+            exit 1
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      # A release is built only from a commit that is already on main, that is, one that went
+      # through a pull request and CI.
+      - name: Check that the tagged commit is on main
+        shell: pwsh
+        run: |
+          $commit = git rev-parse "$env:GITHUB_SHA^{commit}"
+          git merge-base --is-ancestor $commit origin/main
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "the tagged commit $commit is not on main"
+            exit 1
+          }
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --component rustfmt --component clippy
+          rustup default $env:RUST_TOOLCHAIN
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # rustsec/audit-check reports the advisories it finds as a check run.
+      checks: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        continue-on-error: false
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Builds and packages with read-only access: this job runs every dependency's build script,
+  # so it holds no token that could publish, attest or write to the repository.
+  build:
+    name: Build installer
+    needs: [checks, audit]
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.checks.outputs.version }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal
+          rustup default $env:RUST_TOOLCHAIN
+
+      # Chocolatey checks the NSIS download against the checksum recorded in that package
+      # version; the version printed by makensis is checked as well.
+      - name: Install NSIS ${{ env.NSIS_VERSION }}
+        shell: pwsh
+        run: |
+          choco install nsis --version=$env:NSIS_VERSION -y --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $makensis = Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'
+          $found = (& $makensis /VERSION | Out-String).Trim()
+          if ($found -ne "v$env:NSIS_VERSION") {
+            Write-Error "expected makensis v$env:NSIS_VERSION, found '$found'"
+            exit 1
+          }
+
+      # build.ps1 sets the path-remapping and /Brepro RUSTFLAGS, takes SESSIONMUX_BUILD_DATE and
+      # SOURCE_DATE_EPOCH from the tagged commit and builds with --locked, so Sessionmux.exe can
+      # be rebuilt bit for bit.
+      - name: Build and package
+        shell: pwsh
+        env:
+          # Extra words for the privacy scan that are kept out of the repository (optional secret).
+          SESSIONMUX_PRIVACY_TERMS: ${{ secrets.SESSIONMUX_PRIVACY_TERMS }}
+        run: |
+          $makensis = Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'
+          & .\installer\build.ps1 -Makensis $makensis
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # The versions of the tools that produced Sessionmux.exe, needed to rebuild it later.
+      - name: Write BUILDINFO.txt
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $msvc = (Get-Content -LiteralPath (Join-Path $vs 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt') -TotalCount 1).Trim()
+          $makensis = Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'
+          $text = @(
+            "Sessionmux $env:VERSION",
+            "commit: $(git rev-parse HEAD)",
+            "SOURCE_DATE_EPOCH: $(git log -1 --format=%ct)",
+            '',
+            ((rustc -vV) -join "`n"),
+            ((cargo -V) -join "`n"),
+            "MSVC tools (link.exe): $msvc",
+            "NSIS: $((& $makensis /VERSION | Out-String).Trim())"
+          ) -join "`n"
+          Set-Content -LiteralPath dist\BUILDINFO.txt -Value $text -Encoding ascii
+          Get-Content dist\BUILDINFO.txt
+
+      # build.ps1 scans the exe, the staged files, the installer script and an uncompressed build
+      # of the installer itself; they are scanned once more here, with BUILDINFO.txt, so a release
+      # can never be published from an unchecked build.
+      - name: Privacy scan
+        shell: pwsh
+        env:
+          SESSIONMUX_PRIVACY_TERMS: ${{ secrets.SESSIONMUX_PRIVACY_TERMS }}
+        run: |
+          $name = "Sessionmux-Setup-$env:VERSION.exe"
+          & .\scripts\check-binary-privacy.ps1 "dist\$name" target\release\Sessionmux.exe dist\BUILDINFO.txt dist\stage installer\sessionmux.nsi
+          exit $LASTEXITCODE
+
+      # Sessionmux-Setup.exe is a byte-identical copy of the versioned installer under a fixed
+      # name, so releases/latest/download/Sessionmux-Setup.exe always serves the newest release.
+      # SHA256SUMS lists both installer names, the Sessionmux.exe it contains and BUILDINFO.txt.
+      # The exe is the file to compare after rebuilding the tag; the installer is not reproducible
+      # (NSIS stamps it).
+      - name: Write SHA256SUMS and release notes
+        shell: pwsh
+        run: |
+          $version = $env:VERSION
+          $name = "Sessionmux-Setup-$version.exe"
+          Copy-Item -LiteralPath "dist\$name" -Destination dist\Sessionmux-Setup.exe
+          $hash = { param($p) (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash.ToLowerInvariant() }
+          Set-Content -LiteralPath dist\SHA256SUMS -Encoding ascii -Value @(
+            "$(& $hash "dist\$name")  $name",
+            "$(& $hash dist\Sessionmux-Setup.exe)  Sessionmux-Setup.exe",
+            "$(& $hash target\release\Sessionmux.exe)  Sessionmux.exe",
+            "$(& $hash dist\BUILDINFO.txt)  BUILDINFO.txt"
+          )
+          Get-Content dist\SHA256SUMS
+          # Release notes: the download link first, then the matching section of CHANGELOG.md,
+          # then the hashes, the toolchain and how to verify, folded into a details block. The
+          # publish job replaces @ATTESTATION_URL@ with the attestation link.
+          $text = Get-Content -Raw CHANGELOG.md
+          $m = [regex]::Match($text, "(?ms)^## \[$([regex]::Escape($version))\][^\n]*\n(.*?)(?=^## \[|^\[[^\]]+\]:|\z)")
+          $notes = if ($m.Success) { $m.Groups[1].Value.Trim() } else { "Sessionmux $version" }
+          $dl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v$version/$name"
+          $latest = "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/Sessionmux-Setup.exe"
+          $kb = [math]::Round((Get-Item -LiteralPath "dist\$name").Length / 1KB)
+          $verify = @(
+            '## Download',
+            '',
+            "**[$name]($dl)** · $kb KB · Windows 10/11 x64 · installs for your user, no administrator rights",
+            '',
+            'Run the file. If Windows shows "Windows protected your PC", choose **More info**, then **Run anyway**: the build is not code-signed yet, and the section at the end shows how to check it instead.',
+            '',
+            "[Sessionmux-Setup.exe]($latest) is the same file under a name that always points at the newest release.",
+            '',
+            "## What's new in $version",
+            '',
+            $notes,
+            '',
+            '<details>',
+            '<summary><b>Verify this download</b> (SHA-256, build provenance, toolchain)</summary>',
+            '',
+            'SHA-256 (also in `SHA256SUMS`):',
+            '',
+            '```',
+            ((Get-Content -LiteralPath dist\SHA256SUMS) -join "`n"),
+            '```',
+            '',
+            'Build provenance (needs the GitHub CLI; the command accepts either file name):',
+            '',
+            '```',
+            "gh attestation verify $name --repo $env:GITHUB_REPOSITORY --signer-workflow $env:GITHUB_REPOSITORY/.github/workflows/release.yml --source-ref refs/tags/v$version",
+            '```',
+            '',
+            'Toolchain (also in `BUILDINFO.txt`):',
+            '',
+            '```',
+            ((Get-Content -LiteralPath dist\BUILDINFO.txt) -join "`n"),
+            '```',
+            '',
+            'To rebuild: check out this tag, run `installer\build.ps1` with the toolchain above and compare the SHA-256 of `target\release\Sessionmux.exe` with the value above.',
+            '',
+            'Build provenance attestation: @ATTESTATION_URL@',
+            '</details>'
+          ) -join "`n"
+          Set-Content -LiteralPath dist\notes.md -Value $verify -Encoding utf8
+
+      - name: Keep the release files for the publish job
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: release-files
+          path: |
+            dist/Sessionmux-Setup-${{ env.VERSION }}.exe
+            dist/Sessionmux-Setup.exe
+            dist/SHA256SUMS
+            dist/BUILDINFO.txt
+            dist/notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  # Attests and publishes the files built above. It checks out nothing and runs no build code.
+  publish:
+    name: Attest and create draft release
+    needs: [checks, build]
+    runs-on: ubuntu-latest
+    permissions:
+      # create the draft release and upload its files
+      contents: write
+      # OIDC token that binds the provenance attestation to this workflow run
+      id-token: write
+      # store the attestation in this repository
+      attestations: write
+    env:
+      VERSION: ${{ needs.checks.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: release-files
+          path: release
+
+      - name: Check the files against SHA256SUMS
+        working-directory: release
+        # Sessionmux.exe is inside the installer, not a separate file; the other lines, both
+        # installer names included, must match.
+        run: tr -d '\r' < SHA256SUMS | grep -v '  Sessionmux\.exe$' | sha256sum --check --strict
+
+      # No signing key exists: the attestation is signed with a short-lived certificate issued
+      # for this workflow run's OIDC identity, so it can only come from release.yml on a tag.
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release/Sessionmux-Setup-${{ env.VERSION }}.exe
+            release/Sessionmux-Setup.exe
+            release/SHA256SUMS
+            release/BUILDINFO.txt
+
+      # The attestation link replaces the placeholder at the end of the notes; \, | and & in the
+      # link are escaped so it is inserted as written.
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+        run: |
+          grep -q '@ATTESTATION_URL@' release/notes.md || { echo 'release/notes.md has no @ATTESTATION_URL@ placeholder' >&2; exit 1; }
+          url=$(printf '%s' "$ATTESTATION_URL" | sed 's/[\\|&]/\\&/g')
+          sed -i "s|@ATTESTATION_URL@|$url|" release/notes.md
+          gh release create "$TAG" \
+            "release/Sessionmux-Setup-$VERSION.exe" release/Sessionmux-Setup.exe \
+            release/SHA256SUMS release/BUILDINFO.txt \
+            --repo "$GITHUB_REPOSITORY" --title "Sessionmux $VERSION" --notes-file release/notes.md --draft

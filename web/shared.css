@@ -1,0 +1,255 @@
+/*
+ * Copyright (c) 2026 joyal-droid. SPDX-License-Identifier: CPAL-1.0
+ *
+ * The contents of this file are subject to the Common Public Attribution License Version 1.0
+ * (the "License"); you may not use this file except in compliance with the License. You may
+ * obtain a copy of the License in the LICENSE file at the root of this repository or at
+ * https://opensource.org/license/cpal-1-0. The License is based on the Mozilla Public License
+ * Version 1.1 but Sections 14 and 15 have been added to cover use of software over a computer
+ * network and provide for limited attribution for the Original Developer. In addition, Exhibit A
+ * has been modified to be consistent with Exhibit B.
+ *
+ * Software distributed under the License is distributed on an "AS IS" basis, WITHOUT WARRANTY OF
+ * ANY KIND, either express or implied. See the License for the specific language governing rights
+ * and limitations under the License.
+ *
+ * The Original Code is Sessionmux. The Initial Developer of the Original Code is joyal-droid. All
+ * portions of the code written by joyal-droid are Copyright (c) 2026 joyal-droid. All Rights Reserved.
+ * Contributor(s): see the git history of this repository.
+ *
+ * Attribution (Exhibit B of the License): "Powered by Sessionmux", Copyright (c) 2026 joyal-droid,
+ * https://github.com/joyal-droid/sessionmux and the Sessionmux mark must stay visible in the user
+ * interface of every copy and derivative; see docs/attribution.md.
+ */
+
+/*
+ * Sessionmux — shared design tokens ("Dark Glass", see docs/design.md).
+ * Imported by both the panel and the bubble. Keep this file to tokens and a
+ * minimal reset: both windows are transparent, so nothing here may paint a
+ * page background.
+ *
+ * Theme resolution:
+ *   - Dark is the default: no data-theme, or data-theme="dark".
+ *   - <html data-theme="light"> forces the frosted light theme.
+ *   - "system" (no data-theme attribute) follows the OS: it resolves to light
+ *     only when the OS prefers light.
+ */
+
+/* Theme-independent tokens. */
+:root {
+  /* Brand & status — dark values (flat, no gradients).
+     The light blocks below override them. *-text tokens are the tint used
+     for text on the matching *-soft fill (kept >= 4.5:1). */
+  --accent: #8a7cff;
+  --accent-hover: #9d91ff;
+  /* Filled primary buttons: deeper so white text reaches 4.6:1 on dark. */
+  --accent-strong: #6d5df5;
+  --accent-strong-hover: #5d4de6; /* darker on hover: white text stays >= 4.5:1 (5.7:1) */
+  --accent-fg: #fff;
+  --accent-soft: rgba(138, 124, 255, 0.16);
+  --accent-line: rgba(138, 124, 255, 0.55);
+  --accent-glow: 0 8px 24px rgba(138, 124, 255, 0.30);
+  --accent-text: #aba1ff;
+  --success: #34d399;
+  --success-soft: rgba(52, 211, 153, 0.16);
+  --success-text: #34d399;
+  --warn: #fbbf24;
+  --warn-soft: rgba(251, 191, 36, 0.16);
+  --warn-text: #fbbf24;
+  --danger: #f87171;
+  --danger-hover: #fca5a5;
+  --danger-soft: rgba(248, 113, 113, 0.16);
+
+  /* Shape */
+  --radius-xl: 20px;   /* panel */
+  --radius: 16px;      /* cards */
+  --radius-sm: 12px;   /* buttons, inputs, icon buttons */
+  --radius-xs: 8px;
+  --radius-pill: 999px;
+
+  /* 8 px spacing grid (4 px half-step for tight spots) */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 24px;
+  --s-6: 32px;
+
+  /* Type */
+  --font: "Segoe UI Variable Display", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Code", "Cascadia Mono", Consolas, monospace;
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs: 13px;
+  --fs-lg: 15px;
+
+  /* Motion */
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --dur-fast: 120ms;
+  --dur: 180ms;
+
+  /* Marks drawn on a colour fill (account avatars, toggle knob, swatches) */
+  --on-color: #fff;
+  --on-color-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --ring-avatar: 0 0 0 2px rgba(255, 255, 255, 0.10);
+  --ring-avatar-xs: 0 0 0 1.5px rgba(255, 255, 255, 0.10);
+  --inset-hairline: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+  --shadow-knob: 0 1px 4px rgba(0, 0, 0, 0.35);
+
+  /* Small elevation for selected pills and inverted buttons */
+  --shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.25);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.25);
+}
+
+/* Dark — the default. */
+:root[data-theme="dark"],
+:root:not([data-theme="light"]) {
+  color-scheme: dark;
+  --bg: rgba(16, 17, 20, 0.94);              /* panel glass */
+  --bg-solid: #101114;
+  --bg-float: rgba(29, 30, 35, 0.97);        /* menus, dialogs, toasts (opaque) */
+  --bg-elev: rgba(255, 255, 255, 0.045);     /* cards, menus */
+  --bg-elev-2: rgba(255, 255, 255, 0.075);   /* nested cards */
+  --bg-sunken: rgba(255, 255, 255, 0.035);   /* inputs, segmented tracks */
+  --bg-hover: rgba(255, 255, 255, 0.07);
+  --bg-active: rgba(255, 255, 255, 0.10);
+  --scrim: rgba(0, 0, 0, 0.55);
+  --fg: #ecedef;
+  --fg-muted: #9a9da6;                       /* ~6.4:1 on a card */
+  --fg-subtle: #737784;                      /* decorative / disabled only (~3.8:1) */
+  --fg-invert: #101114;                      /* text on white pills */
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
+  --edge-light: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --scroll-thumb: rgba(255, 255, 255, 0.14);
+  --shadow: 0 24px 60px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.35);
+  --shadow-pop: 0 14px 36px rgba(0, 0, 0, 0.6), 0 1px 3px rgba(0, 0, 0, 0.4);
+  --focus-ring: 0 0 0 2px var(--bg-solid), 0 0 0 4px rgba(138, 124, 255, 0.75);
+}
+
+/* Frosted light — forced by the user. */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: rgba(246, 246, 248, 0.94);
+  --bg-solid: #f6f6f8;
+  --bg-elev: rgba(255, 255, 255, 0.65);
+  --bg-elev-2: rgba(255, 255, 255, 0.9);
+  --bg-sunken: rgba(0, 0, 0, 0.04);
+  --bg-hover: rgba(0, 0, 0, 0.05);
+  --bg-active: rgba(0, 0, 0, 0.08);
+  --scrim: rgba(0, 0, 0, 0.3);
+  --fg: #141416;
+  --fg-muted: #5f5f66;
+  --fg-subtle: #75757e;
+  --fg-invert: #ffffff;
+  --border: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.16);
+  --edge-light: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  --scroll-thumb: rgba(0, 0, 0, 0.16);
+  --shadow: 0 24px 60px rgba(0, 0, 0, 0.18), 0 2px 8px rgba(0, 0, 0, 0.08);
+  --shadow-pop: 0 14px 36px rgba(0, 0, 0, 0.2), 0 1px 3px rgba(0, 0, 0, 0.1);
+  --accent: #6d5df5;
+  --accent-hover: #5d4de6;
+  --accent-strong: #6d5df5;
+  --accent-strong-hover: #5d4de6;
+  --accent-soft: rgba(109, 93, 245, 0.12);
+  --accent-line: rgba(109, 93, 245, 0.45);
+  --accent-glow: 0 8px 22px rgba(109, 93, 245, 0.22);
+  --accent-text: #5646d9;
+  --success: #0e9f6e;
+  --success-soft: rgba(14, 159, 110, 0.12);
+  --success-text: #0a6e4c;
+  --warn: #b7791f;
+  --warn-soft: rgba(183, 121, 31, 0.14);
+  --warn-text: #7a5000;
+  --danger: #dc2626;
+  --danger-hover: #b91c1c;
+  --danger-soft: rgba(220, 38, 38, 0.10);
+  --bg-float: rgba(255, 255, 255, 0.96);
+  --focus-ring: 0 0 0 2px var(--bg-solid), 0 0 0 4px rgba(109, 93, 245, 0.6);
+  --shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.12);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.14);
+}
+
+/* Frosted light — "system" theme (no data-theme) on an OS that prefers light.
+   (Duplicated on purpose: a media query cannot be merged into the rule above.) */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    color-scheme: light;
+    --bg: rgba(246, 246, 248, 0.94);
+    --bg-solid: #f6f6f8;
+    --bg-elev: rgba(255, 255, 255, 0.65);
+    --bg-elev-2: rgba(255, 255, 255, 0.9);
+    --bg-sunken: rgba(0, 0, 0, 0.04);
+    --bg-hover: rgba(0, 0, 0, 0.05);
+    --bg-active: rgba(0, 0, 0, 0.08);
+    --scrim: rgba(0, 0, 0, 0.3);
+    --fg: #141416;
+    --fg-muted: #5f5f66;
+    --fg-subtle: #75757e;
+    --fg-invert: #ffffff;
+    --border: rgba(0, 0, 0, 0.08);
+    --border-strong: rgba(0, 0, 0, 0.16);
+    --edge-light: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+    --scroll-thumb: rgba(0, 0, 0, 0.16);
+    --shadow: 0 24px 60px rgba(0, 0, 0, 0.18), 0 2px 8px rgba(0, 0, 0, 0.08);
+    --shadow-pop: 0 14px 36px rgba(0, 0, 0, 0.2), 0 1px 3px rgba(0, 0, 0, 0.1);
+    --accent: #6d5df5;
+    --accent-hover: #5d4de6;
+    --accent-strong: #6d5df5;
+    --accent-strong-hover: #5d4de6;
+    --accent-soft: rgba(109, 93, 245, 0.12);
+    --accent-line: rgba(109, 93, 245, 0.45);
+    --accent-glow: 0 8px 22px rgba(109, 93, 245, 0.22);
+    --accent-text: #5646d9;
+    --success: #0e9f6e;
+    --success-soft: rgba(14, 159, 110, 0.12);
+    --success-text: #0a6e4c;
+    --warn: #b7791f;
+    --warn-soft: rgba(183, 121, 31, 0.14);
+    --warn-text: #7a5000;
+    --danger: #dc2626;
+    --danger-hover: #b91c1c;
+    --danger-soft: rgba(220, 38, 38, 0.10);
+    --bg-float: rgba(255, 255, 255, 0.96);
+    --focus-ring: 0 0 0 2px var(--bg-solid), 0 0 0 4px rgba(109, 93, 245, 0.6);
+    --shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.12);
+    --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.14);
+  }
+}
+
+/* Minimal reset shared by every Sessionmux window. */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: transparent; /* windows are transparent; surfaces paint themselves */
+  font-family: var(--font);
+  font-size: var(--fs);
+  font-weight: 400;
+  line-height: 1.4;
+  color: var(--fg);
+  -webkit-font-smoothing: antialiased;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+}

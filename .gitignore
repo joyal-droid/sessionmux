@@ -1,0 +1,32 @@
+# Build output
+/target
+/dist
+*.rs.bk
+*.pdb
+
+# Smoke run (user data and captures; docs/screenshots/ holds the published ones)
+/smoke/userData
+/smoke/*.png
+
+# Logs
+*.log
+
+# Local cargo configuration (for example a custom target-dir)
+/.cargo/
+
+# Editors and OS files
+/.vs/
+/.vscode/
+/.idea/
+*.swp
+*.swo
+*~
+*.orig
+*.rej
+Thumbs.db
+ehthumbs.db
+desktop.ini
+.DS_Store
+
+# Private words for scripts/check-binary-privacy.ps1 (never published)
+/scripts/private-terms.txt

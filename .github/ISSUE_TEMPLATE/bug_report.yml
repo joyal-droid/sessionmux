@@ -1,0 +1,59 @@
+name: Bug report
+description: Something in Sessionmux does not work as described.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please do not include personal data (e-mail addresses, account ids,
+        real session titles) in the report. Security problems go through a private advisory
+        instead (see SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: Sessionmux version
+      description: Settings > About shows it, for example "1.0.0 · built 2026-10-26".
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 24H2
+    validations:
+      required: true
+  - type: dropdown
+    id: claude
+    attributes:
+      label: Claude Desktop install
+      options:
+        - Microsoft Store
+        - Direct installer
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the panel
+        2. ...
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Relevant lines from %APPDATA%\Sessionmux\sessionmux.log, with personal data removed.
+      render: text
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: Optional. Crop out anything personal.

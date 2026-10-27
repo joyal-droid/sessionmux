@@ -1,0 +1,147 @@
+<!--
+  Copyright (c) 2026 joyal-droid. SPDX-License-Identifier: CPAL-1.0
+
+  The contents of this file are subject to the Common Public Attribution License Version 1.0
+  (the "License"); you may not use this file except in compliance with the License. You may
+  obtain a copy of the License in the LICENSE file at the root of this repository or at
+  https://opensource.org/license/cpal-1-0. The License is based on the Mozilla Public License
+  Version 1.1 but Sections 14 and 15 have been added to cover use of software over a computer
+  network and provide for limited attribution for the Original Developer. In addition, Exhibit A
+  has been modified to be consistent with Exhibit B.
+
+  Software distributed under the License is distributed on an "AS IS" basis, WITHOUT WARRANTY OF
+  ANY KIND, either express or implied. See the License for the specific language governing rights
+  and limitations under the License.
+
+  The Original Code is Sessionmux. The Initial Developer of the Original Code is joyal-droid. All
+  portions of the code written by joyal-droid are Copyright (c) 2026 joyal-droid. All Rights Reserved.
+  Contributor(s): see the git history of this repository.
+
+  Attribution (Exhibit B of the License): "Powered by Sessionmux", Copyright (c) 2026 joyal-droid,
+  https://github.com/joyal-droid/sessionmux and the Sessionmux mark must stay visible in the user
+  interface of every copy and derivative; see docs/attribution.md.
+-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:">
+  <meta name="viewport" content="width=380, height=580, initial-scale=1">
+  <title>Sessionmux — switch between Claude Desktop accounts</title>
+  <link rel="stylesheet" href="shared.css">
+  <link rel="stylesheet" href="panel.css">
+</head>
+<body>
+  <div class="card" id="card">
+    <!-- Header: wordmark + tabs -->
+    <header class="header">
+      <div class="brand">
+        <svg class="brand__mark" viewBox="0 0 24 24" aria-hidden="true" style="box-shadow:none">
+          <defs>
+            <linearGradient id="mx-g1" x1="3.5" y1="3.5" x2="20.5" y2="20.5" gradientUnits="userSpaceOnUse">
+              <stop offset="0" stop-color="#7c3aed"/>
+              <stop offset="1" stop-color="#2563eb"/>
+            </linearGradient>
+          </defs>
+          <path fill="url(#mx-g1)" d="M7.2 3.5h6.9L8.9 20.5H7.2a3.7 3.7 0 0 1-3.7-3.7V7.2a3.7 3.7 0 0 1 3.7-3.7Z"/>
+          <path fill="url(#mx-g1)" d="M16.8 3.5a3.7 3.7 0 0 1 3.7 3.7v9.6a3.7 3.7 0 0 1-3.7 3.7h-6.3L15.7 3.5Z"/>
+        </svg>
+        <span class="brand__name">Sessionmux</span>
+      </div>
+      <nav class="tabs" role="tablist" aria-label="Sessionmux sections">
+        <button class="tab" role="tab" id="tab-accounts" data-tab="accounts" aria-controls="view-accounts" aria-selected="true" tabindex="0">Accounts</button>
+        <button class="tab" role="tab" id="tab-sessions" data-tab="sessions" aria-controls="view-sessions" aria-selected="false" tabindex="-1">Sessions<span class="tab__count" id="sessionsTabCount" aria-hidden="true" hidden></span></button>
+        <button class="tab" role="tab" id="tab-settings" data-tab="settings" aria-controls="view-settings" aria-selected="false" tabindex="-1">Settings</button>
+        <span class="tabs__indicator" id="tabIndicator" aria-hidden="true"></span>
+      </nav>
+    </header>
+
+    <!-- Accounts -->
+    <section class="view" id="view-accounts" role="tabpanel" aria-labelledby="tab-accounts" tabindex="-1">
+      <div class="scroll" id="accountsScroll">
+        <!-- Sign-in routing notice, filled by panel.js -->
+        <div class="signin-notice" id="signinNotice" role="status" hidden>
+          <span class="signin-notice__text" id="signinNoticeText"></span>
+          <button class="btn btn--sm btn--ghost signin-notice__btn" id="signinNoticeBtn" type="button">Cancel</button>
+        </div>
+        <ul class="acct-list" id="accountList" aria-label="Accounts" aria-busy="true">
+          <!-- Skeleton rows, replaced on first load -->
+          <li class="acct acct--skeleton" aria-hidden="true"><span class="sk sk--avatar"></span><span class="sk-lines"><span class="sk sk--line"></span><span class="sk sk--line sk--short"></span></span></li>
+          <li class="acct acct--skeleton" aria-hidden="true"><span class="sk sk--avatar"></span><span class="sk-lines"><span class="sk sk--line"></span><span class="sk sk--line sk--short"></span></span></li>
+          <li class="acct acct--skeleton" aria-hidden="true"><span class="sk sk--avatar"></span><span class="sk-lines"><span class="sk sk--line"></span><span class="sk sk--line sk--short"></span></span></li>
+        </ul>
+        <div id="addFormHost"></div>
+        <!-- Claude-* profile folders found on disk but not added (filled by panel.js) -->
+        <div class="group discovered" id="discoveredHost" role="region" aria-labelledby="discoveredTitle" hidden>
+          <h3 class="group__title" id="discoveredTitle">Found profile folders</h3>
+          <ul class="disc-list" id="discoveredList" aria-labelledby="discoveredTitle"></ul>
+        </div>
+      </div>
+      <footer class="footer">
+        <button class="btn btn--ghost" id="btnAdd" type="button" aria-expanded="false">
+          <span class="ico" data-icon="plus"></span>Add account
+        </button>
+        <button class="btn btn--invert" id="btnOpenAll" type="button">
+          <span class="ico" data-icon="layers"></span>Open all
+        </button>
+      </footer>
+    </section>
+
+    <!-- Sessions -->
+    <section class="view" id="view-sessions" role="tabpanel" aria-labelledby="tab-sessions" tabindex="-1" hidden>
+      <div class="sess-toolbar">
+        <div class="chips" id="sessionChips" role="radiogroup" aria-label="Source account"></div>
+        <div class="search">
+          <span class="ico search__icon" data-icon="search"></span>
+          <input class="search__input" id="sessionSearch" type="search" placeholder="Search by title or folder" aria-label="Search sessions" autocomplete="off" spellcheck="false">
+          <button class="icon-btn icon-btn--sm" id="btnRefreshSessions" type="button" aria-label="Refresh sessions" title="Refresh">
+            <span class="ico" data-icon="refresh"></span>
+          </button>
+        </div>
+      </div>
+      <div class="scroll" id="sessionsScroll">
+        <!-- Requests from Claude Code waiting for a decision, filled by panel.js -->
+        <div class="group approvals" id="approvalsHost" role="region" aria-labelledby="approvalsTitle" hidden>
+          <h3 class="group__title" id="approvalsTitle">Waiting for your approval</h3>
+          <ul class="appr-list" id="approvalList" aria-labelledby="approvalsTitle"></ul>
+        </div>
+        <ul class="sess-list" id="sessionList" aria-label="Sessions"></ul>
+      </div>
+    </section>
+
+    <!-- Settings -->
+    <section class="view" id="view-settings" role="tabpanel" aria-labelledby="tab-settings" tabindex="-1" hidden>
+      <div class="scroll" id="settingsScroll">
+        <div class="settings" id="settingsBody"></div>
+      </div>
+      <footer class="footer footer--settings">
+        <span class="version" id="versionLabel">Sessionmux</span>
+        <button class="btn btn--danger-ghost" id="btnQuit" type="button">
+          <span class="ico" data-icon="power"></span>Quit Sessionmux
+        </button>
+      </footer>
+    </section>
+
+    <!-- Floating layers -->
+    <div class="popover" id="popover" role="menu" hidden></div>
+    <div class="dialog-scrim" id="dialogScrim" hidden>
+      <div class="dialog" id="dialog" role="alertdialog" aria-modal="true" aria-labelledby="dialogTitle" aria-describedby="dialogBody">
+        <h2 class="dialog__title" id="dialogTitle"></h2>
+        <p class="dialog__body" id="dialogBody"></p>
+        <pre class="dialog__code" id="dialogCode" tabindex="0" hidden></pre>
+        <label class="check" id="dialogCheckWrap" hidden>
+          <input type="checkbox" id="dialogCheck">
+          <span class="check__box" aria-hidden="true"></span>
+          <span class="check__label" id="dialogCheckLabel"></span>
+        </label>
+        <div class="dialog__actions">
+          <button class="btn btn--ghost" id="dialogCancel" type="button">Cancel</button>
+          <button class="btn btn--primary btn--invert" id="dialogOk" type="button">OK</button>
+        </div>
+      </div>
+    </div>
+    <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+  </div>
+  <script src="panel.js"></script>
+</body>
+</html>

@@ -1,0 +1,33 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+
+PackageIdentifier: Sessionmux.Sessionmux
+PackageVersion: 1.0.0
+PackageLocale: en-US
+Publisher: Sessionmux
+Author: joyal-droid
+PublisherUrl: https://github.com/joyal-droid/sessionmux
+PublisherSupportUrl: https://github.com/joyal-droid/sessionmux/issues
+PackageName: Sessionmux
+PackageUrl: https://github.com/joyal-droid/sessionmux
+License: CPAL-1.0
+LicenseUrl: https://github.com/joyal-droid/sessionmux/blob/main/LICENSE
+Copyright: Copyright (c) 2026 joyal-droid
+ShortDescription: Switch between multiple Claude Desktop accounts and move your Code sessions with you.
+Description: |-
+  Sessionmux is a small native Windows app that runs several Claude Desktop accounts side by side,
+  switches between them from a floating button, a tray icon or a hotkey, moves or copies
+  Code-tab sessions between accounts (also while they are open), hands a session over when an
+  account hits its plan limit, and can show waiting permission requests for approval in its panel.
+  No telemetry and no network connections of its own.
+  Sessionmux is an independent, unofficial open-source project. It is not affiliated with, endorsed by
+  or sponsored by Anthropic, PBC. Claude is a trademark of Anthropic, PBC.
+Moniker: sessionmux
+Tags:
+  - claude
+  - accounts
+  - account-switcher
+  - profiles
+  - productivity
+ReleaseNotesUrl: https://github.com/joyal-droid/sessionmux/releases/tag/v1.0.0
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0
