@@ -448,18 +448,8 @@ fn now_secs() -> u64 {
 
 /// The machine's current offset from UTC in seconds (local = UTC + offset); 0 when unknown.
 fn local_offset_secs(now: u64) -> i64 {
-    use windows::Win32::Foundation::FILETIME;
-    use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
-    const EPOCH_DIFF_SECS: u64 = 11_644_473_600;
-    let ticks = (now + EPOCH_DIFF_SECS) * 10_000_000;
-    let utc = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
-    let mut local = FILETIME::default();
-    // SAFETY: both pointers refer to live FILETIME values for the duration of the call.
-    if unsafe { FileTimeToLocalFileTime(&utc, &mut local) }.is_err() {
-        return 0;
-    }
-    let local_ticks = (u64::from(local.dwHighDateTime) << 32) | u64::from(local.dwLowDateTime);
-    (local_ticks as i64 - ticks as i64) / 10_000_000
+    use crate::platform::{Misc, Os};
+    <Os as Misc>::local_offset_secs(now)
 }
 
 /// A small backtracking matcher for the patterns in [`RULES`]: literals, `.`-free character

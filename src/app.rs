@@ -29,7 +29,7 @@
 //!
 //! Re-entrancy rules (the reason for the shape of this file):
 //! - Every entry point (panel IPC, bubble events, poll results, worker results) is *posted* to
-//!   the UI thread through `ui_thread::post`, so it runs from the top-level message loop.
+//!   the UI thread through `platform::EventLoop::post`, so it runs from the top-level loop.
 //! - `Panel::create` pumps messages and `Tray::handle` runs a modal menu loop: neither is ever
 //!   called while `AppState` is borrowed. The tray lives in its own `Rc<RefCell<Tray>>` so
 //!   menu updates that arrive during the modal loop are applied afterwards (`tray_dirty`).
@@ -38,17 +38,24 @@
 //!
 //! Smoke mode (`SMOKE`): launch / focus / kill / MCP sync / start-with-Windows / shell opens are
 //! short-circuited; no hotkey, no tray icon, no poll thread, and the sign-in relay never touches
-//! the registry and never begins.
+//! the `claude://` handler and never begins.
 //!
 //! Sign-in routing: opening an extra account that is not signed in starts a
-//! `core::relay` 1.5 s after its window is up; `TIMER_SIGNIN` (every `relay::POLL_MS`) keeps our
+//! `core::relay` 1.5 s after its window is up; `TimerId::SignIn` (every `relay::POLL_MS`) keeps our
 //! `claude://` handler in place and ends the relay when the profile signs in, its Claude exits or
-//! the relay times out. IPC `getSignIn` / `cancelSignIn`, event `signin-changed`.
+//! the relay times out; a restore that waits for the user's answer keeps the timer until it
+//! settles. Every handler change (take, check, restore) runs on the relay worker, one at a time
+//! in the order asked, because it may wait for a system prompt; the UI thread only applies the
+//! results. Quitting restores the handler where changes ask nobody, and otherwise leaves the
+//! restore to the next start. A link the system hands to Sessionmux (`PlatformEvent::OpenUrl`)
+//! goes to the account signing in, else to Main. IPC `getSignIn` / `cancelSignIn` /
+//! `restoreLinkHandler`, event `signin-changed`; `removeChanges` takes out the hooks, the link
+//! handler and the login item.
 //!
 //! Tamper response (cosmetic, always on, no setting): a debugger attaching (checked 3 s after
 //! start, then every 5 s on the poll thread, once per attach), a forged task message on the
-//! message window, or a `--relay` launch whose command line shows argument injection
-//! (`WM_SESSIONMUX_GESTURE`) plays `ui::gesture` beside the bubble, each kind at most once per
+//! event loop, or a `--relay` launch whose command line shows argument injection (both arrive as
+//! `PlatformEvent::Gesture`) plays `ui::gesture` beside the bubble, each kind at most once per
 //! 10 s (the debugger kind has its own limiter), logged as `tamper: <reason>`. Never in smoke
 //! mode, never while exiting, never for a debugger in the first 3 s (`gesture::armed`).
 //!
@@ -66,7 +73,8 @@
 //! `installHooks` / `removeHooks`.
 //!
 //! Entry points used by main.rs: `init(hidden)`, `show_panel()`, `toggle_panel()`, `quit()`,
-//! `shutdown()`. smoke.rs uses the `smoke_*` helpers at the end.
+//! `shutdown()`. Everything the system reports reaches [`on_event`]. smoke.rs uses the `smoke_*`
+//! helpers at the end.
 
 use crate::brand;
 use crate::core::accounts::{Account, AccountsStore, ApiError, Discovered, Point, Settings};
@@ -78,13 +86,18 @@ use crate::core::relay::{self, Relay};
 use crate::core::sessions::{
     pick_handover_target, valid_session_id, AccountView, SessionAccount, Sessions, TransferResult,
 };
-use crate::ui::bubble::{Bubble, BubbleAccount, BubbleEvent, BubbleMode, BubbleState};
+use crate::platform::{
+    self, Autostart, BubbleHost, Closer, Debugger, Desktop, EventLoop, Focus, FocusResult, ForwardError, GestureHost,
+    HotkeyHost, Launcher, Misc, Os, PlatformEvent, PrivacyPane, Processes, Rect, Shell, TimerId, TrayHost, UrlHandler,
+    WindowId, Windows,
+};
+use crate::platform::{bubble::Bubble, tray::Tray};
+use crate::ui::bubble::{BubbleAccount, BubbleEvent, BubbleMode, BubbleState};
 use crate::ui::gesture::{self, Reason};
-use crate::ui::hotkey;
 use crate::ui::ipc::{IpcHandler, IpcRequest};
 use crate::ui::panel::Panel;
-use crate::ui::tray::{self, Tray, TrayEvent};
-use crate::util::{json as ujson, log, paths, ui_thread, win};
+use crate::ui::tray::{TrayEvent, TrayMenu};
+use crate::util::{json as ujson, log, paths};
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -93,14 +106,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime};
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::UI::Shell::ShellExecuteW;
-use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DestroyWindow, GetForegroundWindow, GetSystemMetrics, KillTimer, LoadImageW, PostQuitMessage,
-    SetTimer, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, SM_CXSMICON, SM_CYSMICON, SW_SHOWNORMAL, WM_CLOSE, WM_HOTKEY,
-    WM_TIMER,
-};
 
 /// Smoke mode: launch / focus / kill are short-circuited.
 pub static SMOKE: AtomicBool = AtomicBool::new(false);
@@ -109,8 +114,8 @@ static SMOKE_FIXTURE: AtomicBool = AtomicBool::new(false);
 /// Set once quit was requested (stops the poll thread).
 static QUITTING: AtomicBool = AtomicBool::new(false);
 
-/// Global hotkey id registered on the message window.
-pub const HOTKEY_ID: i32 = 1;
+/// Id of the global hotkey.
+pub const HOTKEY_ID: u32 = 1;
 
 const POLL_MS: u64 = 3000;
 /// First debugger check after start, then the interval between checks.
@@ -123,16 +128,13 @@ const PANEL_DESTROY_MS: u32 = 30_000;
 const TRAY_MAX_ACCOUNTS: usize = 3;
 const OPEN_ALL_STAGGER: Duration = Duration::from_millis(400);
 
-const TIMER_DESTROY_PANEL: usize = 101;
-const TIMER_PIN: usize = 102;
-const TIMER_STARTUP_TRIM: usize = 103;
-/// Sign-in relay poll, every `relay::POLL_MS` while a relay is active.
-const TIMER_SIGNIN: usize = 104;
 /// Claude registers its `claude://` handler at startup: begin the relay this long after the
 /// account's window is up, so our value is the one that stays.
 const SIGNIN_BEGIN_DELAY: Duration = Duration::from_millis(1500);
 /// A relay whose account was never seen running for this long ends ("process gone").
 const SIGNIN_NEVER_RUNNING: Duration = Duration::from_secs(30);
+/// Quitting waits this long for the relay worker to give the handler back.
+const EXIT_RESTORE_WAIT: Duration = Duration::from_secs(5);
 /// One-shot trim after startup: the first D2D render and the tray pull in system DLL pages
 /// (d2d1, D3D10Warp, shell32...) that sit in the working set until trimmed.
 const STARTUP_TRIM_MS: u32 = 2500;
@@ -238,7 +240,7 @@ struct HandoverMark {
 
 pub struct AppState {
     pub store: AccountsStore,
-    /// `claude://` sign-in relay; registry-free in smoke / overridden user data.
+    /// `claude://` sign-in relay; handler-free in smoke / overridden user data.
     relay: Relay,
     pub located: Option<Located>,
     pub sessions: Sessions,
@@ -249,7 +251,6 @@ pub struct AppState {
     /// Active account id (the foreground account, else the last one opened).
     pub last_active: Option<String>,
     pub pinned_until: Option<Instant>,
-    pub hwnd_msg: HWND,
 
     settings: Settings,
     procs: Vec<Proc>,
@@ -272,6 +273,14 @@ pub struct AppState {
     relay_started: Option<Instant>,
     /// Last `ensure()` error, so a persistent failure is logged once.
     relay_last_error: Option<String>,
+    /// The relay worker's queue (started on first use).
+    relay_jobs: Option<mpsc::Sender<RelayJob>>,
+    /// Relay jobs queued or running; the sign-in timer skips its check while one is.
+    relay_busy: u32,
+    /// The last link for the account signing in went to Main instead.
+    relay_forward_failed: bool,
+    /// It went there because the system did not allow Sessionmux to send it.
+    relay_automation_denied: bool,
     /// When this instance started (the debugger trigger ignores the first seconds).
     started: Instant,
     /// Forged-message and bad-link triggers acted on at most once per 10 s.
@@ -325,20 +334,101 @@ fn with_state<R>(f: impl FnOnce(&mut AppState) -> R) -> Option<R> {
     r
 }
 
-fn hwnd_from(h: isize) -> HWND {
-    HWND(h as _)
+/// Run `f` on the UI thread, from any thread.
+fn post(f: impl FnOnce() + Send + 'static) {
+    <Os as EventLoop>::post(Box::new(f));
+}
+
+fn set_timer(id: TimerId, ms: u32) {
+    <Os as EventLoop>::set_timer(id, ms);
+}
+
+fn kill_timer(id: TimerId) {
+    <Os as EventLoop>::kill_timer(id);
+}
+
+/// One unit of work for the relay worker.
+type RelayJob = Box<dyn FnOnce() + Send>;
+
+/// The relay worker: runs its jobs one at a time, in the order they were queued, until the queue
+/// is dropped.
+fn start_relay_worker() -> Option<mpsc::Sender<RelayJob>> {
+    let (tx, rx) = mpsc::channel::<RelayJob>();
+    let spawned = std::thread::Builder::new().name("sessionmux-relay".into()).spawn(move || {
+        for job in rx {
+            job();
+        }
+    });
+    match spawned {
+        Ok(_) => Some(tx),
+        Err(e) => {
+            log::error(&format!("could not start the relay worker: {e}"));
+            None
+        }
+    }
+}
+
+/// Queue `job` on the relay worker, starting it when needed. False when it could not be queued.
+fn queue_relay_job(st: &mut AppState, job: RelayJob) -> bool {
+    if st.relay_jobs.is_none() {
+        st.relay_jobs = start_relay_worker();
+    }
+    let Some(tx) = st.relay_jobs.as_ref() else { return false };
+    if tx.send(job).is_err() {
+        log::error("relay worker is gone; the handler change was dropped");
+        st.relay_jobs = None;
+        return false;
+    }
+    true
+}
+
+/// Run `work` on the relay worker, then `then` on the UI thread with the app state. Handler
+/// changes may wait for a system prompt, so they never run on the UI thread; one worker runs them
+/// in the order asked, so a sign-in's take, checks and restore never overlap.
+fn relay_job<T: Send + 'static>(
+    st: &mut AppState,
+    work: impl FnOnce(&Relay) -> T + Send + 'static,
+    then: impl FnOnce(&mut AppState, T) + Send + 'static,
+) {
+    let rl = st.relay.clone();
+    let job: RelayJob = Box::new(move || {
+        let r = work(&rl);
+        post(move || {
+            with_state(|st| {
+                st.relay_busy = st.relay_busy.saturating_sub(1);
+                then(st, r);
+            });
+        });
+    });
+    if queue_relay_job(st, job) {
+        st.relay_busy += 1;
+    }
+}
+
+/// Run `work` on the relay worker after the jobs already queued and wait up to `limit` for its
+/// result. Only for quitting, where nothing else would apply the result. None when it did not
+/// finish in time.
+fn relay_job_wait<T: Send + 'static>(
+    st: &mut AppState,
+    work: impl FnOnce(&Relay) -> T + Send + 'static,
+    limit: Duration,
+) -> Option<T> {
+    let (tx, rx) = mpsc::sync_channel(1);
+    let rl = st.relay.clone();
+    let job: RelayJob = Box::new(move || {
+        let _ = tx.send(work(&rl));
+    });
+    if !queue_relay_job(st, job) {
+        return None;
+    }
+    rx.recv_timeout(limit).ok()
 }
 
 /// Run `work` on a worker thread, then `then(result)` on the UI thread.
-fn spawn_then<T: Send + 'static>(
-    hwnd_msg: HWND,
-    work: impl FnOnce() -> T + Send + 'static,
-    then: impl FnOnce(T) + Send + 'static,
-) {
-    let h = hwnd_msg.0 as isize;
+fn spawn_then<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static, then: impl FnOnce(T) + Send + 'static) {
     let spawned = std::thread::Builder::new().name("sessionmux-job".into()).spawn(move || {
         let r = work();
-        ui_thread::post(hwnd_from(h), Box::new(move || then(r)));
+        post(move || then(r));
     });
     if let Err(e) = spawned {
         log::error(&format!("could not start a worker thread: {e}"));
@@ -348,14 +438,11 @@ fn spawn_then<T: Send + 'static>(
 // ------------------------------------------------------------------ IPC plumbing
 
 /// Forwards panel requests to the UI thread's app state.
-struct AppIpc {
-    /// Message window as an integer so the handler is Send + Sync.
-    hwnd_msg: isize,
-}
+struct AppIpc;
 
 impl IpcHandler for AppIpc {
     fn handle(&self, req: IpcRequest) {
-        ui_thread::post(hwnd_from(self.hwnd_msg), Box::new(move || handle_ipc(req)));
+        post(move || handle_ipc(req));
     }
 }
 
@@ -548,6 +635,9 @@ fn dispatch(req: &IpcRequest) -> Option<Value> {
         "installHooks" => install_hooks(id),
         "removeHooks" => remove_hooks(id),
         "getSignIn" => return Some(with_state(|st| sign_in_payload(st)).unwrap_or_else(|| json!({ "active": false }))),
+        "restoreLinkHandler" => restore_link_handler(id),
+        "removeChanges" => remove_changes(id),
+        "openSystemSettings" => open_system_settings(&a0).map(Some),
         "cancelSignIn" => {
             return Some(
                 with_state(|st| {
@@ -750,8 +840,6 @@ struct OpenPlan {
     dir: Option<String>,
     /// Begin a sign-in relay once the window is up.
     route: bool,
-    /// Message window (as an integer, Send) for posting the relay begin.
-    hwnd_msg: isize,
 }
 
 /// UI-side preparation for opening `acc` (validation; mkdir + MCP sync when it will launch).
@@ -772,14 +860,7 @@ fn prepare_open(st: &AppState, acc: &Account) -> UResult<OpenPlan> {
         }
     }
     let route = wants_sign_in_route(st, acc, dir.as_deref());
-    Ok(OpenPlan {
-        id: acc.id.clone(),
-        name: acc.name.clone(),
-        is_main: acc.is_main,
-        dir,
-        route,
-        hwnd_msg: st.hwnd_msg.0 as isize,
-    })
+    Ok(OpenPlan { id: acc.id.clone(), name: acc.name.clone(), is_main: acc.is_main, dir, route })
 }
 
 /// Worker: focus the running window, or launch the account.
@@ -795,11 +876,22 @@ fn open_worker(plan: &OpenPlan, located: Option<Located>, focus: bool, wake: &Op
         if let Some(w) = running.iter().find(|p| p.hwnd != 0) {
             if is_smoke() {
                 log::info("smoke: blocked claude_app::focus");
-            } else if claude_app::focus(w.pid) {
-                if plan.route {
-                    schedule_sign_in(plan, None);
+            } else {
+                match <Os as Focus>::focus(w.pid) {
+                    FocusResult::Focused => {
+                        if plan.route {
+                            schedule_sign_in(plan, None);
+                        }
+                        return ok();
+                    }
+                    FocusResult::NeedsHandOff => {}
+                    // No hand-off can show it either: the page explains what the user can do.
+                    FocusResult::Failed => {
+                        let mut v = fail(&format!("Could not bring {}'s Claude window to the front.", plan.name));
+                        v["reason"] = json!("focus-failed");
+                        return v;
+                    }
                 }
-                return ok();
             }
         }
         // Running but hidden in the tray (hwnd 0) or focus refused: launching again hands off
@@ -813,12 +905,12 @@ fn open_worker(plan: &OpenPlan, located: Option<Located>, focus: bool, wake: &Op
         return fail("Claude Desktop was not found on this PC.");
     };
     let r = if plan.is_main {
-        claude_app::launch_main(&loc)
+        <Os as Launcher>::launch_main(&loc).map(|_| ())
     } else {
         match plan.dir.as_deref() {
             Some(d) => {
                 let _ = std::fs::create_dir_all(d);
-                claude_app::launch(&loc, d).map(|_| ())
+                <Os as Launcher>::launch(&loc, d).map(|_| ())
             }
             None => Err(String::new()),
         }
@@ -831,13 +923,13 @@ fn open_worker(plan: &OpenPlan, located: Option<Located>, focus: bool, wake: &Op
     if focus {
         let dir = plan.dir.clone();
         let id = plan.id.clone();
-        let route = plan.route.then(|| (plan.id.clone(), plan.hwnd_msg));
+        let route = plan.route.then(|| plan.id.clone());
         let _ = std::thread::Builder::new().name("sessionmux-focus".into()).spawn(move || {
             if claude_app::wait_and_focus(dir.as_deref(), FOCUS_WAIT_MS).is_none() {
                 log::warn(&format!("waitAndFocus {id}: no window within {} s", FOCUS_WAIT_MS / 1000));
-            } else if let Some((acc_id, h)) = route {
+            } else if let Some(acc_id) = route {
                 std::thread::sleep(SIGNIN_BEGIN_DELAY);
-                ui_thread::post(hwnd_from(h), Box::new(move || begin_sign_in(&acc_id)));
+                post(move || begin_sign_in(&acc_id));
             }
         });
     } else if plan.route {
@@ -869,14 +961,14 @@ fn request_poll(st: &mut AppState) {
 }
 
 fn open_account(id: u64, acc_id: &Value, focus: bool) -> UResult<()> {
-    let (plan, located, wake, hwnd) = state_call_raw(|st| {
+    let (plan, located, wake) = state_call_raw(|st| {
         let acc = find_account(st, acc_id)?;
         st.last_opened = Some(acc.id.clone());
         set_active(st, Some(&acc.id));
         let plan = prepare_open(st, &acc)?;
-        Ok((plan, st.located.clone(), st.poll_wake.clone(), st.hwnd_msg))
+        Ok((plan, st.located.clone(), st.poll_wake.clone()))
     })?;
-    spawn_then(hwnd, move || open_worker(&plan, located, focus, &wake), move |v| resolve(id, v));
+    spawn_then(move || open_worker(&plan, located, focus, &wake), move |v| resolve(id, v));
     Ok(())
 }
 
@@ -885,7 +977,7 @@ fn state_call_raw<T>(f: impl FnOnce(&mut AppState) -> UResult<T>) -> UResult<T> 
 }
 
 fn open_all(id: u64) -> UResult<()> {
-    let (plans, located, wake, hwnd) = state_call_raw(|st| {
+    let (plans, located, wake) = state_call_raw(|st| {
         let mut plans = Vec::new();
         for a in fresh_accounts(st).iter().filter(|a| !a.running) {
             match prepare_open(st, a) {
@@ -901,10 +993,9 @@ fn open_all(id: u64) -> UResult<()> {
                 set_active(st, Some(&last));
             }
         }
-        Ok((plans, st.located.clone(), st.poll_wake.clone(), st.hwnd_msg))
+        Ok((plans, st.located.clone(), st.poll_wake.clone()))
     })?;
     spawn_then(
-        hwnd,
         move || {
             for p in &plans {
                 let r = open_worker(p, located.clone(), false, &wake);
@@ -921,9 +1012,8 @@ fn open_all(id: u64) -> UResult<()> {
 }
 
 fn close_account(id: u64, acc_id: &Value) -> UResult<()> {
-    let (acc, wake, hwnd) = state_call_raw(|st| Ok((find_account(st, acc_id)?, st.poll_wake.clone(), st.hwnd_msg)))?;
+    let (acc, wake) = state_call_raw(|st| Ok((find_account(st, acc_id)?, st.poll_wake.clone())))?;
     spawn_then(
-        hwnd,
         move || {
             let dir = proc_dir(&acc);
             let pids: Vec<u32> = claude_app::list_processes()
@@ -938,7 +1028,7 @@ fn close_account(id: u64, acc_id: &Value) -> UResult<()> {
                 log::info("smoke: blocked claude_app::kill");
                 Err("smoke".to_string())
             } else {
-                claude_app::kill(&pids)
+                <Os as Closer>::close(&pids)
             };
             poll_later(wake, Duration::from_millis(1000));
             match r {
@@ -967,15 +1057,11 @@ fn add_account(st: &mut AppState, opts: &Value) -> UResult<Value> {
     let account = fresh_accounts(st).into_iter().find(|a| a.id == rec.id);
     // Open it right away (the user signs in there); failures are only logged.
     let new_id = Value::String(rec.id.clone());
-    let hwnd = st.hwnd_msg;
-    ui_thread::post(
-        hwnd,
-        Box::new(move || {
-            if let Err(e) = open_account(0, &new_id, true) {
-                log::warn(&format!("open after add failed: {e}"));
-            }
-        }),
-    );
+    post(move || {
+        if let Err(e) = open_account(0, &new_id, true) {
+            log::warn(&format!("open after add failed: {e}"));
+        }
+    });
     Ok(json!({ "ok": true, "account": account }))
 }
 
@@ -996,16 +1082,15 @@ fn rename_account(st: &mut AppState, id: &Value, patch: &Value) -> UResult<Value
 
 fn remove_account(id: u64, acc_id: &Value, opts: &Value) -> UResult<()> {
     let delete_data = opts.get("deleteData") == Some(&Value::Bool(true));
-    let (acc, hwnd) = state_call_raw(|st| {
+    let acc = state_call_raw(|st| {
         let acc = find_account(st, acc_id)?;
         if acc.is_main || acc.id == "main" || acc.data_dir.is_none() {
             return Err("The Main account cannot be removed.".into());
         }
-        Ok((acc, st.hwnd_msg))
+        Ok(acc)
     })?;
     let acc_id = acc.id.clone();
     spawn_then(
-        hwnd,
         move || {
             // Close the account's Claude first; the store refuses to delete a folder in use.
             let dir = proc_dir(&acc);
@@ -1017,12 +1102,12 @@ fn remove_account(id: u64, acc_id: &Value, opts: &Value) -> UResult<()> {
             if !pids.is_empty() {
                 if is_smoke() {
                     log::info("smoke: blocked claude_app::kill");
-                } else if let Err(e) = claude_app::kill(&pids) {
+                } else if let Err(e) = <Os as Closer>::close(&pids) {
                     log::warn(&format!("removeAccount {}: {e}", acc.id));
                 }
             }
             match (delete_data, dir.as_deref()) {
-                (true, Some(d)) => claude_app::processes_under(d),
+                (true, Some(d)) => <Os as Processes>::processes_under(d),
                 _ => Vec::new(),
             }
         },
@@ -1127,7 +1212,7 @@ fn wants_sign_in_route(st: &AppState, acc: &Account, dir: Option<&str>) -> bool 
 /// `wait_for`: Some(dir) = first wait (without focusing) for a window of that profile;
 /// None = the window is already up.
 fn schedule_sign_in(plan: &OpenPlan, wait_for: Option<Option<String>>) {
-    let (acc_id, h) = (plan.id.clone(), plan.hwnd_msg);
+    let acc_id = plan.id.clone();
     let _ = std::thread::Builder::new().name("sessionmux-signin".into()).spawn(move || {
         if let Some(dir) = wait_for {
             let deadline = Instant::now() + Duration::from_millis(FOCUS_WAIT_MS);
@@ -1146,7 +1231,7 @@ fn schedule_sign_in(plan: &OpenPlan, wait_for: Option<Option<String>>) {
             }
         }
         std::thread::sleep(SIGNIN_BEGIN_DELAY);
-        ui_thread::post(hwnd_from(h), Box::new(move || begin_sign_in(&acc_id)));
+        post(move || begin_sign_in(&acc_id));
     });
 }
 
@@ -1162,14 +1247,40 @@ fn profile_signed_in(data_dir: &str) -> bool {
     }
 }
 
-/// `getSignIn` shape: `{active, accountId, accountName, since}` or `{active:false}`.
+/// `getSignIn` shape: `{active, accountId, accountName, since, handlerPending, handlerDeclined}` or
+/// `{active:false}`, both with `restoreDeclined` (the user kept Sessionmux as the handler after a
+/// sign-in; "Give sign-in links back to Claude" undoes it) and `needsConsent` (each handler change
+/// asks the user, so routing is opt-in). While active, `forwardFailed` (the last link went to Main
+/// instead) and `automationDenied` (because the system did not allow sending it) appear when true.
 fn sign_in_payload(st: &AppState) -> Value {
-    match st.relay.state().filter(|s| s.active) {
+    let state = st.relay.state();
+    let mut v = match state.as_ref().filter(|s| s.active) {
         Some(s) => {
-            json!({ "active": true, "accountId": s.account_id, "accountName": s.account_name, "since": s.since })
+            let mut v = json!({
+                "active": true,
+                "accountId": s.account_id,
+                "accountName": s.account_name,
+                "since": s.since,
+                "handlerPending": s.handler_pending,
+                "handlerDeclined": s.handler_declined,
+            });
+            if let Some(o) = v.as_object_mut() {
+                if st.relay_forward_failed {
+                    o.insert("forwardFailed".into(), json!(true));
+                }
+                if st.relay_automation_denied {
+                    o.insert("automationDenied".into(), json!(true));
+                }
+            }
+            v
         }
         None => json!({ "active": false }),
+    };
+    if let Some(o) = v.as_object_mut() {
+        o.insert("restoreDeclined".into(), json!(state.is_some_and(|s| !s.active && s.restore_declined)));
+        o.insert("needsConsent".into(), json!(<Os as UrlHandler>::changes_need_consent()));
     }
+    v
 }
 
 /// Emit `signin-changed`; `ended` (signedIn | timeout | closed | cancelled | disabled | quit) and
@@ -1198,57 +1309,132 @@ fn begin_sign_in(acc_id: &str) {
         if profile_signed_in(&dir) {
             return;
         }
-        if let Some(cur) = st.relay.state().filter(|s| s.active && s.account_id != acc.id) {
-            log::info(&format!("relay: {} replaces {} as the account signing in", acc.name, cur.account_name));
-            if let Err(e) = st.relay.end() {
-                log::warn(&format!("relay end (replace): {e}"));
+        let (id, name, running) = (acc.id.clone(), acc.name.clone(), acc.running);
+        let work = move |rl: &Relay| {
+            if let Some(cur) = rl.state().filter(|s| s.active && s.account_id != id) {
+                log::info(&format!("relay: {name} replaces {} as the account signing in", cur.account_name));
+                if let Err(e) = rl.end() {
+                    log::warn(&format!("relay end (replace): {e}"));
+                }
             }
-        }
-        match st.relay.begin(&acc.id, &acc.name, &dir) {
+            rl.begin(&id, &name, &dir).map_err(|e| format!("relay begin {id}: {e}"))
+        };
+        relay_job(st, work, move |st, r| match r {
             Ok(_) => {
-                st.relay_seen_running = acc.running;
+                st.relay_seen_running = running;
                 st.relay_started = Some(Instant::now());
                 st.relay_last_error = None;
-                set_timer(st.hwnd_msg, TIMER_SIGNIN, relay::POLL_MS as u32);
+                st.relay_forward_failed = false;
+                st.relay_automation_denied = false;
+                if !st.settings.sign_in_routing {
+                    // Turned off while the handler was being taken.
+                    end_sign_in(st, "disabled");
+                    return;
+                }
+                set_timer(TimerId::SignIn, relay::POLL_MS as u32);
                 push_sign_in(st, None);
             }
-            Err(e) => log::warn(&format!("relay begin {}: {e}", acc.id)),
-        }
+            Err(e) => log::warn(&e),
+        });
     });
 }
 
-/// End the active relay (restores the handler, deletes relay.json) and tell the page why.
+/// End the active relay (the relay worker restores the handler and deletes relay.json) and tell
+/// the page why once it is done.
 fn end_sign_in(st: &mut AppState, reason: &str) {
-    kill_timer(st.hwnd_msg, TIMER_SIGNIN);
+    kill_timer(TimerId::SignIn);
     st.relay_seen_running = false;
     st.relay_started = None;
     st.relay_last_error = None;
-    let Some(s) = st.relay.state() else {
+    st.relay_forward_failed = false;
+    st.relay_automation_denied = false;
+    if st.relay.state().is_none() {
         push_sign_in(st, None);
         return;
-    };
-    if let Err(e) = st.relay.end() {
-        log::warn(&format!("relay end ({reason}): {e}"));
     }
-    log::info(&format!("relay: sign-in for {} ended ({reason})", s.account_name));
-    push_sign_in(st, s.active.then_some((reason, s.account_name)));
+    let reason = reason.to_string();
+    let work = |rl: &Relay| {
+        let s = rl.state();
+        let r = s.as_ref().map(|_| rl.end());
+        (s, r)
+    };
+    relay_job(st, work, move |st, (s, r)| {
+        let Some(s) = s else {
+            push_sign_in(st, None);
+            return;
+        };
+        if let Some(Err(e)) = r {
+            log::warn(&format!("relay end ({reason}): {e}"));
+        }
+        watch_restore(st);
+        log::info(&format!("relay: sign-in for {} ended ({reason})", s.account_name));
+        push_sign_in(st, s.active.then_some((reason.as_str(), s.account_name)));
+    });
 }
 
-/// `TIMER_SIGNIN`: keep the handler ours; end on sign-in, exit or timeout.
+/// Quitting ends the sign-in routing without waiting for the user. Where handler changes ask
+/// nobody, the relay worker gives the handler back now (waited for, after any change already
+/// queued); where each change asks the user, the restore is left to the next start.
+fn end_relay_at_exit(st: &mut AppState, why: &str) {
+    if st.relay.state().is_none() {
+        return;
+    }
+    let r = if <Os as UrlHandler>::changes_need_consent() {
+        st.relay.defer_restore()
+    } else {
+        relay_job_wait(st, |rl| rl.end(), EXIT_RESTORE_WAIT)
+            .unwrap_or_else(|| Err("the relay worker did not finish in time".into()))
+    };
+    if let Err(e) = r {
+        log::warn(&format!("relay end ({why}): {e}"));
+    }
+}
+
+/// `quit`: end the sign-in routing as [`end_relay_at_exit`] does and tell the page.
+fn end_sign_in_at_quit(st: &mut AppState) {
+    kill_timer(TimerId::SignIn);
+    st.relay_seen_running = false;
+    st.relay_started = None;
+    let Some(s) = st.relay.state() else { return };
+    end_relay_at_exit(st, "quit");
+    if s.active {
+        log::info(&format!("relay: sign-in for {} ended (quit)", s.account_name));
+    }
+    push_sign_in(st, s.active.then_some(("quit", s.account_name)));
+}
+
+/// Keep the sign-in timer running while giving the links back still waits for the user's answer.
+fn watch_restore(st: &AppState) {
+    if st.relay.state().is_some_and(|s| !s.active && s.restore_pending) {
+        set_timer(TimerId::SignIn, relay::POLL_MS as u32);
+    }
+}
+
+/// `TimerId::SignIn`: keep the handler ours; end on sign-in, exit or timeout. After the relay, a
+/// restore that waits for the user's answer is checked until it settles. While a relay job is
+/// still queued or running (a handler change may wait for the user), the tick does nothing.
 fn sign_in_tick(st: &mut AppState) {
-    let Some(rs) = st.relay.state().filter(|s| s.active) else {
+    if st.relay_busy > 0 {
+        return;
+    }
+    let state = st.relay.state();
+    if state.as_ref().is_some_and(|s| !s.active && s.restore_pending) {
+        relay_job(
+            st,
+            |rl| rl.restore_settled(),
+            |st, settled| {
+                if settled {
+                    kill_timer(TimerId::SignIn);
+                    push_sign_in(st, None);
+                }
+            },
+        );
+        return;
+    }
+    let Some(rs) = state.filter(|s| s.active) else {
         end_sign_in(st, "gone");
         return;
     };
-    match st.relay.ensure() {
-        Ok(_) => st.relay_last_error = None,
-        Err(e) => {
-            if st.relay_last_error.as_deref() != Some(e.as_str()) {
-                log::warn(&format!("relay ensure: {e}"));
-            }
-            st.relay_last_error = Some(e);
-        }
-    }
     if profile_signed_in(&rs.data_dir) {
         end_sign_in(st, "signedIn");
         refresh(st); // signedIn flips in the accounts list and the bubble
@@ -1263,7 +1449,29 @@ fn sign_in_tick(st: &mut AppState) {
     }
     if st.relay.expired(relay::now_secs()) {
         end_sign_in(st, "timeout");
+        return;
     }
+    let before = (rs.handler_pending, rs.handler_declined);
+    relay_job(
+        st,
+        |rl| rl.ensure(),
+        move |st, r| {
+            match r {
+                Ok(_) => st.relay_last_error = None,
+                Err(e) => {
+                    if st.relay_last_error.as_deref() != Some(e.as_str()) {
+                        log::warn(&format!("relay ensure: {e}"));
+                    }
+                    st.relay_last_error = Some(e);
+                }
+            }
+            // The answer about the handler arrived (or Claude took it back): the notice changes.
+            let now = st.relay.state().filter(|s| s.active).map(|s| (s.handler_pending, s.handler_declined));
+            if now.is_some_and(|n| n != before) {
+                push_sign_in(st, None);
+            }
+        },
+    );
 }
 
 /// Startup: resume a relay whose account still runs unsigned-in, else end it (which also heals
@@ -1277,10 +1485,148 @@ fn init_sign_in(st: &mut AppState) {
     if resume {
         st.relay_seen_running = true;
         st.relay_started = Some(Instant::now());
-        set_timer(st.hwnd_msg, TIMER_SIGNIN, relay::POLL_MS as u32);
+        set_timer(TimerId::SignIn, relay::POLL_MS as u32);
         log::info("relay: resumed the sign-in routing of the previous run");
-    } else if let Err(e) = st.relay.end() {
-        log::warn(&format!("relay cleanup: {e}"));
+    } else {
+        relay_job(
+            st,
+            |rl| rl.end(),
+            |st, r| {
+                if let Err(e) = r {
+                    log::warn(&format!("relay cleanup: {e}"));
+                }
+                watch_restore(st);
+            },
+        );
+    }
+}
+
+/// Relay worker: give `claude://` back to Claude because the user asked, also after an earlier
+/// refusal. The outcome: "restored", "pending" (the system still waits for the user's answer;
+/// checked on the sign-in timer) or "declined".
+fn give_links_back(rl: &Relay) -> Result<&'static str, String> {
+    rl.restore_now()?;
+    Ok(match rl.state() {
+        Some(s) if s.restore_pending => "pending",
+        Some(s) if s.restore_declined => "declined",
+        _ => "restored",
+    })
+}
+
+/// `restoreLinkHandler` -> `{ ok, linkHandler }`, resolved once the relay worker is done. Not
+/// while an account is signing in.
+fn restore_link_handler(id: u64) -> UResult<Option<Value>> {
+    state_call_raw(|st| {
+        if st.relay.state().is_some_and(|s| s.active) {
+            return Err("An account is signing in. Cancel its sign-in first.".into());
+        }
+        relay_job(st, give_links_back, move |st, r| {
+            watch_restore(st);
+            push_sign_in(st, None);
+            let v = match r {
+                Ok(link) => json!({ "ok": true, "linkHandler": link }),
+                Err(e) => {
+                    log::warn(&format!("relay restore: {e}"));
+                    fail("Sign-in links could not be given back to Claude.")
+                }
+            };
+            post(move || resolve(id, v));
+        });
+        Ok(None)
+    })
+}
+
+/// How the last link for the account signing in was delivered: None = to that account,
+/// Some(denied) = to Main instead (`denied`: the system did not allow sending it). The sign-in
+/// notice tells the user what to do about it.
+fn note_forward(st: &mut AppState, issue: Option<bool>) {
+    if !st.relay.state().is_some_and(|s| s.active) {
+        return;
+    }
+    let flags = match issue {
+        None => (false, false),
+        Some(denied) => (true, denied),
+    };
+    if (st.relay_forward_failed, st.relay_automation_denied) == flags {
+        return;
+    }
+    (st.relay_forward_failed, st.relay_automation_denied) = flags;
+    push_sign_in(st, None);
+}
+
+/// A `claude://` link the system handed to Sessionmux: forwarded on a worker to the account
+/// signing in, else (no relay, or forwarding there failed) to Main. A link that arrives while no
+/// relay is active also gives the handler back to Claude if it still points at Sessionmux.
+fn on_open_url(raw: &str) {
+    let url = match relay::validate_url(raw) {
+        Ok(u) => u,
+        Err(e) => {
+            log::warn(&format!("relay: refused link {} ({e})", relay::redact(raw.trim())));
+            return;
+        }
+    };
+    let shown = relay::redact(&url);
+    if is_smoke() {
+        log::info(&format!("smoke: blocked forwarding {shown}"));
+        return;
+    }
+    let job = with_state(|st| {
+        let state = st.relay.state();
+        let (target, _) = relay::relay_decision(state.as_ref(), relay::now_secs(), true);
+        if state.as_ref().is_none_or(|s| !s.active && !s.restore_pending) {
+            relay_job(
+                st,
+                |rl| rl.end(),
+                |st, r| {
+                    if let Err(e) = r {
+                        log::warn(&format!("relay: giving the links back failed ({e})"));
+                    }
+                    watch_restore(st);
+                },
+            );
+        }
+        if st.located.is_none() {
+            st.located = claude_app::locate().ok();
+        }
+        let pid_of = |dir: Option<&str>| st.procs.iter().find(|p| claude_app::matches_data_dir(p, dir)).map(|p| p.pid);
+        let name = state.map(|s| s.account_name).unwrap_or_default();
+        let target = target.map(|d| (pid_of(Some(&d)), d, name));
+        (st.located.clone(), target, pid_of(None))
+    });
+    let Some((located, target, main_pid)) = job else { return };
+    let Some(loc) = located else {
+        log::error(&format!("relay: cannot forward {shown}: Claude not found"));
+        return;
+    };
+    let spawned = std::thread::Builder::new().name("sessionmux-link".into()).spawn(move || {
+        let mut issue = None;
+        if let Some((pid, dir, name)) = &target {
+            match relay::forward_to(&loc, Some(dir), *pid, &url) {
+                Ok(()) => {
+                    log::info(&format!("relay: forwarded {shown} to {name}"));
+                    post(|| {
+                        with_state(|st| note_forward(st, None));
+                    });
+                    return;
+                }
+                Err(e) => {
+                    log::error(&format!("relay: forwarding {shown} to {name} failed ({e}); using default"));
+                    issue = Some(e == ForwardError::NotPermitted);
+                }
+            }
+        }
+        match relay::forward_to(&loc, None, main_pid, &url) {
+            Ok(()) => log::info(&format!("relay: forwarded {shown} to default")),
+            Err(e) => log::error(&format!("relay: forwarding {shown} to default failed ({e})")),
+        }
+        if let Some(denied) = issue {
+            post(move || {
+                with_state(|st| note_forward(st, Some(denied)));
+            });
+        }
+    });
+    if let Err(e) = spawned {
+        log::error(&format!("could not start a worker thread: {e}"));
     }
 }
 
@@ -1328,11 +1674,11 @@ fn sessions_clone(st: &AppState) -> Sessions {
 }
 
 fn list_sessions(id: u64, acc_id: &Value) -> UResult<()> {
-    let (sa, sessions, hwnd) = state_call_raw(|st| {
+    let (sa, sessions) = state_call_raw(|st| {
         let acc = find_account(st, acc_id)?;
-        Ok((session_account(st, &acc)?, sessions_clone(st), st.hwnd_msg))
+        Ok((session_account(st, &acc)?, sessions_clone(st)))
     })?;
-    spawn_then(hwnd, move || serde_json::to_value(sessions.list(&sa)).unwrap_or(json!([])), move |v| resolve(id, v));
+    spawn_then(move || serde_json::to_value(sessions.list(&sa)).unwrap_or(json!([])), move |v| resolve(id, v));
     Ok(())
 }
 
@@ -1360,15 +1706,14 @@ fn transfer_session(id: u64, opts: &Value) -> UResult<()> {
     if from_id == to_id {
         return Err("Pick a different account.".into());
     }
-    let (from_s, to_s, to_dir, to_name, sessions, hwnd) = state_call_raw(|st| {
+    let (from_s, to_s, to_dir, to_name, sessions) = state_call_raw(|st| {
         let from = find_account(st, &from_id)?;
         let to = find_account(st, &to_id)?;
         let fs = session_account(st, &from)?;
         let ts = session_account(st, &to)?;
-        Ok((fs, ts, proc_dir(&to), to.name.clone(), sessions_clone(st), st.hwnd_msg))
+        Ok((fs, ts, proc_dir(&to), to.name.clone(), sessions_clone(st)))
     })?;
     spawn_then(
-        hwnd,
         move || {
             let mut to_s = to_s;
             // The cached account list can be a poll behind; ask for the target's live state.
@@ -1396,12 +1741,11 @@ fn transfer_session(id: u64, opts: &Value) -> UResult<()> {
 
 fn delete_session(id: u64, acc_id: &Value, session_id: &Value) -> UResult<()> {
     let sid = check_session_id(session_id)?;
-    let (sa, sessions, hwnd) = state_call_raw(|st| {
+    let (sa, sessions) = state_call_raw(|st| {
         let acc = find_account(st, acc_id)?;
-        Ok((session_account(st, &acc)?, sessions_clone(st), st.hwnd_msg))
+        Ok((session_account(st, &acc)?, sessions_clone(st)))
     })?;
     spawn_then(
-        hwnd,
         move || match sessions.delete(&sa, &sid) {
             Ok(()) => ok(),
             Err(e) => api_fail(&e),
@@ -1416,12 +1760,11 @@ fn delete_session(id: u64, acc_id: &Value, session_id: &Value) -> UResult<()> {
 
 fn open_session_folder(id: u64, acc_id: &Value, session_id: &Value) -> UResult<()> {
     let sid = check_session_id(session_id)?;
-    let (sa, sessions, hwnd) = state_call_raw(|st| {
+    let (sa, sessions) = state_call_raw(|st| {
         let acc = find_account(st, acc_id)?;
-        Ok((session_account(st, &acc)?, sessions_clone(st), st.hwnd_msg))
+        Ok((session_account(st, &acc)?, sessions_clone(st)))
     })?;
     spawn_then(
-        hwnd,
         move || {
             let list = sessions.list(&sa);
             let Some(s) = list.iter().find(|s| s.session_id == sid).filter(|s| !s.cwd.is_empty()) else {
@@ -1433,7 +1776,7 @@ fn open_session_folder(id: u64, acc_id: &Value, session_id: &Value) -> UResult<(
             if is_smoke() {
                 return ok();
             }
-            shell_open("open", "explorer.exe", Some(&format!("/select,\"{}\"", s.cwd)));
+            logged(<Os as Shell>::reveal(Path::new(&s.cwd)));
             ok()
         },
         move |v| resolve(id, v),
@@ -1441,24 +1784,10 @@ fn open_session_folder(id: u64, acc_id: &Value, session_id: &Value) -> UResult<(
     Ok(())
 }
 
-fn shell_open(op: &str, file: &str, params: Option<&str>) {
-    let op_w = win::wide(op);
-    let file_w = win::wide(file);
-    let params_w = params.map(win::wide);
-    let params_p = params_w.as_ref().map(|w| PCWSTR(w.as_ptr())).unwrap_or(PCWSTR::null());
-    // SAFETY: every string is a NUL-terminated UTF-16 buffer that outlives the call.
-    let r = unsafe {
-        ShellExecuteW(
-            HWND::default(),
-            PCWSTR(op_w.as_ptr()),
-            PCWSTR(file_w.as_ptr()),
-            params_p,
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        )
-    };
-    if (r.0 as isize) <= 32 {
-        log::warn(&format!("ShellExecute {op} {file} failed ({})", r.0 as isize));
+/// Log a failed shell open; the user simply sees nothing open.
+fn logged(r: Result<(), String>) {
+    if let Err(e) = r {
+        log::warn(&e);
     }
 }
 
@@ -1472,12 +1801,13 @@ fn open_external(url: &Value) {
         log::info("smoke: blocked openExternal");
         return;
     }
-    shell_open("open", u, None);
+    logged(<Os as Shell>::open_url(u));
 }
 
 // ------------------------------------------------------------------ about
 
-/// `getAppInfo` shape: product identity, links and the license name for the About card.
+/// `getAppInfo` shape: product identity, links and the license name for the About card, the
+/// system's name, and `translocated` (this copy runs from a place it cannot stay in).
 fn app_info() -> Value {
     json!({
         "productName": brand::NAME,
@@ -1490,6 +1820,8 @@ fn app_info() -> Value {
         "sponsorUrl": brand::URL_SPONSOR,
         "licenseName": brand::LICENSE_NAME,
         "disclaimer": brand::DISCLAIMER,
+        "platform": platform::OS_NAME,
+        "translocated": <Os as Misc>::translocated(),
     })
 }
 
@@ -1502,8 +1834,8 @@ fn open_license() {
     let local =
         std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("LICENSE.txt"))).filter(|p| p.is_file());
     match local {
-        Some(p) => shell_open("open", &p.to_string_lossy(), None),
-        None => shell_open("open", brand::URL_LICENSE, None),
+        Some(p) => logged(<Os as Shell>::open_url(&p.to_string_lossy())),
+        None => logged(<Os as Shell>::open_url(brand::URL_LICENSE)),
     }
 }
 
@@ -1532,6 +1864,14 @@ fn panel_settings(st: &AppState) -> Value {
         o.insert("autoHandover".into(), json!(st.settings.auto_handover));
         o.insert("approveFromPanel".into(), json!(st.settings.approve_from_panel));
         o.insert("appVersion".into(), json!(env!("CARGO_PKG_VERSION")));
+        // What the system says about login start, the window-raising permission and routing.
+        o.insert("autostartStatus".into(), json!(<Os as Autostart>::status().as_str()));
+        if let Some(trusted) = <Os as Focus>::accessibility_trusted(false) {
+            o.insert("accessibilityTrusted".into(), json!(trusted));
+        }
+        if let Some(why) = <Os as UrlHandler>::unavailable() {
+            o.insert("signInRoutingUnavailable".into(), json!(why));
+        }
         o.insert(
             "paths".into(),
             json!({
@@ -1595,6 +1935,10 @@ fn apply_settings(st: &mut AppState, prev: &Settings, next: &Settings, move_bubb
     if prev.sign_in_routing && !next.sign_in_routing {
         end_sign_in(st, "disabled");
     }
+    if !prev.raise_windows_with_accessibility && next.raise_windows_with_accessibility && !is_smoke() {
+        // Turned on: the system may show its grant prompt now rather than at the first switch.
+        let _ = <Os as Focus>::accessibility_trusted(true);
+    }
     if !prev.sign_in_routing && next.sign_in_routing && !is_smoke() {
         // Turned on while an extra account already waits to sign in (the routing-off card's
         // "Turn on"): route that account now instead of only on its next open. The most recently
@@ -1607,7 +1951,7 @@ fn apply_settings(st: &mut AppState, prev: &Settings, next: &Settings, move_bubb
             .or_else(|| waiting.first())
             .map(|a| a.id.clone());
         if let Some(id) = pick {
-            ui_thread::post(st.hwnd_msg, Box::new(move || begin_sign_in(&id)));
+            post(move || begin_sign_in(&id));
         }
     }
     if prev.approve_from_panel && !next.approve_from_panel {
@@ -1618,7 +1962,7 @@ fn apply_settings(st: &mut AppState, prev: &Settings, next: &Settings, move_bubb
     if move_bubble && prev.bubble_position != next.bubble_position {
         if let (Some(b), Some(p)) = (st.bubble.as_ref(), next.bubble_position.as_ref()) {
             let r = b.rect();
-            if r.left != p.x || r.top != p.y {
+            if r.x != p.x || r.y != p.y {
                 b.set_position(p.x, p.y);
             }
         }
@@ -1680,9 +2024,8 @@ fn on_poll(procs: Vec<Proc>, fg: Option<u32>, located: Option<Located>) {
     });
 }
 
-fn start_poll_thread(hwnd_msg: HWND) -> Option<mpsc::Sender<()>> {
+fn start_poll_thread() -> Option<mpsc::Sender<()>> {
     let (tx, rx) = mpsc::channel::<()>();
-    let h = hwnd_msg.0 as isize;
     let spawned = std::thread::Builder::new().name("sessionmux-poll".into()).spawn(move || {
         let mut watch = gesture::DebugWatch::default();
         let mut next_debug_check = Instant::now() + DEBUGGER_FIRST;
@@ -1691,17 +2034,17 @@ fn start_poll_thread(hwnd_msg: HWND) -> Option<mpsc::Sender<()>> {
                 break;
             }
             let procs = claude_app::list_processes();
-            let fg = claude_app::foreground_pid();
+            let fg = <Os as Windows>::foreground_pid();
             let loc = claude_app::locate().ok();
-            ui_thread::post(hwnd_from(h), Box::new(move || on_poll(procs, fg, loc)));
+            post(move || on_poll(procs, fg, loc));
             let next_poll = Instant::now() + Duration::from_millis(POLL_MS);
             // Wait for the next poll (or a wake-up), running the debugger check on its own clock.
             loop {
                 let now = Instant::now();
                 if now >= next_debug_check {
                     next_debug_check = now + DEBUGGER_EVERY;
-                    if watch.update(gesture::debugger_present()) {
-                        ui_thread::post(hwnd_from(h), Box::new(|| tamper(Reason::Debugger)));
+                    if watch.update(<Os as Debugger>::present()) {
+                        post(|| tamper(Reason::Debugger));
                     }
                 }
                 if now >= next_poll {
@@ -1741,13 +2084,8 @@ fn tamper(reason: Reason) {
         }
         log::info(&format!("tamper: {}", reason.as_str()));
         let anchor = st.bubble.as_ref().filter(|b| st.settings.show_bubble && b.is_visible()).map(|b| b.rect());
-        gesture::play(anchor);
+        <Os as GestureHost>::play(anchor);
     });
-}
-
-/// `ui_thread` hook for a forged task message.
-fn on_forged_task() {
-    tamper(Reason::ForgedMessage);
 }
 
 /// Set the active account: falls back to the current active, Main, then the first account.
@@ -1828,10 +2166,8 @@ fn sync_bubble(st: &mut AppState) {
             let before = b.rect();
             b.set_state(s);
             let after = b.rect();
-            let resized = (before.right - before.left, before.bottom - before.top)
-                != (after.right - after.left, after.bottom - after.top);
-            if resized {
-                moved = Some((after.left, after.top));
+            if (before.w, before.h) != (after.w, after.h) {
+                moved = Some((after.x, after.y));
             }
         }
         if let Some((x, y)) = moved {
@@ -1846,14 +2182,13 @@ fn sync_bubble(st: &mut AppState) {
     }
 }
 
-fn bubble_event_sink(hwnd_msg: HWND) -> Box<dyn Fn(BubbleEvent)> {
-    let h = hwnd_msg.0 as isize;
-    Box::new(move |ev| ui_thread::post(hwnd_from(h), Box::new(move || on_bubble_event(ev))))
+fn bubble_event_sink() -> Box<dyn Fn(BubbleEvent)> {
+    Box::new(move |ev| post(move || on_event(PlatformEvent::Bubble(ev))))
 }
 
 fn create_bubble(st: &mut AppState) {
     let pos = st.settings.bubble_position.as_ref().map(|p| (p.x, p.y));
-    match Bubble::create(pos, bubble_event_sink(st.hwnd_msg)) {
+    match Bubble::create(pos, bubble_event_sink()) {
         Ok(b) => {
             st.bubble = Some(b);
             st.last_bubble_state = None;
@@ -1902,7 +2237,7 @@ fn update_tray(st: &mut AppState) {
     let mode = bubble_mode_str(st);
     let applied = match t.try_borrow_mut() {
         Ok(mut t) => {
-            t.set_menu(&items, shown, mode);
+            t.set_menu(&TrayMenu::new(&items, shown, mode));
             t.set_waiting(st.approvals.len());
             true
         }
@@ -1913,10 +2248,13 @@ fn update_tray(st: &mut AppState) {
     }
 }
 
-fn on_tray_message(msg: u32, wparam: WPARAM, lparam: LPARAM) {
+/// A tray icon notification: the tray reads it (a right click runs the menu here), then the
+/// menu updates that arrived meanwhile are applied.
+#[cfg(windows)]
+fn on_tray_notify(n: platform::event_loop::TrayNotify) {
     let Some(tray) = with_state(|st| st.tray.clone()).flatten() else { return };
     let ev = match tray.try_borrow() {
-        Ok(t) => t.handle(msg, wparam, lparam),
+        Ok(t) => platform::event_loop::tray_event(&t, &n),
         Err(_) => None,
     };
     with_state(|st| {
@@ -1925,7 +2263,12 @@ fn on_tray_message(msg: u32, wparam: WPARAM, lparam: LPARAM) {
             update_tray(st);
         }
     });
-    let Some(ev) = ev else { return };
+    if let Some(ev) = ev {
+        on_tray_event(ev);
+    }
+}
+
+fn on_tray_event(ev: TrayEvent) {
     log::debug(&format!("tray event: {ev:?}"));
     match ev {
         TrayEvent::LeftClick => toggle_panel(),
@@ -1982,18 +2325,6 @@ fn resend_state(st: &mut AppState) {
     push_sign_in(st, None);
 }
 
-fn set_timer(hwnd: HWND, id: usize, ms: u32) {
-    // SAFETY: timer on our own message window; WM_TIMER is handled in app_wndproc.
-    if unsafe { SetTimer(hwnd, id, ms, None) } == 0 {
-        log::warn(&format!("SetTimer {id}: {}", win::last_error()));
-    }
-}
-
-fn kill_timer(hwnd: HWND, id: usize) {
-    // SAFETY: killing a timer id on our own window; failure (not set) is harmless.
-    let _ = unsafe { KillTimer(hwnd, id) };
-}
-
 /// Make sure the panel exists, creating it without any AppState borrow held (create pumps).
 /// `show_early`: show the bare native window at its target place while WebView2 starts.
 fn ensure_panel(show_early: bool) -> bool {
@@ -2012,8 +2343,10 @@ fn ensure_panel(show_early: bool) -> bool {
     if !need {
         return true;
     }
-    let Some(hwnd_msg) = with_state(|st| st.hwnd_msg) else { return false };
-    let ipc: Arc<dyn IpcHandler> = Arc::new(AppIpc { hwnd_msg: hwnd_msg.0 as isize });
+    if with_state(|_| ()).is_none() {
+        return false;
+    }
+    let ipc: Arc<dyn IpcHandler> = Arc::new(AppIpc);
     let t0 = Instant::now();
     let near = if show_early { with_state(|st| (panel_anchor(st), st.settings.panel_side.clone())) } else { None };
     // New page, new id counter: replies for the old one must not reach it (see tag_id).
@@ -2039,10 +2372,11 @@ fn ensure_panel(show_early: bool) -> bool {
     .unwrap_or(false)
 }
 
-fn panel_anchor(st: &AppState) -> RECT {
+/// The visible bubble's rect; an empty rect places the panel at the cursor (tray icon / hotkey).
+fn panel_anchor(st: &AppState) -> Rect {
     match st.bubble.as_ref() {
         Some(b) if st.settings.show_bubble && b.is_visible() => b.rect(),
-        _ => RECT::default(), // cursor (tray icon / hotkey)
+        _ => Rect::default(),
     }
 }
 
@@ -2058,7 +2392,7 @@ pub fn show_panel() {
         return;
     }
     with_state(|st| {
-        kill_timer(st.hwnd_msg, TIMER_DESTROY_PANEL);
+        kill_timer(TimerId::DestroyPanel);
         let anchor = panel_anchor(st);
         if let Some(p) = st.panel.as_ref() {
             p.show_near(anchor, &st.settings.panel_side);
@@ -2081,7 +2415,7 @@ fn hide_panel_in(st: &mut AppState, from_blur: bool) {
     if from_blur {
         st.last_blur_hide = Some(Instant::now());
     }
-    set_timer(st.hwnd_msg, TIMER_DESTROY_PANEL, PANEL_DESTROY_MS);
+    set_timer(TimerId::DestroyPanel, PANEL_DESTROY_MS);
 }
 
 fn pinned(st: &AppState) -> bool {
@@ -2103,8 +2437,7 @@ fn hide_if_unfocused(st: &mut AppState) {
         return;
     }
     let Some(p) = st.panel.as_ref().filter(|p| p.is_visible()) else { return };
-    // SAFETY: no preconditions.
-    if unsafe { GetForegroundWindow() } == p.hwnd() {
+    if <Os as Desktop>::is_foreground(p.window()) {
         return;
     }
     hide_panel_in(st, true);
@@ -2112,14 +2445,14 @@ fn hide_if_unfocused(st: &mut AppState) {
 
 fn pin_panel(pin: bool) {
     with_state(|st| {
-        kill_timer(st.hwnd_msg, TIMER_PIN);
+        kill_timer(TimerId::Pin);
         if pin {
             st.pinned_until = Some(Instant::now() + Duration::from_millis(PIN_MS as u64));
-            set_timer(st.hwnd_msg, TIMER_PIN, PIN_MS + 50);
+            set_timer(TimerId::Pin, PIN_MS + 50);
         } else {
             st.pinned_until = None;
             // A blur that arrived while pinned was ignored; honour it now.
-            set_timer(st.hwnd_msg, TIMER_PIN, 50);
+            set_timer(TimerId::Pin, 50);
         }
     });
 }
@@ -2147,11 +2480,11 @@ fn show_tab(tab: &str) {
     with_state(|st| emit(st, "show-tab", &json!(tab)));
 }
 
-fn on_timer(id: usize) {
+fn on_timer(id: TimerId) {
     match id {
-        TIMER_DESTROY_PANEL => {
+        TimerId::DestroyPanel => {
             let panel = with_state(|st| {
-                kill_timer(st.hwnd_msg, TIMER_DESTROY_PANEL);
+                kill_timer(TimerId::DestroyPanel);
                 if st.panel.as_ref().is_some_and(|p| !p.is_visible()) {
                     st.panel.take()
                 } else {
@@ -2165,9 +2498,9 @@ fn on_timer(id: usize) {
                 log::debug("panel destroyed after 30 s hidden");
             }
         }
-        TIMER_STARTUP_TRIM => {
+        TimerId::StartupTrim => {
             let idle = with_state(|st| {
-                kill_timer(st.hwnd_msg, TIMER_STARTUP_TRIM);
+                kill_timer(TimerId::StartupTrim);
                 st.panel.is_none() && !st.panel_creating
             })
             .unwrap_or(false);
@@ -2176,77 +2509,45 @@ fn on_timer(id: usize) {
                 log::debug("startup working-set trim");
             }
         }
-        TIMER_PIN => {
+        TimerId::Pin => {
             with_state(|st| {
-                kill_timer(st.hwnd_msg, TIMER_PIN);
+                kill_timer(TimerId::Pin);
                 hide_if_unfocused(st);
             });
         }
-        TIMER_SIGNIN => {
+        TimerId::SignIn => {
             with_state(sign_in_tick);
         }
-        _ => {}
     }
 }
 
-unsafe extern "system" fn app_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    match msg {
-        ui_thread::WM_SESSIONMUX_SHOW_PANEL => {
-            show_panel();
-            LRESULT(0)
-        }
-        // Posted by a refused `--relay` launch.
-        ui_thread::WM_SESSIONMUX_GESTURE => {
-            tamper(Reason::BadLink);
-            LRESULT(0)
-        }
-        // Sent by the installer and uninstaller: quit cleanly (ends a sign-in relay, keeps the
-        // Claude Desktop windows running).
-        WM_CLOSE => {
-            quit();
-            LRESULT(0)
-        }
-        WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID => {
-            toggle_panel();
-            LRESULT(0)
-        }
-        WM_TIMER => {
-            on_timer(wparam.0);
-            LRESULT(0)
-        }
-        tray::WM_TRAY_CALLBACK | tray::WM_TRAY_RECREATE => {
-            on_tray_message(msg, wparam, lparam);
-            LRESULT(0)
-        }
-        // SAFETY: default processing for a window we own, with the original arguments.
-        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
-    }
-}
-
-fn load_tray_icon() -> HICON {
-    // SAFETY: loads icon resource IDI_TRAY embedded by build.rs from our own module.
-    unsafe {
-        let cx = GetSystemMetrics(SM_CXSMICON);
-        let cy = GetSystemMetrics(SM_CYSMICON);
-        match LoadImageW(win::hinstance(), win::make_int_resource(win::IDI_TRAY), IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR) {
-            Ok(h) => HICON(h.0),
-            Err(e) => {
-                log::warn(&format!("tray icon load failed: {e}"));
-                HICON::default()
-            }
+/// Everything the system reports, on the UI thread from the top-level loop.
+fn on_event(ev: PlatformEvent) {
+    match ev {
+        PlatformEvent::ShowPanel => show_panel(),
+        PlatformEvent::Gesture(reason) => tamper(reason),
+        // The installer and uninstaller ask for this too: quit cleanly (ends a sign-in relay,
+        // keeps the Claude Desktop windows running).
+        PlatformEvent::QuitRequested => quit(),
+        PlatformEvent::Hotkey(id) if id == HOTKEY_ID => toggle_panel(),
+        PlatformEvent::Hotkey(_) => {}
+        PlatformEvent::Timer(id) => on_timer(id),
+        PlatformEvent::Tray(ev) => on_tray_event(ev),
+        #[cfg(windows)]
+        PlatformEvent::TrayNotify(n) => on_tray_notify(n),
+        PlatformEvent::Bubble(ev) => on_bubble_event(ev),
+        PlatformEvent::OpenUrl(url) => on_open_url(&url),
+        PlatformEvent::PanelBlur => on_blur(),
+        PlatformEvent::DisplayChanged => {
+            with_state(|st| reposition_panel(st));
         }
     }
 }
 
-/// After the panel's WebView2 is gone, hand the pages it touched (loader, heaps) back to the
+/// After the panel's web view is gone, hand the pages it touched (loader, heaps) back to the
 /// OS so the idle footprint returns to "bubble only". Pages are faulted back in on demand.
 fn trim_working_set() {
-    use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
-    use windows::Win32::System::Threading::GetCurrentProcess;
-    // SAFETY: GetCurrentProcess returns a pseudo-handle valid for this call; no memory is freed.
-    if let Err(e) = unsafe { EmptyWorkingSet(GetCurrentProcess()) } {
-        log::debug(&format!("EmptyWorkingSet: {e}"));
-    }
+    <Os as Misc>::trim_memory();
 }
 
 /// True when running from an installed location rather than a cargo target dir.
@@ -2265,13 +2566,14 @@ fn is_cargo_build(exe: &Path) -> bool {
 
 // ------------------------------------------------------------------ approvals, waiting sessions, limits
 
-/// Start the hook helpers' pipe; every request is handled on the UI thread.
-fn start_pipe(hwnd_msg: HWND) -> Option<Server> {
-    let h = hwnd_msg.0 as isize;
+/// Start the hook helpers' pipe; every request is handled on the UI thread. A show request (a
+/// second launch where the system has no window message for it) opens the panel.
+fn start_pipe() -> Option<Server> {
     let on_request = Box::new(move |req: Request, resp: Responder| {
-        ui_thread::post(hwnd_from(h), Box::new(move || on_pipe_request(req, resp)));
+        post(move || on_pipe_request(req, resp));
     });
-    match Server::start(on_request) {
+    let on_show = Box::new(|| post(|| on_event(PlatformEvent::ShowPanel)));
+    match Server::start_with_show(on_request, on_show) {
         Ok(s) => Some(s),
         Err(e) => {
             log::warn(&format!("pipe: not started: {e}"));
@@ -2671,7 +2973,6 @@ fn start_index(st: &mut AppState) {
     st.index_busy = true;
     let job = IndexJob { accounts, sessions: sessions_clone(st), seen: st.transcripts.clone() };
     spawn_then(
-        st.hwnd_msg,
         move || build_index(job, relay::now_secs()),
         |res| {
             with_state(|st| apply_index(st, res));
@@ -2809,15 +3110,14 @@ fn decide_approval(id: u64, opts: &Value) -> UResult<Option<Value>> {
         };
         st.waiting.remove(&key);
         approvals_changed(st);
-        Ok(Some((a, st.hwnd_msg)))
+        Ok(Some(a))
     })?;
-    let Some((mut a, hwnd)) = taken else { return Ok(Some(gone())) };
+    let Some(mut a) = taken else { return Ok(Some(gone())) };
     let Some(responder) = a.responder.take() else { return Ok(Some(gone())) };
     let word = if decision == Decision::Allow { "allow" } else { "deny" };
     let tool = log_tool(&a.tool_name);
     let session = a.session_id.clone().unwrap_or_else(|| a.cli_session_id.clone());
     spawn_then(
-        hwnd,
         move || responder.decide(decision),
         move |r| {
             let v = match r {
@@ -2951,7 +3251,7 @@ fn start_handover(
     let to_s = session_account(st, &to_acc)?;
     let plan = prepare_open(st, &to_acc)?;
     let window = DesktopWindow { plan, located: st.located.clone(), wake: st.poll_wake.clone() };
-    let (sessions, hwnd) = (sessions_clone(st), st.hwnd_msg);
+    let sessions = sessions_clone(st);
     let sid = sid.to_string();
     let mode = if reply_id == 0 { HandoverMode::Auto } else { HandoverMode::Manual { restart } };
     let auto = mode == HandoverMode::Auto;
@@ -2960,7 +3260,6 @@ fn start_handover(
         (to_acc.name.clone(), to_acc.id.clone(), from.name.clone(), from.id.clone());
     let job_sid = sid.clone();
     spawn_then(
-        hwnd,
         move || run_handover(&sessions, &from_s, to_s, &job_sid, mode, &window),
         move |out| {
             with_state(|st| {
@@ -3122,7 +3421,7 @@ fn restart_and_open(
             log::info("smoke: blocked claude_app::kill");
             return ok();
         }
-        if let Err(e) = claude_app::kill(&pids) {
+        if let Err(e) = <Os as Closer>::close(&pids) {
             log::warn(&format!("handover: closing {}: {e}", plan.id));
             return fail(&format!("Could not restart {}'s Claude window.", plan.name));
         }
@@ -3174,8 +3473,8 @@ fn hooks_job(id: u64, work: impl FnOnce(&Path, &Path) -> Value + Send + 'static)
         return Err("Claude Code's settings are not changed during the smoke check.".into());
     }
     let exe = std::env::current_exe().map_err(|e| format!("The location of {} is unknown: {e}", brand::NAME))?;
-    let hwnd = state_call_raw(|st| Ok(st.hwnd_msg))?;
-    spawn_then(hwnd, move || work(&hooks::user_settings_path(), &exe), move |v| resolve(id, v));
+    state_call_raw(|_| Ok(()))?;
+    spawn_then(move || work(&hooks::user_settings_path(), &exe), move |v| resolve(id, v));
     Ok(None)
 }
 
@@ -3209,19 +3508,90 @@ fn remove_hooks(id: u64) -> UResult<Option<Value>> {
     })
 }
 
+/// `removeChanges`: take out everything Sessionmux changed outside its own folder, so it can be
+/// removed without an uninstaller: a sign-in in progress ends, the `claude://` handler goes back
+/// to Claude, the login item is turned off and our Claude Code hooks are removed. Resolved by a
+/// worker with `{ ok, removed, written, linkHandler }` (`linkHandler` as for
+/// `restoreLinkHandler`, or "failed").
+fn remove_changes(id: u64) -> UResult<Option<Value>> {
+    if !hooks_allowed() {
+        return Err("Claude Code's settings are not changed during the smoke check.".into());
+    }
+    state_call_raw(|st| {
+        if st.relay.state().is_some_and(|s| s.active) {
+            end_sign_in(st, "cancelled");
+        }
+        if st.settings.start_with_windows {
+            update_settings(st, json!({ "startWithWindows": false }));
+        } else {
+            apply_login_item(false);
+        }
+        // Queued after the cancel above, so the relay has ended when the links are given back.
+        let work = |rl: &Relay| {
+            give_links_back(rl).unwrap_or_else(|e| {
+                log::warn(&format!("relay restore: {e}"));
+                "failed"
+            })
+        };
+        relay_job(st, work, move |st, link| {
+            watch_restore(st);
+            push_sign_in(st, None);
+            log::info(&format!("remove changes: sign-in links {link}, login item off"));
+            post(move || {
+                if let Err(e) = remove_hooks_after(id, link) {
+                    resolve(id, json!({ "ok": false, "error": e, "linkHandler": link }));
+                }
+            });
+        });
+        Ok(())
+    })?;
+    Ok(None)
+}
+
+/// The hooks part of `removeChanges`, once the link handler is settled (`link`).
+fn remove_hooks_after(id: u64, link: &'static str) -> UResult<Option<Value>> {
+    hooks_job(id, move |path, exe| match hooks::remove(path, exe) {
+        Ok(r) => {
+            log::info(&format!("hooks: removed {} entries", r.removed));
+            json!({ "ok": true, "removed": r.removed, "written": r.written, "linkHandler": link })
+        }
+        Err(e) => {
+            log::warn(&format!("hooks: remove: {e}"));
+            json!({ "ok": false, "error": human_error(&e.to_string()), "linkHandler": link })
+        }
+    })
+}
+
+/// `openSystemSettings(page)`: the system settings page where the user grants what `page`
+/// ("loginItems", "automation" or "accessibility") needs.
+fn open_system_settings(page: &Value) -> UResult<Value> {
+    let pane = match page.as_str() {
+        Some("loginItems") => None,
+        Some("automation") => Some(PrivacyPane::Automation),
+        Some("accessibility") => Some(PrivacyPane::Accessibility),
+        _ => return Err("Unknown settings page.".into()),
+    };
+    if is_smoke() {
+        log::info("smoke: blocked openSystemSettings");
+        return Ok(ok());
+    }
+    match pane {
+        None => <Os as Autostart>::open_settings(),
+        Some(p) => <Os as Shell>::open_privacy_settings(p)?,
+    }
+    Ok(ok())
+}
+
 // ------------------------------------------------------------------ lifecycle
 
-/// Create the message window, open the store and build the UI. Call once on the UI thread.
+/// Set up the event loop, open the store and build the UI. Call once on the UI thread.
 pub fn init(hidden: bool) -> Result<(), String> {
     let smoke = is_smoke();
-    let hwnd_msg = ui_thread::create_msg_window(Some(app_wndproc));
-    if hwnd_msg.is_invalid() {
-        return Err(format!("message window: {}", win::last_error()));
-    }
+    <Os as EventLoop>::init(on_event)?;
     remove_stale_state(&paths::user_data());
     let store = AccountsStore::open(&paths::user_data(), &paths::app_data());
     // In smoke mode or with a user-data override, the relay uses relay.json only and never touches
-    // the HKCU claude:// handler.
+    // the claude:// handler.
     let relay = if smoke || paths::user_data_overridden() {
         Relay::open_with(&paths::user_data(), None)
     } else {
@@ -3236,12 +3606,12 @@ pub fn init(hidden: bool) -> Result<(), String> {
     };
     let settings = store.settings();
     let procs = claude_app::list_processes();
-    let fg_pid = claude_app::foreground_pid();
+    let fg_pid = <Os as Windows>::foreground_pid();
 
     let tray = if smoke {
         None
     } else {
-        match Tray::create(hwnd_msg, load_tray_icon()) {
+        match <Tray as TrayHost>::create() {
             Ok(t) => Some(Rc::new(RefCell::new(t))),
             Err(e) => {
                 log::warn(&format!("tray: {e}"));
@@ -3250,7 +3620,7 @@ pub fn init(hidden: bool) -> Result<(), String> {
         }
     };
     if !smoke {
-        if let Err(e) = hotkey::register(hwnd_msg, HOTKEY_ID, &settings.hotkey) {
+        if let Err(e) = <Os as HotkeyHost>::register(HOTKEY_ID, &settings.hotkey) {
             log::warn(&format!("hotkey {}: {e}", settings.hotkey));
         }
         if is_packaged() {
@@ -3269,7 +3639,6 @@ pub fn init(hidden: bool) -> Result<(), String> {
         last_accounts: Vec::new(),
         last_active: None,
         pinned_until: None,
-        hwnd_msg,
         settings: settings.clone(),
         procs,
         fg_pid,
@@ -3288,6 +3657,10 @@ pub fn init(hidden: bool) -> Result<(), String> {
         relay_seen_running: false,
         relay_started: None,
         relay_last_error: None,
+        relay_jobs: None,
+        relay_busy: 0,
+        relay_forward_failed: false,
+        relay_automation_denied: false,
         started: Instant::now(),
         tamper_limit: gesture::Limiter::default(),
         debugger_limit: gesture::Limiter::default(),
@@ -3313,11 +3686,10 @@ pub fn init(hidden: bool) -> Result<(), String> {
         update_tray(st);
         if !smoke {
             init_sign_in(st);
-            st.poll_wake = start_poll_thread(st.hwnd_msg);
-            ui_thread::set_forged_hook(Some(on_forged_task));
-            st.pipe = start_pipe(st.hwnd_msg);
+            st.poll_wake = start_poll_thread();
+            st.pipe = start_pipe();
         }
-        set_timer(st.hwnd_msg, TIMER_STARTUP_TRIM, STARTUP_TRIM_MS);
+        set_timer(TimerId::StartupTrim, STARTUP_TRIM_MS);
         st.tray.is_none() && st.bubble.is_none()
     })
     .unwrap_or(true);
@@ -3334,16 +3706,15 @@ pub fn init(hidden: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Request exit: the message loop ends and main.rs calls `shutdown`.
+/// Request exit: the event loop ends and main.rs calls `shutdown`.
 pub fn quit() {
     QUITTING.store(true, Ordering::Relaxed);
-    with_state(|st| end_sign_in(st, "quit"));
-    // SAFETY: posts WM_QUIT to the calling (UI) thread's queue; no preconditions.
-    unsafe { PostQuitMessage(0) };
+    with_state(end_sign_in_at_quit);
+    <Os as EventLoop>::quit();
 }
 
-/// Release UI resources (idempotent): poll thread, timers, hotkey, tray, panel, bubble,
-/// message window.
+/// Release UI resources (idempotent): poll thread, timers, hotkey, tray, panel, bubble, event
+/// loop.
 pub fn shutdown() {
     QUITTING.store(true, Ordering::Relaxed);
     let Some(app) = APP.with(|a| a.borrow_mut().take()) else { return };
@@ -3352,35 +3723,30 @@ pub fn shutdown() {
         return;
     };
     let mut st = cell.into_inner();
-    ui_thread::set_forged_hook(None);
-    gesture::close();
+    <Os as GestureHost>::close();
     st.poll_wake.take(); // disconnects the poll thread's channel
-    kill_timer(st.hwnd_msg, TIMER_DESTROY_PANEL);
-    kill_timer(st.hwnd_msg, TIMER_PIN);
-    kill_timer(st.hwnd_msg, TIMER_STARTUP_TRIM);
-    kill_timer(st.hwnd_msg, TIMER_SIGNIN);
+    for id in [TimerId::DestroyPanel, TimerId::Pin, TimerId::StartupTrim, TimerId::SignIn] {
+        kill_timer(id);
+    }
     // Pending approvals are told nothing: each helper exits silently and the prompt in Claude decides.
     st.approvals.clear();
     if let Some(p) = st.pipe.take() {
         p.stop();
     }
     SMOKE_FIXTURE.store(false, Ordering::Relaxed);
-    // Never leave Sessionmux registered as the claude:// handler after it exits.
-    if st.relay.state().is_some() {
-        if let Err(e) = st.relay.end() {
-            log::warn(&format!("relay end (shutdown): {e}"));
-        }
-    }
+    // Never leave Sessionmux registered as the claude:// handler after it exits: given back now
+    // where that asks nobody, else at the next start.
+    end_relay_at_exit(&mut st, "shutdown");
+    st.relay_jobs.take(); // ends the relay worker once its queue is empty
     if !is_smoke() {
-        hotkey::unregister(st.hwnd_msg, HOTKEY_ID);
+        <Os as HotkeyHost>::unregister(HOTKEY_ID);
     }
     if let Some(p) = st.panel.take() {
         p.destroy();
     }
     drop(st.tray.take());
     drop(st.bubble.take());
-    // SAFETY: hwnd_msg was created on this thread by create_msg_window and is destroyed once.
-    let _ = unsafe { DestroyWindow(st.hwnd_msg) };
+    <Os as EventLoop>::shutdown();
     log::info("shutdown complete");
 }
 
@@ -3417,9 +3783,10 @@ pub fn smoke_bubble_mode() -> String {
     with_state(|st| bubble_mode_str(st).to_string()).unwrap_or_default()
 }
 
-/// Bubble window rect and DPI scale.
-pub fn smoke_bubble_rect() -> Option<(RECT, f32)> {
-    with_state(|st| st.bubble.as_ref().map(|b| (b.rect(), win::dpi_scale(b.hwnd())))).flatten()
+/// Bubble window rect and its display's scale.
+pub fn smoke_bubble_rect() -> Option<(Rect, f32)> {
+    let r: Rect = with_state(|st| st.bubble.as_ref().map(|b| b.rect())).flatten()?;
+    Some((r, <Os as Desktop>::units_per_dip(&r)))
 }
 
 /// Number of accounts the mini tray shows.
@@ -3441,7 +3808,7 @@ pub fn smoke_show_panel_offscreen() -> Result<(), String> {
         return Err("panel could not be created".into());
     }
     with_state(|st| {
-        kill_timer(st.hwnd_msg, TIMER_DESTROY_PANEL);
+        kill_timer(TimerId::DestroyPanel);
         if let Some(p) = st.panel.as_ref() {
             p.show_inactive_at(-10_000, 100);
         }
@@ -3453,8 +3820,8 @@ pub fn smoke_panel_ready() -> bool {
     with_state(|st| st.panel.as_ref().is_some_and(|p| p.is_ready())).unwrap_or(false)
 }
 
-pub fn smoke_panel_hwnd() -> Option<HWND> {
-    with_state(|st| st.panel.as_ref().map(|p| p.hwnd())).flatten()
+pub fn smoke_panel_window() -> Option<WindowId> {
+    with_state(|st| st.panel.as_ref().map(|p| p.window())).flatten()
 }
 
 pub fn smoke_show_tab(tab: &str) {
@@ -3465,7 +3832,7 @@ pub fn smoke_show_tab(tab: &str) {
 pub fn smoke_destroy_panel() {
     let p = with_state(|st| {
         hide_panel_in(st, false);
-        kill_timer(st.hwnd_msg, TIMER_DESTROY_PANEL);
+        kill_timer(TimerId::DestroyPanel);
         st.panel.take()
     })
     .flatten();
@@ -3489,7 +3856,7 @@ pub fn smoke_sign_in() -> Value {
 }
 
 /// Push a synthetic `signin-changed` payload to the page (page check only; no relay, no
-/// registry). `None` re-sends the real state.
+/// handler change). `None` re-sends the real state.
 pub fn smoke_emit_sign_in(fake: Option<Value>) {
     with_state(|st| match fake {
         None => push_sign_in(st, None),
@@ -3682,6 +4049,13 @@ mod tests {
     }
 
     #[test]
+    fn system_settings_pages() {
+        for page in [json!("nope"), json!(""), json!(null), json!(1), json!("LoginItems")] {
+            assert!(open_system_settings(&page).is_err(), "{page}");
+        }
+    }
+
+    #[test]
     fn app_info_shape() {
         let a = app_info();
         for k in [
@@ -3695,10 +4069,13 @@ mod tests {
             "sponsorUrl",
             "licenseName",
             "disclaimer",
+            "platform",
+            "translocated",
         ] {
             assert!(a.get(k).is_some(), "getAppInfo lacks {k}");
         }
-        assert_eq!(a.as_object().map(|o| o.len()), Some(10));
+        assert_eq!(a.as_object().map(|o| o.len()), Some(12));
+        assert_eq!(a["platform"], platform::OS_NAME);
         assert_eq!(a["productName"], "Sessionmux");
         assert_eq!(a["licenseName"], "CPAL-1.0");
         assert_eq!(a["homeUrl"], brand::REPO_URL);

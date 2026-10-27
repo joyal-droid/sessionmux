@@ -94,7 +94,7 @@ fn main() {
     }
     let mut res = winresource::WindowsResource::new();
     res.set_icon("assets/icon.ico") // id 1 = application icon
-        .set_icon_with_id("assets/tray.ico", "2") // id 2 = tray icon (util::win::IDI_TRAY)
+        .set_icon_with_id("assets/tray.ico", "2") // id 2 = tray icon (platform::windows::win::IDI_TRAY)
         .set_manifest_file("assets/sessionmux.manifest")
         .set("ProductName", "Sessionmux")
         .set("FileDescription", "Sessionmux account switcher")

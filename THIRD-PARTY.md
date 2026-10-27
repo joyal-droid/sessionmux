@@ -17,8 +17,8 @@ which is what this file is for.
 | Crate | Version | License | Used for |
 | --- | --- | --- | --- |
 | `windows` | 0.58.0 | MIT OR Apache-2.0 | Win32 API bindings |
-| `wry` | 0.47.2 | Apache-2.0 OR MIT | WebView2 host for the panel |
-| `webview2-com` (+ `webview2-com-sys`) | 0.33.0 | MIT | WebView2 COM bindings (used by `wry`) |
+| `wry` | 0.57.0 | Apache-2.0 OR MIT | WebView2 host for the panel |
+| `webview2-com` (+ `webview2-com-sys`) | 0.39.1 | MIT | WebView2 COM bindings (used by `wry`) |
 | `raw-window-handle` | 0.6.2 | MIT OR Apache-2.0 OR Zlib | window handle interop |
 | `serde` | 1.0.229 | MIT OR Apache-2.0 | serialisation |
 | `serde_json` | 1.0.154 | MIT OR Apache-2.0 | JSON store and IPC |
@@ -44,18 +44,25 @@ Listed by `cargo tree -e normal --target x86_64-pc-windows-msvc`:
 | `once_cell` | 1.21.4 | MIT OR Apache-2.0 |
 | `powerfmt` | 0.2.1 | MIT OR Apache-2.0 |
 | `serde_core`, `serde_derive` | 1.0.229 | MIT OR Apache-2.0 |
-| `thiserror`, `thiserror-impl` | 1.0.69 | MIT OR Apache-2.0 |
+| `thiserror`, `thiserror-impl` | 2.0.21 | MIT OR Apache-2.0 |
 | `time`, `time-core`, `time-macros` | 0.3.55 / 0.1.9 / 0.2.32 | MIT OR Apache-2.0 |
 | `unicode-ident` | 1.0.27 | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | `webview2-com-macros` | 0.8.1 | MIT |
-| `windows-core`, `windows-implement`, `windows-interface` | 0.58.0 | MIT OR Apache-2.0 |
-| `windows-result` | 0.2.0 | MIT OR Apache-2.0 |
-| `windows-strings` | 0.1.0 | MIT OR Apache-2.0 |
+| `windows` (used by `webview2-com` and `wry`) | 0.62.2 | MIT OR Apache-2.0 |
+| `windows-core` | 0.58.0, 0.62.2 | MIT OR Apache-2.0 |
+| `windows-implement` | 0.58.0, 0.60.2 | MIT OR Apache-2.0 |
+| `windows-interface` | 0.58.0, 0.59.3 | MIT OR Apache-2.0 |
+| `windows-result` | 0.2.0, 0.4.1 | MIT OR Apache-2.0 |
+| `windows-strings` | 0.1.0, 0.5.1 | MIT OR Apache-2.0 |
+| `windows-collections`, `windows-future`, `windows-numerics`, `windows-threading` | 0.3.2 / 0.3.2 / 0.3.1 / 0.2.1 | MIT OR Apache-2.0 |
 | `windows-targets`, `windows_x86_64_msvc` | 0.52.6 | MIT OR Apache-2.0 |
 | `windows-link` | 0.2.1 | MIT OR Apache-2.0 |
 | `windows-version` | 0.1.7 | MIT OR Apache-2.0 |
 | `zmij` | 1.0.23 | MIT |
 | `proc-macro2`, `quote`, `syn` | 1.0.107 / 1.0.47 / 2.0.119, 3.0.9 | MIT OR Apache-2.0 (build-time macros only) |
+
+Two versions of the `windows` crate family ship side by side: Sessionmux's own Win32 code uses
+`windows` 0.58, and `wry` reaches WebView2 through `webview2-com`, which uses `windows` 0.62.
 
 `Cargo.lock` also lists crates that `wry` uses on macOS and Linux only (for example
 `base64` and `sha2`); they are not compiled into the Windows build.
@@ -95,7 +102,7 @@ from the authors named in its `Cargo.toml`.
 
 | Crates | Copyright |
 | --- | --- |
-| `windows`, `windows-core`, `windows-implement`, `windows-interface`, `windows-result`, `windows-strings`, `windows-targets`, `windows_x86_64_msvc`, `windows-link`, `windows-version` | Copyright (c) Microsoft Corporation. |
+| `windows`, `windows-core`, `windows-implement`, `windows-interface`, `windows-result`, `windows-strings`, `windows-collections`, `windows-future`, `windows-numerics`, `windows-threading`, `windows-targets`, `windows_x86_64_msvc`, `windows-link`, `windows-version` | Copyright (c) Microsoft Corporation. |
 | `wry` | Copyright (c) 2020-2023 Ngo Iok Ui & Tauri Programme within The Commons Conservancy |
 | `webview2-com`, `webview2-com-sys`, `webview2-com-macros` | Copyright (c) the webview2-rs contributors |
 | `raw-window-handle` | Copyright (c) 2019-2020 Osspial |

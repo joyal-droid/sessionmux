@@ -27,10 +27,12 @@
 //! `user_data() -> PathBuf` (%APPDATA%\Sessionmux, overridable via `set_user_data()` for smoke);
 //! `set_folders(Option<(home, roaming, local)>)` (smoke demo fixture: replaces the three folders);
 //! `slug(cwd) -> String` (every char not [A-Za-z0-9] -> '-');
-//! `same_path(a, b) -> bool` (case-insensitive, trailing-slash tolerant).
+//! `same_path(a, b) -> bool`, `norm_path(p)`, `is_under(child, dir)` (the system's path rules).
+//! The real folders and the path rules come from the platform layer; the overrides live here.
 
 use crate::brand;
-use std::path::{Path, PathBuf};
+use crate::platform::{Os, Paths};
+use std::path::PathBuf;
 use std::sync::RwLock;
 
 static USER_DATA_OVERRIDE: RwLock<Option<PathBuf>> = RwLock::new(None);
@@ -51,43 +53,28 @@ fn folder_override(pick: fn(&(PathBuf, PathBuf, PathBuf)) -> &PathBuf) -> Option
     FOLDERS_OVERRIDE.read().ok().and_then(|g| g.as_ref().map(|f| pick(f).clone()))
 }
 
-fn env_dir(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from)
-}
-
 /// The user's home directory (%USERPROFILE%).
 pub fn home() -> PathBuf {
     if let Some(p) = folder_override(|f| &f.0) {
         return p;
     }
-    env_dir("USERPROFILE")
-        .or_else(|| {
-            let mut s = std::env::var_os("HOMEDRIVE")?;
-            s.push(std::env::var_os("HOMEPATH")?);
-            Some(PathBuf::from(s))
-        })
-        .unwrap_or_else(|| {
-            // Last resort: the default profile on the system drive, built at run time.
-            let mut drive = std::env::var_os("SystemDrive").unwrap_or_else(|| "C:".into());
-            drive.push(std::path::MAIN_SEPARATOR_STR);
-            PathBuf::from(drive).join("Users").join("Default")
-        })
+    <Os as Paths>::home()
 }
 
-/// %APPDATA% (Roaming); falls back to `<home>\AppData\Roaming`.
+/// The per-user settings root (%APPDATA%, Roaming).
 pub fn app_data() -> PathBuf {
     if let Some(p) = folder_override(|f| &f.1) {
         return p;
     }
-    env_dir("APPDATA").unwrap_or_else(|| home().join("AppData").join("Roaming"))
+    <Os as Paths>::config_root()
 }
 
-/// %LOCALAPPDATA%; falls back to `<home>\AppData\Local`.
+/// The per-user local data root (%LOCALAPPDATA%).
 pub fn local_app_data() -> PathBuf {
     if let Some(p) = folder_override(|f| &f.2) {
         return p;
     }
-    env_dir("LOCALAPPDATA").unwrap_or_else(|| home().join("AppData").join("Local"))
+    <Os as Paths>::local_root()
 }
 
 /// Sessionmux's own data folder: `%APPDATA%\Sessionmux` unless overridden (smoke mode).
@@ -124,8 +111,9 @@ pub fn log_file() -> PathBuf {
 }
 
 /// Claude Code project slug: every character not in [A-Za-z0-9] becomes '-'.
-/// e.g. `C:\Users\u\x` -> `C--Users-u-x`. Works per UTF-16 unit (no `u`
-/// flag), as Claude Code does, so an astral character such as an emoji becomes two dashes.
+/// e.g. `C:\Users\u\x` -> `C--Users-u-x`, `/Users/me/proj` -> `-Users-me-proj`. Works per UTF-16
+/// unit (no `u` flag), as Claude Code does, so an astral character such as an emoji becomes two
+/// dashes.
 pub fn slug(cwd: &str) -> String {
     let mut out = String::with_capacity(cwd.len());
     for c in cwd.chars() {
@@ -140,40 +128,23 @@ pub fn slug(cwd: &str) -> String {
     out
 }
 
-/// Normalise for comparisons: strip surrounding quotes, make absolute, '/' -> '\', drop trailing
-/// separators, lowercase. Empty input gives an empty string.
+/// Normalise for comparisons with the system's rules (on Windows: quotes stripped, absolute,
+/// '/' -> '\', no trailing separators, lowercase). Empty input gives an empty string.
+#[allow(dead_code)] // used only by the unit tests
 pub fn norm_path(p: &str) -> String {
-    let t = p.trim_matches('"');
-    if t.is_empty() {
-        return String::new();
-    }
-    let t = t.replace('/', "\\");
-    let abs = std::path::absolute(Path::new(&t)).unwrap_or_else(|_| PathBuf::from(&t));
-    let mut s = abs.to_string_lossy().into_owned();
-    while s.len() > 1 && s.ends_with('\\') {
-        s.pop();
-    }
-    s.to_lowercase()
+    <Os as Paths>::norm_path(p)
 }
 
-/// True if two paths refer to the same location (case-insensitive, trailing-slash tolerant).
-/// Empty paths never match.
+/// True if two paths refer to the same location (on Windows: case-insensitive, trailing-slash
+/// tolerant). Empty paths never match.
 pub fn same_path(a: &str, b: &str) -> bool {
-    if a.is_empty() || b.is_empty() {
-        return false;
-    }
-    let (na, nb) = (norm_path(a), norm_path(b));
-    !na.is_empty() && na == nb
+    <Os as Paths>::same_path(a, b)
 }
 
-/// True if `child` is `dir` itself or lies inside it (normalised, case-insensitive).
+/// True if `child` is `dir` itself or lies inside it (normalised).
 #[allow(dead_code)] // used only by the unit tests
 pub fn is_under(child: &str, dir: &str) -> bool {
-    let (c, d) = (norm_path(child), norm_path(dir));
-    if c.is_empty() || d.is_empty() {
-        return false;
-    }
-    c == d || (c.starts_with(&d) && c.as_bytes().get(d.len()) == Some(&b'\\'))
+    <Os as Paths>::is_under(child, dir)
 }
 
 #[cfg(test)]
@@ -190,20 +161,19 @@ mod tests {
     }
 
     #[test]
-    fn same_path_rules() {
-        assert!(same_path(r"C:\Users\A\AppData", r"c:\users\a\appdata\"));
-        assert!(same_path("C:/x/y/", r"C:\X\Y"));
-        assert!(same_path(r#""C:\x""#, r"C:\x"));
-        assert!(!same_path(r"C:\x", r"C:\xy"));
-        assert!(!same_path("", ""));
-        assert!(!same_path(r"C:\x", ""));
+    fn slug_of_a_posix_path() {
+        assert_eq!(slug("/Users/me/proj"), "-Users-me-proj");
+        assert_eq!(slug("/home/a b/c.d"), "-home-a-b-c-d");
     }
 
+    #[cfg(windows)]
     #[test]
-    fn is_under_rules() {
+    fn path_rules_follow_the_system() {
+        assert!(same_path(r"C:\Users\A\AppData", r"c:\users\a\appdata\"));
+        assert!(!same_path("", ""));
         assert!(is_under(r"C:\a\b\c.exe", r"C:\A\b\"));
-        assert!(is_under(r"C:\a\b", r"C:\a\b"));
         assert!(!is_under(r"C:\a\bc", r"C:\a\b"));
+        assert_eq!(norm_path(r"C:\X\"), r"c:\x");
     }
 
     #[test]

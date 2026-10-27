@@ -23,32 +23,40 @@
 //! Sign-in routing for extra accounts.
 //!
 //! While an account Sessionmux opened is waiting to sign in, Sessionmux temporarily becomes the
-//! per-user `claude://` handler (`HKCU\Software\Classes\claude\shell\open\command`), forwards each
-//! link to that account's instance (`Sessionmux.exe --relay "%1"` → `"<Claude.exe>"
-//! --user-data-dir="<dir>" "<url>"`) and restores the saved handler afterwards. The state lives in
+//! per-user `claude://` handler, forwards each link to that account's instance and restores the
+//! saved handler afterwards. On Windows the handler is `HKCU\Software\Classes\claude\shell\open\
+//! command` and a link arrives as `Sessionmux.exe --relay "%1"`. The state lives in
 //! `<user_data>\relay.json` so the short-lived `--relay` process can read it.
+//!
+//! Handler changes go through the platform's [`UrlHandler`]. A change can also stay unanswered
+//! (`Pending`: the relay keeps reading the handler and treats a later switch as done) or be
+//! refused by the user (`Declined`: never asked again in that relay). A restore the user refused
+//! sets `restoreDeclined`, which stops automatic restores until the user asks for one.
 //!
 //! Contract:
 //! ```ignore
 //! pub const PROTOCOL: &str = "claude"; pub const TIMEOUT_SECS: u64 = 900; pub const POLL_MS: u64 = 2000;
 //! pub const FILE: &str = "relay.json";
-//! pub struct RelayState { active, account_id, account_name, data_dir, since, original_command }
-//! pub fn read_handler(protocol) -> Option<String>; pub fn write_handler(protocol, command) -> Result<(), String>;
-//! pub fn our_command() -> String; pub fn points_at_us(command) -> bool; pub fn default_command(exe) -> String;
+//! pub struct RelayState { active, account_id, account_name, data_dir, since, original_command,
+//!                         handler_pending, handler_declined, retakes, restore_pending, restore_declined }
 //! impl Relay { open(user_data), open_with(user_data, Option<protocol>), state(), begin(id, name, dir),
-//!              ensure() -> Result<bool, String>, end(), expired(now_secs) }
+//!              ensure() -> Result<bool, String>, end(), defer_restore(), restore_settled(), restore_now(),
+//!              expired(now_secs) }
 //! pub fn validate_url(url) -> Result<String, String>; pub fn relay_target(Option<&RelayState>) -> Option<String>;
-//! pub fn forward(url, exe, data_dir) -> Result<(), String>; pub fn redact(url) -> String; pub fn now_secs() -> u64;
-//! pub fn signal_bad_link(); pub fn signal_bad_link_to(hwnd_msg) -> bool;
+//! pub fn forward(url, exe, data_dir) -> Result<(), ForwardError>; pub fn forward_to(l, data_dir, pid, url);
+//! pub fn redact(url) -> String; pub fn now_secs() -> u64; pub fn signal_bad_link();
 //! ```
-//! Unit tests (`cfg(test)`) never touch the real `claude` key: `Relay::open` then has no
-//! registry at all, and the registry tests use a throw-away `sessionmux-test-<uuid>` protocol.
+//! Unit tests (`cfg(test)`) never touch the real `claude` handler: `Relay::open` then manages no
+//! handler at all, and the handler tests use a fake [`UrlHandler`] or a throw-away
+//! `sessionmux-test-<uuid>` scheme.
 
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 use crate::brand;
-use crate::core::claude_app;
-use crate::util::{date, json, log, registry};
+use crate::core::claude_app::{self, Located};
+use crate::platform::{ForwardError, HandlerChange, HandlerId, Os, Pid, UrlHandler};
+use crate::util::{date, json, log};
 
 pub const PROTOCOL: &str = "claude";
 pub const TIMEOUT_SECS: u64 = 15 * 60;
@@ -70,99 +78,85 @@ pub struct RelayState {
     pub data_dir: String,
     /// ISO-8601 UTC.
     pub since: String,
-    /// The handler value that was there before us (None: there was none).
+    /// The handler that was there before us (None: there was none).
     #[serde(rename = "originalCommand")]
     pub original_command: Option<String>,
+    /// Taking the handler is still waiting for the user's answer.
+    #[serde(rename = "handlerPending", default, skip_serializing_if = "is_false")]
+    pub handler_pending: bool,
+    /// The user kept Claude as the handler: links are not routed in this relay.
+    #[serde(rename = "handlerDeclined", default, skip_serializing_if = "is_false")]
+    pub handler_declined: bool,
+    /// How often this relay took the handler back after Claude claimed it (counted only where
+    /// that is limited).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retakes: u32,
+    /// The relay ended but giving the handler back still waits for the user's answer.
+    #[serde(rename = "restorePending", default, skip_serializing_if = "is_false")]
+    pub restore_pending: bool,
+    /// The user chose to keep Sessionmux as the handler: no automatic restore until asked.
+    #[serde(rename = "restoreDeclined", default, skip_serializing_if = "is_false")]
+    pub restore_declined: bool,
 }
 
-// ───────────────────────────────────────────────────────────── registry ──
-
-fn command_key(protocol: &str) -> String {
-    format!("Software\\Classes\\{protocol}\\shell\\open\\command")
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
-/// `(Default)` of `HKCU\Software\Classes\<protocol>\shell\open\command`.
-pub fn read_handler(protocol: &str) -> Option<String> {
-    registry::read_default(&command_key(protocol))
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
-/// Set that value, creating the key path when missing.
-pub fn write_handler(protocol: &str, command: &str) -> Result<(), String> {
-    registry::write_default(&command_key(protocol), command)
-}
-
-/// Full path of the running exe (GetModuleFileNameW; falls back to `std::env::current_exe`).
-pub fn current_exe() -> String {
-    use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
-    let mut buf = vec![0u16; 512];
-    loop {
-        // SAFETY: a None module selects the current exe; buf is a valid writable slice.
-        let n = unsafe { GetModuleFileNameW(None, &mut buf) } as usize;
-        if n == 0 {
-            break;
+impl RelayState {
+    fn new(account_id: &str, account_name: &str, data_dir: &str, original_command: Option<String>) -> RelayState {
+        RelayState {
+            active: true,
+            account_id: account_id.to_string(),
+            account_name: account_name.to_string(),
+            data_dir: data_dir.to_string(),
+            since: date::iso_now(),
+            original_command,
+            handler_pending: false,
+            handler_declined: false,
+            retakes: 0,
+            restore_pending: false,
+            restore_declined: false,
         }
-        if n < buf.len() {
-            return String::from_utf16_lossy(&buf[..n]);
-        }
-        if buf.len() >= 32 * 1024 {
-            break;
-        }
-        let len = buf.len() * 2;
-        buf.resize(len, 0);
     }
-    std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| brand::EXE.to_string())
-}
-
-/// `"<full path of current exe>" --relay "%1"`.
-pub fn our_command() -> String {
-    format!("\"{}\" --relay \"%1\"", current_exe())
-}
-
-/// `"<exe>" "%1"` — what Claude itself registers; the fallback when nothing was saved.
-pub fn default_command(exe: &str) -> String {
-    format!("\"{}\" \"%1\"", exe)
-}
-
-/// argv[0] of a handler command line (quoted or bare).
-fn command_exe(command: &str) -> &str {
-    let c = command.trim_start();
-    if let Some(rest) = c.strip_prefix('"') {
-        rest.split('"').next().unwrap_or("")
-    } else {
-        c.split(char::is_whitespace).next().unwrap_or("")
-    }
-}
-
-/// True when `command` runs an Sessionmux relay: its exe is the current exe or any `Sessionmux.exe`
-/// (an older install location still counts — it must never be saved as the "original"), and it
-/// carries `--relay`.
-pub fn points_at_us(command: &str) -> bool {
-    let exe = command_exe(command);
-    if exe.is_empty() || !command.to_ascii_lowercase().contains("--relay") {
-        return false;
-    }
-    let leaf = exe.rsplit(['\\', '/']).next().unwrap_or(exe);
-    leaf.eq_ignore_ascii_case(brand::EXE) || crate::util::paths::same_path(exe, &current_exe())
 }
 
 // ───────────────────────────────────────────────────────────── state ──
 
-/// The relay state of one Sessionmux user-data folder.
-pub struct Relay {
+/// The relay state of one Sessionmux user-data folder, managing the handler through `H`.
+pub struct Relay<H: UrlHandler = Os> {
     user_data: PathBuf,
-    /// Protocol whose handler we manage; None = no registry at all (unit tests of other modules).
+    /// Scheme whose handler we manage; None = no handler at all (unit tests of other modules).
     protocol: Option<String>,
+    handler: PhantomData<H>,
 }
 
-impl Relay {
+impl<H: UrlHandler> Clone for Relay<H> {
+    fn clone(&self) -> Self {
+        Relay { user_data: self.user_data.clone(), protocol: self.protocol.clone(), handler: PhantomData }
+    }
+}
+
+impl Relay<Os> {
     /// Relay for `user_data` managing the real `claude` handler (none under `cfg(test)`).
     pub fn open(user_data: &Path) -> Relay {
         Self::open_with(user_data, if cfg!(test) { None } else { Some(PROTOCOL) })
     }
 
-    /// Full control: `protocol` None disables every registry access (relay.json only).
+    /// Full control: `protocol` None disables every handler access (relay.json only).
     pub fn open_with(user_data: &Path, protocol: Option<&str>) -> Relay {
-        Relay { user_data: user_data.to_path_buf(), protocol: protocol.map(str::to_string) }
+        Relay::using(user_data, protocol)
+    }
+}
+
+impl<H: UrlHandler> Relay<H> {
+    /// A relay whose handler changes go through `H`.
+    pub fn using(user_data: &Path, protocol: Option<&str>) -> Relay<H> {
+        Relay { user_data: user_data.to_path_buf(), protocol: protocol.map(str::to_string), handler: PhantomData }
     }
 
     fn file(&self) -> PathBuf {
@@ -201,38 +195,55 @@ impl Relay {
         }
     }
 
-    /// Save the current handler (unless it already points at us), persist state, write our command.
+    /// True while the handler of our scheme is Sessionmux.
+    fn handler_is_us(&self, protocol: &str) -> bool {
+        H::current(protocol).is_some_and(|h| H::is_us(&h))
+    }
+
+    /// Save the current handler (unless it already is us), persist state, take the handler.
+    /// A take that waits for the user's answer or that the user refused still starts the relay
+    /// (`handlerPending` / `handlerDeclined`); only a failed take is an error.
     pub fn begin(&self, account_id: &str, account_name: &str, data_dir: &str) -> Result<RelayState, String> {
         if data_dir.trim().is_empty() {
             return Err("relay: dataDir required".into());
         }
-        let current = self.protocol.as_deref().and_then(read_handler);
+        let current = self.protocol.as_deref().and_then(H::current);
         let original_command = match &current {
             // Already ours (a previous relay or a crash): keep whatever was saved before.
-            Some(c) if points_at_us(c) => self.state().and_then(|s| s.original_command),
-            other => other.clone(),
+            Some(h) if H::is_us(h) => self.state().and_then(|s| s.original_command),
+            other => other.as_ref().map(|h| h.0.clone()),
         };
-        let st = RelayState {
-            active: true,
-            account_id: account_id.to_string(),
-            account_name: account_name.to_string(),
-            data_dir: data_dir.to_string(),
-            since: date::iso_now(),
-            original_command,
-        };
+        let mut st = RelayState::new(account_id, account_name, data_dir, original_command);
         self.persist(&st)?;
         if let Some(p) = self.protocol.as_deref() {
-            if let Err(e) = write_handler(p, &our_command()) {
-                let _ = self.remove_file();
-                return Err(format!("relay: {e}"));
+            match H::take(p) {
+                HandlerChange::Done => {}
+                HandlerChange::Pending => {
+                    st.handler_pending = true;
+                    self.persist(&st)?;
+                    log::info("relay: waiting for the answer on taking sign-in links");
+                }
+                HandlerChange::Declined => {
+                    st.handler_declined = true;
+                    self.persist(&st)?;
+                    log::info("relay: sign-in links stay with Claude (declined)");
+                    return Ok(st);
+                }
+                HandlerChange::Failed(e) => {
+                    let _ = self.remove_file();
+                    return Err(format!("relay: {e}"));
+                }
             }
         }
         log::info(&format!("relay: routing sign-in links to {}", st.account_name));
         Ok(st)
     }
 
-    /// Re-apply our command if Claude re-registered the handler (called every POLL_MS while
-    /// active). The value Claude wrote becomes the one restored by [`Relay::end`].
+    /// Called every POLL_MS while active. A pending take becomes active once the handler reads
+    /// as us. If Claude took the handler back, the value Claude wrote becomes the one restored by
+    /// [`Relay::end`] and the handler is taken again, as often as the platform allows; past that
+    /// (and at once where changes ask the user) routing stops for this relay. Ok(true) when the
+    /// handler was taken again.
     pub fn ensure(&self) -> Result<bool, String> {
         let Some(mut st) = self.state().filter(|s| s.active) else {
             return Ok(false);
@@ -240,45 +251,148 @@ impl Relay {
         let Some(p) = self.protocol.as_deref() else {
             return Ok(false);
         };
-        let current = read_handler(p);
-        if current.as_deref().is_some_and(points_at_us) {
+        if st.handler_declined {
             return Ok(false);
         }
-        if current.is_some() && current != st.original_command {
-            st.original_command = current;
+        let current = H::current(p);
+        if current.as_ref().is_some_and(H::is_us) {
+            if st.handler_pending {
+                st.handler_pending = false;
+                self.persist(&st)?;
+                log::info("relay: sign-in links now open through Sessionmux");
+            }
+            return Ok(false);
+        }
+        if st.handler_pending {
+            return Ok(false); // still waiting for the answer
+        }
+        let mut dirty = false;
+        if let Some(c) = current.map(|h| h.0) {
+            if Some(&c) != st.original_command.as_ref() {
+                st.original_command = Some(c);
+                dirty = true;
+            }
+        }
+        let limit = if H::changes_need_consent() { Some(0) } else { H::retake_limit() };
+        if let Some(n) = limit {
+            if st.retakes >= n {
+                st.handler_declined = true;
+                self.persist(&st)?;
+                log::info("relay: Claude took the sign-in links back; routing stops for this sign-in");
+                return Ok(false);
+            }
+            st.retakes += 1;
+            dirty = true;
+        }
+        if dirty {
             self.persist(&st)?;
         }
-        write_handler(p, &our_command()).map_err(|e| format!("relay: {e}"))?;
+        match H::take(p) {
+            HandlerChange::Done => {}
+            HandlerChange::Pending => {
+                st.handler_pending = true;
+                self.persist(&st)?;
+            }
+            HandlerChange::Declined => {
+                st.handler_declined = true;
+                self.persist(&st)?;
+                log::info("relay: sign-in links stay with Claude (declined)");
+                return Ok(false);
+            }
+            HandlerChange::Failed(e) => return Err(format!("relay: {e}")),
+        }
         log::info("relay: handler was re-registered; re-applied");
         Ok(true)
     }
 
-    /// Restore the saved command (only if the handler still points at us), delete relay.json.
-    /// With nothing saved, Claude's own `"<exe>" "%1"` is restored when Claude can be located,
-    /// else our value is removed (Claude re-registers itself on its next start).
+    /// Restore the saved handler (only if the handler still is us), delete relay.json. With
+    /// nothing usable saved, Claude's own handler is restored when Claude can be located, else
+    /// ours is removed (Claude registers itself again on its next start). A restore waiting for
+    /// the user's answer keeps relay.json (`restorePending`, healed by a later call); one the user
+    /// refused keeps it too (`restoreDeclined`), and later calls then leave the handler alone.
     pub fn end(&self) -> Result<(), String> {
         let st = self.state();
+        if st.as_ref().is_some_and(|s| !s.active && s.restore_declined) {
+            return Ok(());
+        }
+        self.restore_with(st)
+    }
+
+    /// End the relay without changing the handler, leaving the restore to the next start
+    /// (`restorePending`): used at quit where every change asks the user, so quitting never waits
+    /// for an answer. A restore the user already refused stays refused. Asks nothing.
+    pub fn defer_restore(&self) -> Result<(), String> {
+        if self.protocol.is_none() {
+            return self.end(); // no handler to give back: only relay.json goes
+        }
+        let Some(mut st) = self.state() else { return Ok(()) };
+        if !st.active && (st.restore_pending || st.restore_declined) {
+            return Ok(());
+        }
+        st.active = false;
+        st.handler_pending = false;
+        st.restore_pending = true;
+        self.persist(&st)?;
+        log::info("relay: sign-in routing ended; sign-in links go back to Claude at the next start");
+        Ok(())
+    }
+
+    /// Give the links back because the user asked: also after an earlier refusal.
+    #[allow(dead_code)]
+    pub fn restore_now(&self) -> Result<(), String> {
+        self.restore_with(self.state())
+    }
+
+    /// While a restore waits for an answer: true once the handler no longer is us, and the
+    /// leftover relay.json is then removed. Asks nothing.
+    #[allow(dead_code)]
+    pub fn restore_settled(&self) -> bool {
+        let Some(st) = self.state().filter(|s| !s.active && s.restore_pending) else {
+            return true;
+        };
+        if self.protocol.as_deref().is_some_and(|p| self.handler_is_us(p)) {
+            return false;
+        }
+        let _ = self.remove_file();
+        log::info(&format!("relay: sign-in links are back with Claude ({})", st.account_name));
+        true
+    }
+
+    fn restore_with(&self, st: Option<RelayState>) -> Result<(), String> {
         let mut result = Ok(());
+        let mut keep: Option<RelayState> = None;
         if let Some(p) = self.protocol.as_deref() {
-            if read_handler(p).as_deref().is_some_and(points_at_us) {
-                let restore = st
-                    .as_ref()
-                    .and_then(|s| s.original_command.clone())
-                    // A Store update may have removed the saved Claude folder meanwhile.
-                    .filter(|c| !points_at_us(c) && Path::new(command_exe(c)).is_file())
-                    .or_else(|| claude_app::locate().ok().map(|l| default_command(&l.exe)));
-                result = match restore {
-                    Some(c) => write_handler(p, &c),
-                    None => registry::delete_default(&command_key(p)),
+            if self.handler_is_us(p) {
+                let prev = st.as_ref().and_then(|s| s.original_command.clone()).map(HandlerId);
+                let located = claude_app::locate().ok();
+                let finished = |pending: bool, declined: bool| {
+                    let mut s = st.clone().unwrap_or_else(|| RelayState::new("", "", "", None));
+                    s.active = false;
+                    s.handler_pending = false;
+                    s.restore_pending = pending;
+                    s.restore_declined = declined;
+                    s
+                };
+                match H::restore(p, prev.as_ref(), located.as_ref()) {
+                    HandlerChange::Done => {}
+                    HandlerChange::Pending => keep = Some(finished(true, false)),
+                    HandlerChange::Declined => keep = Some(finished(false, true)),
+                    HandlerChange::Failed(e) => result = Err(format!("relay: {e}")),
                 }
-                .map_err(|e| format!("relay: {e}"));
             }
         }
-        let removed = self.remove_file();
-        if st.is_some() {
+        let saved = match &keep {
+            Some(s) => self.persist(s),
+            None => self.remove_file(),
+        };
+        if st.as_ref().is_some_and(|s| s.active) {
             log::info("relay: sign-in routing ended");
         }
-        result.and(removed)
+        if let Some(s) = &keep {
+            let what = if s.restore_pending { "waits for an answer" } else { "was declined" };
+            log::info(&format!("relay: giving sign-in links back to Claude {what}"));
+        }
+        result.and(saved)
     }
 
     /// True when the active relay started `TIMEOUT_SECS` or more before `now_secs` (Unix
@@ -349,17 +463,7 @@ pub fn validate_url(url: &str) -> Result<String, String> {
 /// A refused `--relay` launch whose command line shows argument injection tells the running
 /// Sessionmux, if any, to play its tamper gesture. The relay process itself shows no UI; never blocks.
 pub fn signal_bad_link() {
-    if let Some(h) = crate::util::ui_thread::find_msg_window() {
-        signal_bad_link_to(h);
-    }
-}
-
-/// Post `WM_SESSIONMUX_GESTURE` to `hwnd_msg` (integers only; failure is ignored).
-pub fn signal_bad_link_to(hwnd_msg: windows::Win32::Foundation::HWND) -> bool {
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
-    // SAFETY: posts a private message with integer parameters; a stale handle just fails.
-    unsafe { PostMessageW(hwnd_msg, crate::util::ui_thread::WM_SESSIONMUX_GESTURE, WPARAM(0), LPARAM(0)) }.is_ok()
+    <Os as UrlHandler>::signal_bad_link();
 }
 
 /// `Some(data_dir)` while a relay is active (and names a profile).
@@ -384,10 +488,17 @@ pub fn relay_decision(state: Option<&RelayState>, now_secs: u64, sessionmux_runn
     (relay_target(Some(s)), false)
 }
 
-/// CreateProcessW: `"<exe>" [--user-data-dir="<dir>"] "<url>"`. The url is validated first.
-pub fn forward(url: &str, exe: &str, data_dir: Option<&str>) -> Result<(), String> {
+/// Deliver a link to the instance of `data_dir` (None = Main) through the platform; `pid` is
+/// that instance's main process when known. The url is validated first.
+pub fn forward_to(l: &Located, data_dir: Option<&str>, pid: Option<Pid>, url: &str) -> Result<(), ForwardError> {
     let url = validate_url(url)?;
-    claude_app::launch_url(exe, data_dir, &url).map(|_| ())
+    <Os as UrlHandler>::forward(l, data_dir, pid, &url)
+}
+
+/// [`forward_to`] for a caller that knows only Claude's exe (the `--relay` process).
+pub fn forward(url: &str, exe: &str, data_dir: Option<&str>) -> Result<(), ForwardError> {
+    let l = Located { exe: exe.to_string(), ..Located::default() };
+    forward_to(&l, data_dir, None, url)
 }
 
 /// `scheme://host/path` of a link for the log: no query, no fragment, at most 200 chars.
@@ -399,28 +510,8 @@ pub fn redact(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Throw-away protocol `sessionmux-test-<uuid>`; its whole `HKCU\Software\Classes\<p>` tree
-    /// is deleted on drop (also when the test panics).
-    struct TestProtocol(String);
-
-    impl TestProtocol {
-        fn new() -> TestProtocol {
-            TestProtocol(format!("sessionmux-test-{}", uuid::Uuid::new_v4()))
-        }
-        fn root(&self) -> String {
-            format!("Software\\Classes\\{}", self.0)
-        }
-    }
-
-    impl Drop for TestProtocol {
-        fn drop(&mut self) {
-            assert!(self.0.starts_with("sessionmux-test-"));
-            registry::delete_tree(&self.root());
-        }
-    }
-
-    const CLAUDE: &str = r#""C:\Program Files\WindowsApps\Claude_3.6556.2.0_x64__pzs8sxrjxfjjc\app\Claude.exe" "%1""#;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
 
     fn st(active: bool, dir: &str) -> RelayState {
         RelayState {
@@ -430,69 +521,298 @@ mod tests {
             data_dir: dir.into(),
             since: "2026-10-26T08:00:00.000Z".into(),
             original_command: None,
+            handler_pending: false,
+            handler_declined: false,
+            retakes: 0,
+            restore_pending: false,
+            restore_declined: false,
         }
     }
 
-    #[test]
-    fn registry_round_trip() {
-        let tp = TestProtocol::new();
-        assert_eq!(read_handler(&tp.0), None);
-        assert!(!registry::key_exists(&tp.root()));
-        write_handler(&tp.0, CLAUDE).unwrap();
-        assert_eq!(read_handler(&tp.0).as_deref(), Some(CLAUDE));
-        assert!(!points_at_us(CLAUDE));
-        let ours = our_command();
-        write_handler(&tp.0, &ours).unwrap();
-        assert_eq!(read_handler(&tp.0).as_deref(), Some(ours.as_str()));
-        assert!(points_at_us(&ours));
-        // A long value round-trips too (buffer growth).
-        let long = format!("\"C:\\{}\\Claude.exe\" \"%1\"", "x".repeat(2000));
-        write_handler(&tp.0, &long).unwrap();
-        assert_eq!(read_handler(&tp.0).as_deref(), Some(long.as_str()));
-        write_handler(&tp.0, CLAUDE).unwrap();
-        assert_eq!(read_handler(&tp.0).as_deref(), Some(CLAUDE));
-        registry::delete_default(&command_key(&tp.0)).unwrap();
-        assert_eq!(read_handler(&tp.0), None);
-        registry::delete_tree(&tp.root());
-        assert!(!registry::key_exists(&tp.root()));
+    // ── a scripted handler, one per test thread ──
+
+    const US: &str = "sessionmux";
+    const CLAUDE_APP: &str = "claude-app";
+
+    #[derive(Default)]
+    struct FakeState {
+        current: Option<String>,
+        takes: VecDeque<HandlerChange>,
+        restores: VecDeque<HandlerChange>,
+        consent: bool,
+        limit: Option<u32>,
+        take_calls: u32,
+        restore_calls: u32,
     }
 
-    #[test]
-    fn command_shapes() {
-        let ours = our_command();
-        assert!(ours.starts_with('"'));
-        assert!(ours.ends_with(" --relay \"%1\""));
-        assert!(Path::new(command_exe(&ours)).is_absolute());
-        assert!(points_at_us(&ours));
-        assert!(points_at_us(r#""C:\Other\Place\SESSIONMUX.EXE" --relay "%1""#));
-        assert!(!points_at_us(r#""C:\Other\Place\Sessionmux.exe" "%1""#));
-        assert!(!points_at_us(CLAUDE));
-        assert!(!points_at_us(""));
-        assert_eq!(default_command(r"C:\a b\Claude.exe"), r#""C:\a b\Claude.exe" "%1""#);
-        assert_eq!(command_exe(r"C:\x\a.exe --relay %1"), r"C:\x\a.exe");
+    thread_local! {
+        static FAKE: RefCell<FakeState> = RefCell::new(FakeState::default());
     }
 
-    /// The bad-link hand-off reaches a message window as WM_SESSIONMUX_GESTURE. Uses a private
-    /// window of this test only (never `signal_bad_link`, which would find a running Sessionmux).
-    #[test]
-    fn bad_link_posts_gesture_message() {
-        use crate::util::ui_thread;
-        use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, PeekMessageW, MSG, PM_REMOVE};
-        let hwnd = ui_thread::create_msg_window(None);
-        assert!(!hwnd.is_invalid());
-        assert!(signal_bad_link_to(hwnd));
-        let mut msg = MSG::default();
-        let mut seen = 0;
-        // SAFETY: reads this thread's queue for its own window, then destroys that window.
-        unsafe {
-            while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE).as_bool() {
-                if msg.message == ui_thread::WM_SESSIONMUX_GESTURE {
-                    seen += 1;
+    fn fake<R>(f: impl FnOnce(&mut FakeState) -> R) -> R {
+        FAKE.with(|s| f(&mut s.borrow_mut()))
+    }
+
+    struct Fake;
+
+    impl UrlHandler for Fake {
+        fn current(_scheme: &str) -> Option<HandlerId> {
+            fake(|s| s.current.clone().map(HandlerId))
+        }
+        fn take(_scheme: &str) -> HandlerChange {
+            fake(|s| {
+                s.take_calls += 1;
+                let r = s.takes.pop_front().unwrap_or(HandlerChange::Done);
+                if r == HandlerChange::Done {
+                    s.current = Some(US.into());
                 }
-            }
-            let _ = DestroyWindow(hwnd);
+                r
+            })
         }
-        assert_eq!(seen, 1);
+        fn restore(_scheme: &str, prev: Option<&HandlerId>, _l: Option<&Located>) -> HandlerChange {
+            fake(|s| {
+                s.restore_calls += 1;
+                let r = s.restores.pop_front().unwrap_or(HandlerChange::Done);
+                if r == HandlerChange::Done {
+                    s.current = Some(prev.map(|h| h.0.clone()).unwrap_or_else(|| CLAUDE_APP.into()));
+                }
+                r
+            })
+        }
+        fn is_us(h: &HandlerId) -> bool {
+            h.0 == US
+        }
+        fn changes_need_consent() -> bool {
+            fake(|s| s.consent)
+        }
+        fn retake_limit() -> Option<u32> {
+            fake(|s| s.limit)
+        }
+        fn unavailable() -> Option<String> {
+            None
+        }
+        fn forward(_l: &Located, _d: Option<&str>, _p: Option<Pid>, _u: &str) -> Result<(), ForwardError> {
+            Ok(())
+        }
+        fn signal_bad_link() {}
+    }
+
+    fn fake_relay(d: &Path) -> Relay<Fake> {
+        fake(|s| {
+            *s = FakeState::default();
+            s.current = Some(CLAUDE_APP.into());
+        });
+        Relay::<Fake>::using(d, Some("claude"))
+    }
+
+    const DIR: &str = "/profiles/Claude-Work";
+
+    #[test]
+    fn pending_take_then_done_activates_routing() {
+        let d = tempfile::tempdir().unwrap();
+        let r = fake_relay(d.path());
+        fake(|s| s.takes.push_back(HandlerChange::Pending));
+        let s = r.begin("a1", "Work", DIR).unwrap();
+        assert!(s.active && s.handler_pending);
+        assert_eq!(s.original_command.as_deref(), Some(CLAUDE_APP));
+        // No answer yet: nothing is asked again, routing waits.
+        assert_eq!(r.ensure(), Ok(false));
+        assert!(r.state().unwrap().handler_pending);
+        assert_eq!(fake(|s| s.take_calls), 1);
+        // The user answered Use: the next tick sees us and routing is active.
+        fake(|s| s.current = Some(US.into()));
+        assert_eq!(r.ensure(), Ok(false));
+        let s = r.state().unwrap();
+        assert!(s.active && !s.handler_pending && !s.handler_declined);
+        assert_eq!(fake(|s| s.take_calls), 1);
+        assert_eq!(relay_target(Some(&s)).as_deref(), Some(DIR));
+    }
+
+    #[test]
+    fn declined_take_ends_routing_without_asking_again() {
+        let d = tempfile::tempdir().unwrap();
+        let r = fake_relay(d.path());
+        fake(|s| s.takes.push_back(HandlerChange::Declined));
+        let s = r.begin("a1", "Work", DIR).unwrap();
+        assert!(s.active && s.handler_declined);
+        for _ in 0..3 {
+            assert_eq!(r.ensure(), Ok(false));
+        }
+        assert_eq!(fake(|s| s.take_calls), 1);
+        // The handler never was ours: ending asks nothing and removes relay.json.
+        r.end().unwrap();
+        assert_eq!(fake(|s| s.restore_calls), 0);
+        assert_eq!(r.state(), None);
+    }
+
+    #[test]
+    fn failed_take_is_an_error() {
+        let d = tempfile::tempdir().unwrap();
+        let r = fake_relay(d.path());
+        fake(|s| s.takes.push_back(HandlerChange::Failed("nope".into())));
+        assert!(r.begin("a1", "Work", DIR).is_err());
+        assert_eq!(r.state(), None);
+    }
+
+    #[test]
+    fn with_consent_a_taken_back_handler_is_never_retaken() {
+        let d = tempfile::tempdir().unwrap();
+        let r = fake_relay(d.path());
+        fake(|s| s.consent = true);
+        r.begin("a1", "Work", DIR).unwrap();
+        fake(|s| s.current = Some("claude-new".into()));
+        assert_eq!(r.ensure(), Ok(false));
+        let s = r.state().unwrap();
+        assert!(s.handler_declined);
+        assert_eq!(s.original_command.as_deref(), Some("claude-new"));
+        assert_eq!(r.ensure(), Ok(false));
+        assert_eq!(fake(|s| s.take_calls), 1);
+    }
+
+    #[test]
+    fn retakes_stop_at_the_limit() {
+        let d = tempfile::tempdir().unwrap();
+        let r = fake_relay(d.path());
+        fake(|s| s.limit = Some(1));
+        r.begin("a1", "Work", DIR).unwrap();
+        fake(|s| s.current = Some(CLAUDE_APP.into()));
+        assert_eq!(r.ensure(), Ok(true));
+        assert_eq!(r.state().unwrap().retakes, 1);
+        fake(|s| s.current = Some(CLAUDE_APP.into()));
+        assert_eq!(r.ensure(), Ok(false));
+        assert!(r.state().unwrap().handler_declined);
+        assert_eq!(fake(|s| s.take_calls), 2);
+    }
+
+    #[test]
+    fn unlimited_retakes_keep_the_file_shape() {
+        let d = tempfile::tempdir().unwrap();
+        let r = fake_relay(d.path());
+        r.begin("a1", "Work", DIR).unwrap();
+        for _ in 0..3 {
+            fake(|s| s.current = Some(CLAUDE_APP.into()));
+            assert_eq!(r.ensure(), Ok(true));
+        }
+        let raw: serde_json::Value = json::read(&d.path().join(FILE)).unwrap();
+        let keys: Vec<&String> = raw.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["accountId", "accountName", "active", "dataDir", "originalCommand", "since"]);
+    }
+
+    #[test]
+    fn pending_restore_is_kept_and_heals_later() {
+        let d = tempfile::tempdir().unwrap();
+        let r = fake_relay(d.path());
+        r.begin("a1", "Work", DIR).unwrap();
+        fake(|s| s.restores.push_back(HandlerChange::Pending));
+        r.end().unwrap();
+        let s = r.state().unwrap();
+        assert!(!s.active && s.restore_pending && !s.restore_declined);
+        assert_eq!(relay_decision(Some(&s), now_secs(), true), (None, false));
+        // Still ours: the check asks nothing and keeps waiting.
+        assert!(!r.restore_settled());
+        assert_eq!(fake(|s| s.restore_calls), 1);
+        // The user answered: the next check removes the leftover state.
+        fake(|s| s.current = Some(CLAUDE_APP.into()));
+        assert!(r.restore_settled());
+        assert_eq!(r.state(), None);
+    }
+
+    #[test]
+    fn pending_restore_is_asked_again_at_the_next_start() {
+        let d = tempfile::tempdir().unwrap();
+        let r = fake_relay(d.path());
+        r.begin("a1", "Work", DIR).unwrap();
+        fake(|s| s.restores.push_back(HandlerChange::Pending));
+        r.end().unwrap();
+        // The next start ends the leftover relay: one more restore, which completes.
+        r.end().unwrap();
+        assert_eq!(fake(|s| s.restore_calls), 2);
+        assert_eq!(fake(|s| s.current.clone()).as_deref(), Some(CLAUDE_APP));
+        assert_eq!(r.state(), None);
+    }
+
+    #[test]
+    fn a_deferred_restore_asks_nothing_and_heals_at_the_next_start() {
+        let d = tempfile::tempdir().unwrap();
+        let r = fake_relay(d.path());
+        r.begin("a1", "Work", DIR).unwrap();
+        r.defer_restore().unwrap();
+        let s = r.state().unwrap();
+        assert!(!s.active && s.restore_pending && !s.restore_declined);
+        assert_eq!(s.original_command.as_deref(), Some(CLAUDE_APP));
+        assert_eq!(fake(|s| s.restore_calls), 0);
+        assert_eq!(fake(|s| s.current.clone()).as_deref(), Some(US));
+        // A link arriving in between is not routed.
+        assert_eq!(relay_decision(Some(&s), now_secs(), true), (None, false));
+        // The next start ends the leftover relay with the one restore.
+        r.end().unwrap();
+        assert_eq!(fake(|s| s.restore_calls), 1);
+        assert_eq!(fake(|s| s.current.clone()).as_deref(), Some(CLAUDE_APP));
+        assert_eq!(r.state(), None);
+        // Nothing saved: nothing to defer.
+        r.defer_restore().unwrap();
+        assert_eq!(r.state(), None);
+    }
+
+    #[test]
+    fn a_deferred_restore_keeps_an_earlier_refusal() {
+        let d = tempfile::tempdir().unwrap();
+        let r = fake_relay(d.path());
+        r.begin("a1", "Work", DIR).unwrap();
+        fake(|s| s.restores.push_back(HandlerChange::Declined));
+        r.end().unwrap();
+        r.defer_restore().unwrap();
+        let s = r.state().unwrap();
+        assert!(s.restore_declined && !s.restore_pending);
+    }
+
+    #[test]
+    fn declined_restore_is_never_retried_automatically() {
+        let d = tempfile::tempdir().unwrap();
+        let r = fake_relay(d.path());
+        r.begin("a1", "Work", DIR).unwrap();
+        fake(|s| s.restores.push_back(HandlerChange::Declined));
+        r.end().unwrap();
+        let s = r.state().unwrap();
+        assert!(!s.active && s.restore_declined);
+        assert_eq!(s.original_command.as_deref(), Some(CLAUDE_APP));
+        for _ in 0..3 {
+            r.end().unwrap();
+        }
+        assert_eq!(fake(|s| s.restore_calls), 1);
+        assert!(r.state().unwrap().restore_declined);
+        // The user asks: one restore, and the flag is gone once it is done.
+        r.restore_now().unwrap();
+        assert_eq!(fake(|s| s.restore_calls), 2);
+        assert_eq!(fake(|s| s.current.clone()).as_deref(), Some(CLAUDE_APP));
+        assert_eq!(r.state(), None);
+    }
+
+    #[test]
+    fn a_new_sign_in_after_a_declined_restore_keeps_the_saved_handler() {
+        let d = tempfile::tempdir().unwrap();
+        let r = fake_relay(d.path());
+        r.begin("a1", "Work", DIR).unwrap();
+        fake(|s| s.restores.push_back(HandlerChange::Declined));
+        r.end().unwrap();
+        let s = r.begin("a2", "Home", "/profiles/Claude-Home").unwrap();
+        assert!(s.active && !s.restore_declined);
+        assert_eq!(s.original_command.as_deref(), Some(CLAUDE_APP));
+        r.end().unwrap();
+        assert_eq!(fake(|s| s.current.clone()).as_deref(), Some(CLAUDE_APP));
+        assert_eq!(r.state(), None);
+    }
+
+    #[test]
+    fn end_leaves_a_handler_someone_else_set() {
+        let d = tempfile::tempdir().unwrap();
+        let r = fake_relay(d.path());
+        r.begin("a1", "Work", DIR).unwrap();
+        fake(|s| s.current = Some("other-app".into()));
+        r.end().unwrap();
+        assert_eq!(fake(|s| s.restore_calls), 0);
+        assert_eq!(fake(|s| s.current.clone()).as_deref(), Some("other-app"));
+        assert_eq!(r.state(), None);
     }
 
     #[test]
@@ -538,18 +858,10 @@ mod tests {
     }
 
     #[test]
-    fn forward_builds_the_command_line() {
-        // forward() delegates to claude_app::build_url_cmdline (no Claude is spawned here).
-        let exe = r"C:\Program Files\WindowsApps\Claude_1\app\Claude.exe";
-        let url = validate_url("claude://auth/callback?code=xyz").unwrap();
-        assert_eq!(
-            claude_app::build_url_cmdline(exe, Some(r"C:\Users\u\AppData\Roaming\Claude-Work"), &url).unwrap(),
-            format!("\"{exe}\" --user-data-dir=\"C:\\Users\\u\\AppData\\Roaming\\Claude-Work\" \"{url}\"")
-        );
-        assert_eq!(claude_app::build_url_cmdline(exe, None, &url).unwrap(), format!("\"{exe}\" \"{url}\""));
-        // Invalid links are refused before anything is started; a missing exe is an error.
-        assert!(forward("http://x", exe, None).is_err());
-        assert!(forward("claude://x", r"C:\definitely\missing\Claude.exe", None).is_err());
+    fn forward_refuses_invalid_links() {
+        // Refused before anything is started.
+        assert!(forward("http://x", "Claude", None).is_err());
+        assert!(forward("claude://a\"b", "Claude", Some("/x")).is_err());
     }
 
     #[test]
@@ -560,95 +872,18 @@ mod tests {
     }
 
     #[test]
-    fn begin_ensure_end() {
-        let tp = TestProtocol::new();
-        let d = tempfile::tempdir().unwrap();
-        let r = Relay::open_with(d.path(), Some(&tp.0));
-        assert_eq!(r.state(), None);
-        assert_eq!(r.ensure(), Ok(false));
-        // end() only restores a saved command whose exe exists: use stand-in files.
-        let fake = |v: &str| {
-            let dir = d.path().join(v);
-            std::fs::create_dir_all(&dir).unwrap();
-            let exe = dir.join("Claude.exe");
-            std::fs::write(&exe, b"").unwrap();
-            default_command(&exe.to_string_lossy())
-        };
-        let (claude, claude2) = (fake("v1"), fake("v2"));
-        let (c1, c2) = (claude.as_str(), claude2.as_str());
-
-        // Fresh begin saves Claude's handler and writes ours.
-        write_handler(&tp.0, c1).unwrap();
-        let s = r.begin("a1", "Work", r"C:\D\Claude-Work").unwrap();
-        assert!(s.active);
-        assert_eq!(s.original_command.as_deref(), Some(c1));
-        assert!(date::is_iso_utc(&s.since));
-        assert_eq!(r.state(), Some(s.clone()));
-        assert!(points_at_us(&read_handler(&tp.0).unwrap()));
-        let raw: serde_json::Value = json::read(&d.path().join(FILE)).unwrap();
-        assert_eq!(raw["accountId"], "a1");
-        assert_eq!(raw["accountName"], "Work");
-        assert_eq!(raw["dataDir"], r"C:\D\Claude-Work");
-        assert_eq!(raw["originalCommand"], c1);
-        assert_eq!(r.ensure(), Ok(false));
-
-        // begin again while the handler already points at us: original_command is kept.
-        let s2 = r.begin("a2", "Home", r"C:\D\Claude-Home").unwrap();
-        assert_eq!(s2.original_command.as_deref(), Some(c1));
-        assert_eq!(relay_target(r.state().as_ref()).as_deref(), Some(r"C:\D\Claude-Home"));
-
-        // Claude re-registered (new version) in between: ensure re-writes and remembers it.
-        write_handler(&tp.0, c2).unwrap();
-        assert_eq!(r.ensure(), Ok(true));
-        assert!(points_at_us(&read_handler(&tp.0).unwrap()));
-        assert_eq!(r.state().unwrap().original_command.as_deref(), Some(c2));
-        assert_eq!(r.ensure(), Ok(false));
-
-        // end restores the saved handler and deletes relay.json.
-        r.end().unwrap();
-        assert_eq!(read_handler(&tp.0).as_deref(), Some(c2));
-        assert_eq!(r.state(), None);
-        assert!(!d.path().join(FILE).exists());
-        assert_eq!(r.ensure(), Ok(false));
-        r.end().unwrap(); // idempotent
-
-        // end when someone else changed the handler: leave it alone, still delete relay.json.
-        r.begin("a1", "Work", r"C:\D\Claude-Work").unwrap();
-        let other = r#""C:\Other\Thing.exe" "%1""#;
-        write_handler(&tp.0, other).unwrap();
-        r.end().unwrap();
-        assert_eq!(read_handler(&tp.0).as_deref(), Some(other));
-        assert!(!d.path().join(FILE).exists());
-
-        // The saved Claude folder vanished (Store update): never restore a dead path.
-        write_handler(&tp.0, c1).unwrap();
-        r.begin("a1", "Work", r"C:\D\Claude-Work").unwrap();
-        std::fs::remove_file(d.path().join("v1").join("Claude.exe")).unwrap();
-        r.end().unwrap();
-        let after = read_handler(&tp.0);
-        assert_ne!(after.as_deref(), Some(c1));
-        assert!(!after.as_deref().is_some_and(points_at_us));
+    fn older_files_read_with_the_new_fields_off() {
+        let raw = r#"{"active":true,"accountId":"a1","accountName":"Work","dataDir":"D","since":"2026-10-26T08:00:00.000Z","originalCommand":null}"#;
+        let s: RelayState = serde_json::from_str(raw).unwrap();
+        assert!(!s.handler_pending && !s.handler_declined && !s.restore_pending && !s.restore_declined);
+        assert_eq!(s.retakes, 0);
+        assert_eq!(serde_json::to_string(&s).unwrap(), raw);
     }
 
     #[test]
-    fn begin_without_a_previous_handler() {
-        let tp = TestProtocol::new();
+    fn no_handler_mode_and_corrupt_file() {
         let d = tempfile::tempdir().unwrap();
-        let r = Relay::open_with(d.path(), Some(&tp.0));
-        let s = r.begin("a1", "Work", r"C:\D\Claude-Work").unwrap();
-        assert_eq!(s.original_command, None);
-        assert!(points_at_us(&read_handler(&tp.0).unwrap()));
-        r.end().unwrap();
-        // Restored to Claude's default command (when Claude is installed) or removed; never ours.
-        assert!(!read_handler(&tp.0).as_deref().is_some_and(points_at_us));
-        assert_eq!(r.state(), None);
-        assert!(r.begin("a1", "Work", "  ").is_err());
-    }
-
-    #[test]
-    fn no_registry_mode_and_corrupt_file() {
-        let d = tempfile::tempdir().unwrap();
-        let r = Relay::open(d.path()); // cfg(test): no registry
+        let r = Relay::open(d.path()); // cfg(test): no handler
         assert!(r.protocol.is_none());
         r.begin("a1", "Work", r"C:\D\Claude-Work").unwrap();
         assert!(r.state().unwrap().active);
@@ -687,5 +922,137 @@ mod tests {
         json::write_atomic(&d.path().join(FILE), &s).unwrap();
         assert!(r.expired(0), "an unreadable start time ends the relay");
         assert!(now_secs() > t0 - 86_400 * 365);
+    }
+
+    /// The whole relay against the real Windows handler of a throw-away scheme.
+    #[cfg(windows)]
+    mod registry_handler {
+        use super::*;
+        use crate::platform::windows::registry;
+
+        /// Throw-away scheme `sessionmux-test-<uuid>`; its whole `HKCU\Software\Classes\<s>` tree
+        /// is deleted on drop (also when the test panics).
+        struct TestScheme(String);
+
+        impl TestScheme {
+            fn new() -> TestScheme {
+                TestScheme(format!("sessionmux-test-{}", uuid::Uuid::new_v4()))
+            }
+            fn command_key(&self) -> String {
+                format!("Software\\Classes\\{}\\shell\\open\\command", self.0)
+            }
+            fn write(&self, command: &str) {
+                registry::write_default(&self.command_key(), command).unwrap();
+            }
+            fn read(&self) -> Option<String> {
+                registry::read_default(&self.command_key())
+            }
+        }
+
+        impl Drop for TestScheme {
+            fn drop(&mut self) {
+                assert!(self.0.starts_with("sessionmux-test-"));
+                registry::delete_tree(&format!("Software\\Classes\\{}", self.0));
+            }
+        }
+
+        fn is_us(c: Option<String>) -> bool {
+            c.is_some_and(|c| <Os as UrlHandler>::is_us(&HandlerId(c)))
+        }
+
+        fn default_command(exe: &str) -> String {
+            format!("\"{}\" \"%1\"", exe)
+        }
+
+        #[test]
+        fn begin_ensure_end() {
+            let tp = TestScheme::new();
+            let d = tempfile::tempdir().unwrap();
+            let r = Relay::open_with(d.path(), Some(&tp.0));
+            assert_eq!(r.state(), None);
+            assert_eq!(r.ensure(), Ok(false));
+            // end() only restores a saved command whose exe exists: use stand-in files.
+            let fake = |v: &str| {
+                let dir = d.path().join(v);
+                std::fs::create_dir_all(&dir).unwrap();
+                let exe = dir.join("Claude.exe");
+                std::fs::write(&exe, b"").unwrap();
+                default_command(&exe.to_string_lossy())
+            };
+            let (claude, claude2) = (fake("v1"), fake("v2"));
+            let (c1, c2) = (claude.as_str(), claude2.as_str());
+
+            // Fresh begin saves Claude's handler and writes ours.
+            tp.write(c1);
+            let s = r.begin("a1", "Work", r"C:\D\Claude-Work").unwrap();
+            assert!(s.active);
+            assert_eq!(s.original_command.as_deref(), Some(c1));
+            assert!(date::is_iso_utc(&s.since));
+            assert_eq!(r.state(), Some(s.clone()));
+            assert!(is_us(tp.read()));
+            let raw: serde_json::Value = json::read(&d.path().join(FILE)).unwrap();
+            assert_eq!(raw["accountId"], "a1");
+            assert_eq!(raw["accountName"], "Work");
+            assert_eq!(raw["dataDir"], r"C:\D\Claude-Work");
+            assert_eq!(raw["originalCommand"], c1);
+            assert_eq!(r.ensure(), Ok(false));
+
+            // begin again while the handler already points at us: original_command is kept.
+            let s2 = r.begin("a2", "Home", r"C:\D\Claude-Home").unwrap();
+            assert_eq!(s2.original_command.as_deref(), Some(c1));
+            assert_eq!(relay_target(r.state().as_ref()).as_deref(), Some(r"C:\D\Claude-Home"));
+
+            // Claude re-registered (new version) in between: ensure re-writes and remembers it.
+            tp.write(c2);
+            assert_eq!(r.ensure(), Ok(true));
+            assert!(is_us(tp.read()));
+            assert_eq!(r.state().unwrap().original_command.as_deref(), Some(c2));
+            assert_eq!(r.ensure(), Ok(false));
+
+            // end restores the saved handler and deletes relay.json.
+            r.end().unwrap();
+            assert_eq!(tp.read().as_deref(), Some(c2));
+            assert_eq!(r.state(), None);
+            assert!(!d.path().join(FILE).exists());
+            assert_eq!(r.ensure(), Ok(false));
+            r.end().unwrap(); // idempotent
+
+            // end when someone else changed the handler: leave it alone, still delete relay.json.
+            r.begin("a1", "Work", r"C:\D\Claude-Work").unwrap();
+            let other = r#""C:\Other\Thing.exe" "%1""#;
+            tp.write(other);
+            r.end().unwrap();
+            assert_eq!(tp.read().as_deref(), Some(other));
+            assert!(!d.path().join(FILE).exists());
+
+            // The saved Claude folder vanished (Store update): never restore a dead path.
+            tp.write(c1);
+            r.begin("a1", "Work", r"C:\D\Claude-Work").unwrap();
+            std::fs::remove_file(d.path().join("v1").join("Claude.exe")).unwrap();
+            r.end().unwrap();
+            let after = tp.read();
+            assert_ne!(after.as_deref(), Some(c1));
+            assert!(!is_us(after));
+        }
+
+        #[test]
+        fn begin_without_a_previous_handler() {
+            let tp = TestScheme::new();
+            let d = tempfile::tempdir().unwrap();
+            let r = Relay::open_with(d.path(), Some(&tp.0));
+            let s = r.begin("a1", "Work", r"C:\D\Claude-Work").unwrap();
+            assert_eq!(s.original_command, None);
+            assert!(is_us(tp.read()));
+            r.end().unwrap();
+            // Restored to Claude's default command (when Claude is installed) or removed; never ours.
+            assert!(!is_us(tp.read()));
+            assert_eq!(r.state(), None);
+            assert!(r.begin("a1", "Work", "  ").is_err());
+        }
+
+        #[test]
+        fn forward_needs_an_existing_exe() {
+            assert!(forward("claude://x", r"C:\definitely\missing\Claude.exe", None).is_err());
+        }
     }
 }

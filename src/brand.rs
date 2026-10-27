@@ -20,7 +20,8 @@
 // https://github.com/joyal-droid/sessionmux and the Sessionmux mark must stay visible in the user
 // interface of every copy and derivative; see docs/attribution.md.
 
-//! Every product identifier in one place: names, files, window classes, registry keys and links.
+//! Every product identifier in one place: names, files, window classes, registry keys, the macOS
+//! bundle identifiers and links.
 //! The panel's literal strings live in web/panel.html and the installer's in installer/sessionmux.nsi.
 
 /// The repository; every public link derives from it.
@@ -48,6 +49,22 @@ pub const AUMID: &str = "Sessionmux.App"; // taskbar / notification identity
 pub const RUN_VALUE: &str = "Sessionmux"; // HKCU\...\Run
 pub const URL_SCHEME_HOST: &str = "sessionmux://app"; // panel asset scheme
 pub const TRAY_TOOLTIP: &str = "Sessionmux — switch between Claude Desktop accounts";
+
+// macOS identifiers (the Windows build does not use them).
+/// Bundle identifier of `Sessionmux.app`.
+#[cfg_attr(windows, allow(dead_code))]
+pub const BUNDLE_ID: &str = "io.github.joyal-droid.sessionmux";
+#[cfg_attr(windows, allow(dead_code))]
+pub const APP_BUNDLE: &str = "Sessionmux.app";
+/// The hook helpers' socket, in the user-data folder.
+#[cfg_attr(windows, allow(dead_code))]
+pub const SOCKET_FILE: &str = "hook.sock";
+/// Single-instance lock file, in the user-data folder.
+#[cfg_attr(windows, allow(dead_code))]
+pub const LOCK_FILE: &str = "instance.lock";
+/// Label of the login-start LaunchAgent (`~/Library/LaunchAgents/<label>.plist`).
+#[cfg_attr(windows, allow(dead_code))]
+pub const LAUNCH_AGENT_LABEL: &str = BUNDLE_ID;
 
 pub const REPO_URL: &str = repo_url!();
 pub const URL_HOME: &str = REPO_URL;

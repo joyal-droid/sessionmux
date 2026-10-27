@@ -220,14 +220,36 @@ function sameSignInMessage(name) {
   return 'This folder is signed in to the same claude.ai account as ' + name + '.';
 }
 
-/** Split an accelerator into display keys ("CommandOrControl+Shift+Space" → ["Ctrl","Shift","Space"]). */
-function hotkeyParts(accel) {
+/** macOS modifier symbols in the order menus show them, with the accelerator names for each. */
+const MAC_MODIFIERS = [
+  ['⌃', /^(control|ctrl)$/i],
+  ['⌥', /^(option|alt)$/i],
+  ['⇧', /^shift$/i],
+  ['⌘', /^(commandorcontrol|cmdorctrl|super|meta|command|cmd)$/i],
+];
+
+/** Spoken names of the macOS modifier symbols, for screen readers. */
+const MAC_KEY_NAMES = { '⌃': 'Control', '⌥': 'Option', '⇧': 'Shift', '⌘': 'Command' };
+
+/**
+ * Split an accelerator into display keys ("CommandOrControl+Shift+Space" → ["Ctrl","Shift","Space"]).
+ * With `mac` the modifiers become the symbols ⌃ ⌥ ⇧ ⌘ in menu order and CommandOrControl is
+ * Command ("CommandOrControl+Shift+Space" → ["⇧","⌘","Space"]).
+ */
+function hotkeyParts(accel, mac) {
   if (typeof accel !== 'string' || accel.trim() === '') return [];
-  return accel.split('+').map((k) => k.trim()).filter(Boolean).map((k) => {
+  const keys = accel.split('+').map((k) => k.trim()).filter(Boolean);
+  const name = (k) => (k.length === 1 ? k.toUpperCase() : k[0].toUpperCase() + k.slice(1));
+  if (mac) {
+    const mods = MAC_MODIFIERS.filter(([, re]) => keys.some((k) => re.test(k))).map(([sym]) => sym);
+    const rest = keys.filter((k) => !MAC_MODIFIERS.some(([, re]) => re.test(k))).map(name);
+    return mods.concat(rest);
+  }
+  return keys.map((k) => {
     if (/^(commandorcontrol|cmdorctrl|control|ctrl)$/i.test(k)) return 'Ctrl';
     if (/^(super|meta|command|cmd)$/i.test(k)) return 'Win';
     if (/^(option|alt)$/i.test(k)) return 'Alt';
-    return k.length === 1 ? k.toUpperCase() : k[0].toUpperCase() + k.slice(1);
+    return name(k);
   });
 }
 
@@ -415,6 +437,7 @@ if (typeof module === 'object' && module && module.exports) {
     nextColor,
     defaultProfileName,
     hotkeyParts,
+    MAC_KEY_NAMES,
     transferMessage,
     sourceRunning,
     skippedFiles,
@@ -565,6 +588,18 @@ function initPanel() {
   };
 
   const accountById = (id) => state.accounts.find((a) => a.id === id) || null;
+
+  /** True when the app reports it runs on macOS (getAppInfo().platform); Windows otherwise. */
+  const onMac = () => !!(state.appInfo && state.appInfo.platform === 'macos');
+
+  /** macOS: running from a disk image or a quarantine copy, where our path cannot be written anywhere. */
+  const movedAway = () => onMac() && state.appInfo.translocated === true;
+
+  const MOVE_HINT = 'Move Sessionmux to your Applications folder and open it from there.';
+
+  const FOCUS_FAILED_MAC = "Sessionmux could not bring this Claude window forward. Turn on 'Bring minimised Claude windows to the front' in Settings (needs Accessibility), or click this account's Claude icon in the Dock.";
+
+  const EMAIL_CODE_ADVICE = 'Sign in with your e-mail address and the code Claude sends you; this needs no extra steps.';
 
   /* ---------- Theme ---------- */
 
@@ -945,10 +980,22 @@ function initPanel() {
 
   /* ---------- Sign-in routing notice ---------- */
 
+  const appNotice = $('appNotice');
+  const appNoticeText = $('appNoticeText');
+
+  /** The top notice for an app that runs from a disk image or a quarantine copy (macOS). */
+  function renderAppNotice() {
+    const moved = movedAway();
+    appNoticeText.textContent = moved ? MOVE_HINT : '';
+    appNotice.hidden = !moved;
+  }
+
   const signinNotice = $('signinNotice');
   const signinNoticeText = $('signinNoticeText');
   const signinNoticeBtn = $('signinNoticeBtn');
-  let signinNoticeMode = null; // 'cancel' | 'enable'
+  const signinNoticeAlt = $('signinNoticeAlt');
+  // 'cancel' | 'enable', and while signing in on macOS 'pending' | 'declined' | 'automation' | 'fallback'
+  let signinNoticeMode = null;
   let signinNoticeKey = null;  // last rendered mode + name: the role=status region is only rewritten on change
 
   const routingOn = () => !state.settings || state.settings.signInRouting !== false;
@@ -956,10 +1003,16 @@ function initPanel() {
   function renderSignInNotice() {
     const si = state.signIn;
     let mode = null;
-    if (si && si.active) mode = 'cancel';
-    else if (!routingOn() && state.accounts.some((a) => !a.isMain && a.running && a.signedIn === false)) mode = 'enable';
+    if (si && si.active) {
+      // The system's answer about the link handler or the hand-over decides what the user has to do.
+      if (si.automationDenied) mode = 'automation';
+      else if (si.forwardFailed) mode = 'fallback';
+      else if (si.handlerDeclined) mode = 'declined';
+      else if (si.handlerPending) mode = 'pending';
+      else mode = 'cancel';
+    } else if (!routingOn() && state.accounts.some((a) => !a.isMain && a.running && a.signedIn === false)) mode = 'enable';
     signinNoticeMode = mode;
-    const key = mode ? mode + '|' + (mode === 'cancel' ? si.accountName || '' : '') : null;
+    const key = mode ? mode + '|' + (mode !== 'enable' ? si.accountName || '' : '') : null;
     if (key === signinNoticeKey) return;
     signinNoticeKey = key;
     if (!mode) {
@@ -972,9 +1025,26 @@ function initPanel() {
       }
       return;
     }
+    signinNoticeAlt.hidden = mode !== 'automation';
     if (mode === 'cancel') {
       signinNoticeText.textContent = 'Signing in ' + (si.accountName || 'the new account') +
         ' — use the Claude window that opened. Google, Apple and e-mail sign-in all work; Sessionmux sends the link back to this account.';
+      signinNoticeBtn.textContent = 'Cancel';
+      signinNoticeBtn.setAttribute('aria-label', 'Cancel sign-in routing');
+    } else if (mode !== 'enable') {
+      const name = si.accountName || 'the new account';
+      if (mode === 'pending') {
+        signinNoticeText.textContent = 'macOS is asking whether Sessionmux may open Claude sign-in links. Choose Use.';
+      } else if (mode === 'declined') {
+        signinNoticeText.textContent = 'Sign-in links stay with Claude. Sign in with an e-mail code instead, or quit your other Claude accounts while this one signs in.';
+      } else if (mode === 'automation') {
+        signinNoticeText.textContent = 'Sessionmux needs your permission to pass the sign-in link to ' + name +
+          '. Allow it in System Settings > Privacy & Security > Automation, or sign in with an e-mail code.';
+        signinNoticeAlt.textContent = 'Open Automation';
+        signinNoticeAlt.setAttribute('aria-label', 'Open the Automation settings');
+      } else {
+        signinNoticeText.textContent = 'Quit your other Claude accounts while this one signs in, or sign in with an e-mail code.';
+      }
       signinNoticeBtn.textContent = 'Cancel';
       signinNoticeBtn.setAttribute('aria-label', 'Cancel sign-in routing');
     } else {
@@ -998,11 +1068,18 @@ function initPanel() {
     if (res && res.ok === false) toast('error', "Couldn't cancel sign-in routing", res.error || '');
   });
 
+  signinNoticeAlt.addEventListener('click', () => call('openSystemSettings', 'automation'));
+
   /** Accept a getSignIn() reply or a signin-changed event; a just-ended relay gets a toast. */
   function setSignIn(si) {
     if (!si || typeof si !== 'object' || typeof si.active !== 'boolean') return;
+    const prev = state.signIn || {};
     state.signIn = si;
     renderSignInNotice();
+    // Settings shows the give-back button and the consent wording from these two flags.
+    if (state.tab === 'settings' && (!!prev.restoreDeclined !== !!si.restoreDeclined || !!prev.needsConsent !== !!si.needsConsent)) {
+      renderSettings();
+    }
     const name = typeof si.accountName === 'string' && si.accountName ? si.accountName : 'The account';
     switch (si.ended) {
       case 'signedIn': toast('success', name + ' is signed in'); break;
@@ -1080,7 +1157,7 @@ function initPanel() {
     const handle = h('span', {
       class: 'acct__handle',
       draggable: true,
-      title: 'Drag to reorder (or Alt+↑ / Alt+↓)',
+      title: onMac() ? 'Drag to reorder (or ⌥↑ / ⌥↓)' : 'Drag to reorder (or Alt+↑ / Alt+↓)',
       attrs: { 'aria-hidden': 'true' },
       on: {
         dragstart: (e) => {
@@ -1131,7 +1208,7 @@ function initPanel() {
           (signedOut ? (needsSignIn ? ', sign in needed' : ', not signed in') : '') +
           (limited ? ', ' + limited : '') +
           (sameAs ? ', same sign-in as ' + sameAs : '') + '. Press Enter to ' + (a.running ? 'switch to it' : 'open it') +
-          '. Alt+Up or Alt+Down to reorder.',
+          (onMac() ? '. Option+Up or Option+Down to reorder.' : '. Alt+Up or Alt+Down to reorder.'),
       },
       on: {
         click: () => openAccount(a.id),
@@ -1216,7 +1293,10 @@ function initPanel() {
     state.busyAccounts.delete(id);
     state.accountsDirty = true;
     renderAccounts();
-    if (res && res.ok === false) toast('error', "Couldn't open " + a.name, res.error || 'Claude did not start.');
+    if (res && res.ok === false && res.reason === 'focus-failed') {
+      toast('warn', "Couldn't switch to " + a.name, onMac() ? FOCUS_FAILED_MAC : (res.error || ''), 12000,
+        { label: 'Settings', onClick: () => showTab('settings') });
+    } else if (res && res.ok === false) toast('error', "Couldn't open " + a.name, res.error || 'Claude did not start.');
   }
 
   async function closeAccount(a) {
@@ -1391,6 +1471,7 @@ function initPanel() {
 
     const form = h('form', { class: 'form', attrs: { 'aria-label': opts.title }, noValidate: true },
       h('div', { class: 'form__head' }, preview, h('h3', { class: 'form__title', text: opts.title })),
+      opts.note ? h('p', { class: 'form__note', text: opts.note }) : null,
       h('div', { class: 'field' },
         h('label', { class: 'field__label', htmlFor: uid + '-name', text: 'Name' }),
         nameInput,
@@ -1573,6 +1654,8 @@ function initPanel() {
       },
       submitLabel: disc ? 'Add' : 'Add & open',
       excludeId: null,
+      // Where every link handler change asks the user, an e-mail code is the easy way in.
+      note: !disc && state.signIn && state.signIn.needsConsent ? EMAIL_CODE_ADVICE : null,
       onCancel: () => { closeAddForm(); returnFocus(); },
       onSubmit: async (v) => {
         if (disc) {
@@ -2604,7 +2687,7 @@ function initPanel() {
       h('h3', { class: 'group__title', text: 'Approvals and limits' }),
       toggleRow('approveFromPanel', 'Show waiting sessions and approve from Sessionmux',
         'Adds hooks to your Claude Code settings so a session that waits for you shows up here. Nothing is ever approved without you.',
-        { onToggle: setApproveFromPanel }),
+        { onToggle: setApproveFromPanel, disabled: movedAway() && !installed, hint: MOVE_HINT }),
       notes.length ? h('div', { class: 'setting setting--note', attrs: { role: 'note' } },
         icon('alert', 'setting__note-icon'),
         h('span', { class: 'setting__desc', text: notes.join(' ') })) : null,
@@ -2668,13 +2751,96 @@ function initPanel() {
   }
 
   function hotkeyRow() {
-    const parts = hotkeyParts((state.settings && state.settings.hotkey) || 'Ctrl+Shift+Space');
+    const mac = onMac();
+    const parts = hotkeyParts((state.settings && state.settings.hotkey) || 'Ctrl+Shift+Space', mac);
+    const spoken = mac ? parts.map((p) => MAC_KEY_NAMES[p] || p).join(' ') : parts.join(' plus ');
     return h('div', { class: 'setting' },
       h('span', { class: 'setting__text' },
         h('span', { class: 'setting__label', text: 'Show / hide panel' }),
-        h('span', { class: 'setting__desc', text: 'Works from anywhere in Windows.' })),
-      h('span', { class: 'kbd-group', attrs: { 'aria-label': 'Shortcut ' + parts.join(' plus ') } },
+        h('span', { class: 'setting__desc', text: mac ? 'Works from anywhere on your Mac.' : 'Works from anywhere in Windows.' })),
+      h('span', { class: 'kbd-group', attrs: { 'aria-label': 'Shortcut ' + spoken } },
         parts.map((p) => h('kbd', { text: p }))));
+  }
+
+  /** A warning line in a settings card, with an optional button under the text. */
+  function noteRow(text, action) {
+    return h('div', { class: 'setting setting--note', attrs: { role: 'note' } },
+      icon('alert', 'setting__note-icon'),
+      h('span', { class: 'setting__text' },
+        h('span', { class: 'setting__desc', text }),
+        action ? h('button', {
+          class: 'btn btn--secondary btn--sm', type: 'button', text: action.label,
+          dataset: { key: action.key }, on: { click: action.onClick },
+        }) : null));
+  }
+
+  /** Settings → "Give sign-in links back to Claude": one restore of the claude:// handler. */
+  async function giveLinksBack() {
+    const res = await call('restoreLinkHandler');
+    if (!res || res.ok === false) {
+      toast('error', "Couldn't give the sign-in links back", (res && res.error) || '');
+    } else if (res.linkHandler === 'pending') {
+      toast('info', 'macOS is asking you to confirm', 'Choose Use when macOS asks whether Claude may open Claude sign-in links.', 9000);
+    } else if (res.linkHandler === 'declined') {
+      toast('warn', 'Sign-in links still open through Sessionmux', 'macOS kept Sessionmux for them. Try again and choose Use for Claude.', 9000);
+    } else {
+      toast('success', 'Sign-in links open in Claude again');
+    }
+  }
+
+  /** Settings → "Remove Sessionmux's changes": hooks, link handler and login item, after a confirm. */
+  async function removeChanges() {
+    if (state.hooksBusy) return;
+    const r = await confirmDialog({
+      title: "Remove Sessionmux's changes?",
+      body: [
+        'Sessionmux takes out what it changed outside its own folder:',
+        '• its hooks in your Claude Code settings',
+        '• the claude:// link handler, which goes back to Claude',
+        '• the login item',
+        'Your accounts and their data folders stay as they are. To remove Sessionmux completely, quit it afterwards and move it to the Trash.',
+      ].join('\n'),
+      okLabel: 'Remove changes',
+      danger: true,
+    });
+    if (!r.confirmed) return;
+    state.hooksBusy = true;
+    renderSettings();
+    try {
+      const res = await call('removeChanges');
+      if (!res || res.ok === false) {
+        toast('error', "Couldn't remove all of Sessionmux's changes", (res && res.error) || '');
+        return;
+      }
+      if (state.settings && state.settings.approveFromPanel) await updateSetting('approveFromPanel', false);
+      if (res.linkHandler === 'pending') {
+        toast('info', "Sessionmux's changes were removed", 'macOS may ask whether Claude may open Claude sign-in links; choose Use.', 9000);
+      } else if (res.linkHandler === 'declined' || res.linkHandler === 'failed') {
+        toast('warn', 'Hooks and login item removed', "Sign-in links still open through Sessionmux. Use 'Give sign-in links back to Claude' in Settings to try again.", 9000);
+      } else {
+        toast('success', "Sessionmux's changes were removed", 'You can quit Sessionmux and move it to the Trash now.');
+      }
+    } finally {
+      state.hooksBusy = false;
+      await refreshHooks();
+      renderSettings();
+    }
+  }
+
+  /** macOS only: the card that undoes everything before the app is moved to the Trash. */
+  function removeGroup() {
+    return h('div', { class: 'group' },
+      h('h3', { class: 'group__title', text: 'Remove Sessionmux' }),
+      h('div', { class: 'setting' },
+        h('span', { class: 'setting__text' },
+          h('span', { class: 'setting__label', text: "Remove Sessionmux's changes" }),
+          h('span', { class: 'setting__desc', text: 'Takes out its hooks, the sign-in link handler and the login item. Then quit Sessionmux and move it to the Trash.' })),
+        h('button', {
+          class: 'btn btn--danger-ghost btn--sm', type: 'button', text: 'Remove',
+          disabled: !!state.hooksBusy, dataset: { key: 'remove-changes' },
+          attrs: { 'aria-label': "Remove Sessionmux's changes" },
+          on: { click: removeChanges },
+        })));
   }
 
   function pathRow(label, path, key) {
@@ -2756,16 +2922,45 @@ function initPanel() {
         a.dataDir || p.mainDataDir || 'Claude Desktop’s default profile',
         'acct-' + a.id));
 
+      const mac = onMac();
+      const moved = movedAway();
+      const si = state.signIn || {};
+      // The switches that write our path somewhere stay off while the app runs from a moved copy.
+      const pathGuard = (key) => (moved && !s[key] ? { disabled: true, hint: MOVE_HINT } : null);
+      const routingUnavailable = mac && typeof s.signInRoutingUnavailable === 'string' && s.signInRoutingUnavailable && !s.signInRouting
+        ? { disabled: true, hint: s.signInRoutingUnavailable } : null;
+      const routingDesc = mac && si.needsConsent
+        ? 'macOS will ask two or three times during each sign-in whether Sessionmux or Claude should open Claude sign-in links. Choose Use when Sessionmux asks at the start, and Use when Claude asks at the end.'
+        : 'While an account is signing in, Sessionmux temporarily becomes the handler for claude:// links and restores Claude as the handler afterwards.';
+
       settingsBody.append(
         h('div', { class: 'group' },
           h('h3', { class: 'group__title', text: 'General' }),
-          toggleRow('startWithWindows', 'Start with Windows', 'Launch Sessionmux quietly when you sign in.'),
+          mac
+            ? toggleRow('startWithWindows', 'Open at login', 'Launch Sessionmux quietly when you log in.', pathGuard('startWithWindows'))
+            : toggleRow('startWithWindows', 'Start with Windows', 'Launch Sessionmux quietly when you sign in.'),
+          mac && s.startWithWindows && s.autostartStatus === 'requiresApproval'
+            ? noteRow('Allow Sessionmux in System Settings > General > Login Items.',
+              { label: 'Open Login Items', key: 'open-login-items', onClick: () => call('openSystemSettings', 'loginItems') })
+            : null,
           toggleRow('showBubble', 'Show floating bubble', 'A small always-on-top button for quick switching.'),
-          toggleRow('shareMcpConfig', 'Share MCP servers from Main', "Copy Main's MCP server config into the other accounts when it changes.")),
+          toggleRow('shareMcpConfig', 'Share MCP servers from Main', "Copy Main's MCP server config into the other accounts when it changes."),
+          mac
+            ? toggleRow('raiseWindowsWithAccessibility', 'Bring minimised Claude windows to the front',
+              'When switching to an account leaves its window minimised or in another Space, Sessionmux uses Accessibility to bring it forward. macOS asks for it again after each update.')
+            : null,
+          mac && s.raiseWindowsWithAccessibility && s.accessibilityTrusted === false
+            ? noteRow('Allow Sessionmux in System Settings > Privacy & Security > Accessibility.',
+              { label: 'Open Accessibility', key: 'open-accessibility', onClick: () => call('openSystemSettings', 'accessibility') })
+            : null),
         h('div', { class: 'group' },
           h('h3', { class: 'group__title', text: 'Sign-in' }),
-          toggleRow('signInRouting', 'Route sign-in links to the account being signed in',
-            'While an account is signing in, Sessionmux temporarily becomes the handler for claude:// links and restores Claude as the handler afterwards.')),
+          toggleRow('signInRouting', 'Route sign-in links to the account being signed in', routingDesc,
+            (mac && (pathGuard('signInRouting') || routingUnavailable)) || undefined),
+          si.restoreDeclined
+            ? noteRow('Sign-in links open through Sessionmux, which passes them to your Main account.',
+              { label: 'Give sign-in links back to Claude', key: 'restore-links', onClick: giveLinksBack })
+            : null),
         hooksGroup(),
         h('div', { class: 'group' },
           h('h3', { class: 'group__title', text: 'Appearance' }),
@@ -2776,10 +2971,11 @@ function initPanel() {
           hotkeyRow()),
         h('div', { class: 'group' },
           h('h3', { class: 'group__title', text: 'Where Sessionmux keeps data' }),
-          pathRow('Sessionmux settings', p.store || '%APPDATA%\\Sessionmux\\sessionmux.json', 'store'),
-          pathRow('Log file', p.log || '%APPDATA%\\Sessionmux\\sessionmux.log', 'log'),
-          pathRow('Code transcripts (shared)', p.transcripts || '%USERPROFILE%\\.claude\\projects', 'transcripts'),
+          pathRow('Sessionmux settings', p.store || (mac ? '~/Library/Application Support/Sessionmux/sessionmux.json' : '%APPDATA%\\Sessionmux\\sessionmux.json'), 'store'),
+          pathRow('Log file', p.log || (mac ? '~/Library/Application Support/Sessionmux/sessionmux.log' : '%APPDATA%\\Sessionmux\\sessionmux.log'), 'log'),
+          pathRow('Code transcripts (shared)', p.transcripts || (mac ? '~/.claude/projects' : '%USERPROFILE%\\.claude\\projects'), 'transcripts'),
           accountDirs),
+        ...(mac ? [removeGroup()] : []),
         aboutGroup());
     });
   }
@@ -2798,12 +2994,13 @@ function initPanel() {
     call('hidePanel');
   });
 
-  // Ctrl+1/2/3 jump between tabs.
+  // Ctrl+1/2/3 jump between tabs (⌘1/2/3 on macOS); Ctrl+F (⌘F) searches the sessions.
   document.addEventListener('keydown', (e) => {
-    if (e.ctrlKey && !e.altKey && !e.shiftKey && /^[123]$/.test(e.key)) {
+    const mod = onMac() ? e.metaKey && !e.ctrlKey : e.ctrlKey;
+    if (mod && !e.altKey && !e.shiftKey && /^[123]$/.test(e.key)) {
       e.preventDefault();
       showTab(TABS[Number(e.key) - 1], { focus: true });
-    } else if (e.ctrlKey && e.key.toLowerCase() === 'f' && state.tab === 'sessions') {
+    } else if (mod && e.key.toLowerCase() === 'f' && state.tab === 'sessions') {
       e.preventDefault();
       searchInput.focus();
       searchInput.select();
@@ -2875,6 +3072,7 @@ function initPanel() {
       call('listAccounts'), call('getSettings'), call('getAppInfo'), call('getSignIn'),
     ]);
     if (info && typeof info === 'object' && info.ok !== false) state.appInfo = info;
+    renderAppNotice();
     setSettings(settings);
     if (signIn && !signIn.ended) setSignIn(signIn);
     if (Array.isArray(list)) {

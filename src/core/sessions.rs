@@ -52,6 +52,7 @@
 //! reports `source-left-open`. Deleting a running session is still refused.
 
 use crate::core::accounts::ApiError;
+use crate::platform::{Misc, Os, Processes};
 use crate::util::{json, log, paths};
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
@@ -487,9 +488,9 @@ fn copy_tree(src: &Path, dst: &Path, merge: bool, skipped: &mut usize) -> io::Re
     Ok(())
 }
 
-/// ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION: another process holds the file open.
+/// Another process holds the file open (never on systems without mandatory file locks).
 fn is_sharing_violation(e: &io::Error) -> bool {
-    matches!(e.raw_os_error(), Some(32) | Some(33))
+    <Os as Misc>::is_sharing_violation(e)
 }
 
 /// Copy one file (CopyFileExW keeps its timestamps). A file another process keeps locked is
@@ -533,12 +534,7 @@ fn copy_link(s: &Path, d: &Path, merge: bool) {
         let _ = rm_rf(d);
     }
     let is_dir = std::fs::metadata(s).map(|m| m.is_dir()).unwrap_or(false);
-    let r = if is_dir {
-        std::os::windows::fs::symlink_dir(&target, d)
-    } else {
-        std::os::windows::fs::symlink_file(&target, d)
-    };
-    if let Err(e) = r {
+    if let Err(e) = <Os as Misc>::symlink(&target, d, is_dir) {
         log::debug(&format!("sessions: could not recreate link {} -> {}: {e}", d.display(), target.display()));
     }
 }
@@ -608,22 +604,9 @@ fn replace_all(text: &str, pairs: &[(String, String)]) -> String {
 
 /// Is `pid` a live process? Access denied still means "exists" (like `process.kill(pid, 0)`'s EPERM).
 fn pid_alive(pid: i64) -> bool {
-    use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, STILL_ACTIVE};
-    use windows::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-    if pid <= 0 || pid > i64::from(u32::MAX) {
-        return false;
-    }
-    // SAFETY: OpenProcess has no memory preconditions; a returned handle is closed below.
-    match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid as u32) } {
-        Ok(h) => {
-            let mut code = 0u32;
-            // SAFETY: `h` is a valid process handle we own and `code` is a valid out-pointer.
-            let ok = unsafe { GetExitCodeProcess(h, &mut code) }.is_ok();
-            // SAFETY: `h` was opened above and is closed exactly once.
-            let _ = unsafe { CloseHandle(h) };
-            !ok || code == STILL_ACTIVE.0 as u32
-        }
-        Err(e) => e.code() == E_ACCESSDENIED,
+    match u32::try_from(pid) {
+        Ok(p) if p > 0 => <Os as Processes>::alive(p),
+        _ => false,
     }
 }
 
@@ -1577,6 +1560,7 @@ mod tests {
         assert_eq!(last["sessionId"], new_cli, "the late line is rewritten like the rest");
     }
 
+    #[cfg(windows)]
     #[test]
     fn locked_file_is_skipped_and_counted() {
         use std::os::windows::fs::OpenOptionsExt;

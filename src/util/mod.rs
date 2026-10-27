@@ -20,12 +20,8 @@
 // https://github.com/joyal-droid/sessionmux and the Sessionmux mark must stay visible in the user
 // interface of every copy and derivative; see docs/attribution.md.
 
-//! Shared helpers: dates, logging, paths, JSON I/O, the registry, Win32 helpers and UI-thread
-//! marshalling.
+//! Shared helpers: dates, logging, paths and JSON I/O.
 pub mod date;
 pub mod json;
 pub mod log;
 pub mod paths;
-pub mod registry;
-pub mod ui_thread;
-pub mod win;

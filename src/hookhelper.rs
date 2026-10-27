@@ -98,7 +98,7 @@ pub fn run_approve_hook() -> i32 {
     guarded(|| {
         log::init(&paths::log_file());
         let Some(input) = read_stdin(deadline) else { return };
-        if let Some(out) = approve_with(&input, &pipe::pipe_name(), deadline) {
+        if let Some(out) = approve_with(&input, &pipe::endpoint(), deadline) {
             let mut so = std::io::stdout().lock();
             let _ = so.write_all(out.as_bytes());
             let _ = so.flush();
@@ -532,7 +532,7 @@ mod tests {
 
     #[test]
     fn approve_round_trip_through_a_test_server() {
-        let name = format!("{}.test-{}", pipe::pipe_name(), uuid::Uuid::new_v4().simple());
+        let name = pipe::test_endpoint();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let rec = seen.clone();
         let server = Server::start_at(
@@ -622,7 +622,7 @@ mod tests {
         assert!(APPROVE_BUDGET < Duration::from_secs(hooks::APPROVE_TIMEOUT));
         assert!(NOTIFY_BUDGET < Duration::from_secs(hooks::NOTIFY_TIMEOUT));
         // A deadline already past ends the helper at once.
-        let name = format!("{}.test-{}", pipe::pipe_name(), uuid::Uuid::new_v4().simple());
+        let name = pipe::test_endpoint();
         assert_eq!(approve_with(&permission("Bash", json!({ "command": "x" })), &name, Instant::now()), None);
     }
 

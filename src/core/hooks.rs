@@ -281,11 +281,11 @@ fn backup_path(settings_path: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
-/// Two spellings of the same exe path: case-insensitive, either separator, quotes ignored.
+/// Two spellings of the same exe path, by the system's rules (on Windows: case-insensitive,
+/// either separator, quotes ignored).
 fn same_exe(a: &str, b: &str) -> bool {
-    let norm = |s: &str| s.trim().trim_matches('"').replace('/', "\\").to_lowercase();
-    let (a, b) = (norm(a), norm(b));
-    !a.is_empty() && a == b
+    use crate::platform::{Misc, Os};
+    <Os as Misc>::same_exe(a, b)
 }
 
 /// The argument of one of our hooks: `command` names `exe` and `args` is exactly one of ours.

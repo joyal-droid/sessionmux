@@ -28,11 +28,13 @@
 //! `--notify-hook` / `--approve-hook` (the Claude Code hook helpers, see `hookhelper`) and
 //! `--remove-hooks` (the uninstaller: take our hooks out of the user's Claude Code settings).
 //! A hook word is honoured only as the one and only argument; any other shape exits 0 silently.
-//! Single instance via the named mutex `brand::MUTEX` (`Local\Sessionmux.SingleInstance`); a second launch posts
-//! `WM_SESSIONMUX_SHOW_PANEL` to the first instance's message window and exits. A refused relay
+//! Single instance through `platform::instance` (on Windows the named mutex `brand::MUTEX`,
+//! `Local\Sessionmux.SingleInstance`); a second launch asks the first instance to show its panel
+//! (on Windows by posting `WM_SESSIONMUX_SHOW_PANEL` to its message window) and exits. A refused relay
 //! launch whose command line shows argument injection ([`relay_injected`]) also posts
 //! `WM_SESSIONMUX_GESTURE` to it (cosmetic); other refused shapes are only logged.
-//! The UI thread initialises COM (STA) and runs a classic Win32 message loop.
+//! The UI thread is prepared through `platform::misc` (on Windows: COM in an STA, per-monitor DPI
+//! awareness and the taskbar identity) and then runs the platform's event loop.
 #![windows_subsystem = "windows"]
 // Direct2D drawing helpers take a rectangle, radius, stroke width and colour as plain values.
 #![allow(clippy::too_many_arguments)]
@@ -43,21 +45,13 @@ mod core;
 mod hookhelper;
 #[cfg(test)]
 mod livetest;
+mod platform;
 mod smoke;
 mod ui;
 mod util;
 
-use util::{log, paths, ui_thread};
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, LPARAM, WPARAM};
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
-use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
-use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
-use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
-use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, DispatchMessageW, GetMessageW, GetWindowThreadProcessId, PostMessageW, TranslateMessage,
-    MSG,
-};
+use platform::{EventLoop, Misc, Os, SingleInstance};
+use util::{log, paths};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Args {
@@ -185,19 +179,9 @@ fn link_scheme(link: &str) -> Option<&str> {
     ok.then_some(sch)
 }
 
-/// True while an Sessionmux app instance holds the single-instance mutex `brand::MUTEX`.
+/// True while an Sessionmux app instance holds the single-instance guard.
 fn sessionmux_running() -> bool {
-    use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
-    let name = util::win::wide(brand::MUTEX);
-    // SAFETY: opens (never creates) a named mutex; `name` is NUL-terminated and outlives the call.
-    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(name.as_ptr())) } {
-        Ok(h) => {
-            // SAFETY: `h` was just returned by OpenMutexW and is closed exactly once.
-            let _ = unsafe { CloseHandle(h) };
-            true
-        }
-        Err(_) => false,
-    }
+    platform::instance::Os::running()
 }
 
 /// `Sessionmux.exe --end-relay` (run by the uninstaller before it removes the exe):
@@ -302,13 +286,7 @@ fn real_main() -> i32 {
     }
     let args = parse_args(raw.iter().cloned());
 
-    // SAFETY: called once on the UI thread before any COM use; balanced by CoUninitialize below.
-    let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-    // SAFETY: no preconditions; fails harmlessly when the manifest already set the awareness.
-    let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-    let aumid = util::win::wide(brand::AUMID);
-    // SAFETY: `aumid` is a NUL-terminated UTF-16 buffer that outlives the call; failure is harmless.
-    let _ = unsafe { SetCurrentProcessExplicitAppUserModelID(PCWSTR(aumid.as_ptr())) };
+    let prepared = <Os as Misc>::init_ui_thread();
 
     let code = if args.smoke {
         app::SMOKE.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -317,9 +295,8 @@ fn real_main() -> i32 {
         run_app(args)
     };
 
-    if com.is_ok() {
-        // SAFETY: balances the successful CoInitializeEx above on the same thread.
-        unsafe { CoUninitialize() };
+    if prepared {
+        <Os as Misc>::uninit_ui_thread();
     }
     code
 }
@@ -327,81 +304,25 @@ fn real_main() -> i32 {
 fn run_app(args: Args) -> i32 {
     log::init(&paths::log_file());
 
-    let mutex_name = util::win::wide(brand::MUTEX);
-    // SAFETY: creates (or opens) a named mutex; `mutex_name` is NUL-terminated and outlives
-    // the call.
-    let mutex = unsafe { CreateMutexW(None, true, PCWSTR(mutex_name.as_ptr())) };
-    // SAFETY: GetLastError reads this thread's last-error value set by CreateMutexW.
-    let already = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
-    let mutex: Option<HANDLE> = match mutex {
-        Ok(h) => Some(h),
-        Err(e) => {
-            log::warn(&format!("single-instance mutex: {e}"));
-            None
-        }
-    };
-    if already {
+    let Some(guard) = platform::instance::Os::acquire() else {
         log::info("another instance is running; handing off");
-        if let Some(h) = ui_thread::find_msg_window() {
-            // We were just started by the user, so we may hand our foreground right to the first
-            // instance; without it the panel would show inactive and never blur-hide.
-            let mut pid = 0u32;
-            // SAFETY: h is a window handle (possibly stale; the API then returns 0); pid is a
-            // valid out-pointer. AllowSetForegroundWindow has no memory preconditions.
-            unsafe {
-                GetWindowThreadProcessId(h, Some(&mut pid));
-                if pid != 0 {
-                    let _ = AllowSetForegroundWindow(pid);
-                }
-            }
-            // SAFETY: posting a private message to another process's window; integers only.
-            let _ = unsafe { PostMessageW(h, ui_thread::WM_SESSIONMUX_SHOW_PANEL, WPARAM(0), LPARAM(0)) };
-        }
-        close_mutex(mutex, false);
+        platform::instance::Os::notify_existing();
         return 0;
-    }
+    };
 
     log::info(&format!("{} {} starting{}", brand::NAME, brand::VERSION, if args.hidden { " (hidden)" } else { "" }));
     if let Err(e) = app::init(args.hidden) {
         log::error(&format!("startup failed: {e}"));
-        close_mutex(mutex, true);
+        drop(guard);
         return 1;
     }
 
-    let mut msg = MSG::default();
-    // SAFETY: standard message loop on the thread that owns all our windows; `msg` is a valid
-    // out-pointer for each call.
-    unsafe {
-        loop {
-            let r = GetMessageW(&mut msg, None, 0, 0);
-            if r.0 <= 0 {
-                if r.0 < 0 {
-                    log::error(&format!("GetMessageW failed: {}", util::win::last_error()));
-                }
-                break;
-            }
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
+    let code = <Os as EventLoop>::run();
 
     app::shutdown();
-    close_mutex(mutex, true);
+    drop(guard);
     log::info("exit");
-    msg.wParam.0 as i32
-}
-
-fn close_mutex(h: Option<HANDLE>, owned: bool) {
-    if let Some(h) = h {
-        // SAFETY: `h` is the handle returned by CreateMutexW in this thread; released only if we
-        // own it, then closed exactly once.
-        unsafe {
-            if owned {
-                let _ = ReleaseMutex(h);
-            }
-            let _ = CloseHandle(h);
-        }
-    }
+    code
 }
 
 #[cfg(test)]

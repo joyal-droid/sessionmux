@@ -54,22 +54,11 @@
 
 use crate::app;
 use crate::brand;
-use crate::util::{log, paths, win};
+use crate::platform::{Capture, Footprint, GestureHost, Os};
+use crate::util::{log, paths};
 use serde_json::json;
 use std::path::Path;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{CloseHandle, FILETIME};
-use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
-};
-use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-use windows::Win32::System::Threading::{
-    GetCurrentProcessId, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-};
-use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, WM_QUIT,
-};
 
 const WATCHDOG: Duration = Duration::from_secs(32);
 /// Wait before the approvals capture: the panel's next poll, the arming of Allow and the end of
@@ -78,9 +67,7 @@ const APPROVALS_SETTLE_MS: u64 = 10_800;
 
 /// Run the smoke test; returns the process exit code.
 pub fn run() -> i32 {
-    // SAFETY: AttachConsole has no memory-safety preconditions; failure (no parent console,
-    // e.g. output already redirected) is fine and ignored.
-    let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    <Os as Capture>::attach_console();
     let cwd = std::env::current_dir().unwrap_or_default();
     let out_dir = cwd.join("smoke");
     let user_data = out_dir.join("userData");
@@ -131,7 +118,7 @@ fn steps(out_dir: &Path) -> Result<serde_json::Value, String> {
         app::smoke_seed_feature_fixture(&demo_sessions(), DEMO_LIMITED_ACCOUNT);
     }
     let (accounts, discovered, loc, procs) = app::smoke_counts().ok_or("app state unavailable")?;
-    let rss_start = working_set(current_pid()).unwrap_or(0);
+    let rss_start = <Os as Capture>::footprint(false).resident;
 
     // A previous, interrupted run (or the real store) may be in tray mode.
     if app::smoke_bubble_mode() != "icon" {
@@ -143,7 +130,7 @@ fn steps(out_dir: &Path) -> Result<serde_json::Value, String> {
     app::smoke_set_settings(json!({ "bubbleMode": "tray" }))?;
     pump(700);
     let (r, scale) = app::smoke_bubble_rect().ok_or("no bubble window")?;
-    let tray_window = json!({ "width": r.right - r.left, "height": r.bottom - r.top });
+    let tray_window = json!({ "width": r.w, "height": r.h });
     let n = app::smoke_tray_accounts() as i32;
     let dip_w = 16 + 14 + n * 44 + (n - 1) * 6 + 8 + 32 + 16;
     let tray_expected =
@@ -156,7 +143,7 @@ fn steps(out_dir: &Path) -> Result<serde_json::Value, String> {
     pump(300);
     let gesture = env_flag("SESSIONMUX_SMOKE_GESTURE");
     if gesture {
-        crate::ui::gesture::render_to_png(&out_dir.join("gesture.png"))?;
+        <Os as GestureHost>::render_to_png(&out_dir.join("gesture.png"))?;
     }
 
     // Panel: create, wait for __ready, show off-screen without activation, capture each tab.
@@ -170,20 +157,21 @@ fn steps(out_dir: &Path) -> Result<serde_json::Value, String> {
         return Err("panel never reported __ready".into());
     }
     let ready_ms = tp.elapsed().as_millis() as u64;
-    let hwnd = app::smoke_panel_hwnd().ok_or("no panel window")?;
+    let panel = app::smoke_panel_window().ok_or("no panel window")?;
+    let capture = |path: &Path| <Os as Capture>::panel_png(panel, path);
     // Off-screen, Chromium only produces frames when asked: a throw-away capture starts the
     // card-in entrance animation, which has finished by the next capture.
-    let _ = crate::ui::panel::capture_window_png(hwnd, &std::env::temp_dir().join("sessionmux-smoke-warmup.png"));
+    let _ = capture(&std::env::temp_dir().join("sessionmux-smoke-warmup.png"));
     pump(700);
     for tab in app::smoke_tabs() {
         app::smoke_show_tab(tab);
         pump(if tab == "sessions" { 1200 } else { 800 });
-        crate::ui::panel::capture_window_png(hwnd, &out_dir.join(format!("panel-{tab}.png")))?;
+        capture(&out_dir.join(format!("panel-{tab}.png")))?;
     }
     // Settings scrolled to the About card (version, links, license attribution).
     app::smoke_show_tab("about");
     pump(500);
-    crate::ui::panel::capture_window_png(hwnd, &out_dir.join("panel-about.png"))?;
+    capture(&out_dir.join("panel-about.png"))?;
     // Opt-in renderer check for the sign-in notice card: a synthetic page event
     // only — no relay begins and the registry is never touched.
     if fixture_enabled() || std::env::var_os("SESSIONMUX_SMOKE_SIGNIN").is_some() {
@@ -193,7 +181,7 @@ fn steps(out_dir: &Path) -> Result<serde_json::Value, String> {
             "active": true, "accountId": id, "accountName": name, "since": crate::util::date::iso_now(),
         })));
         pump(400);
-        crate::ui::panel::capture_window_png(hwnd, &out_dir.join("signin-notice.png"))?;
+        capture(&out_dir.join("signin-notice.png"))?;
         app::smoke_emit_sign_in(None);
         pump(200);
     }
@@ -204,23 +192,24 @@ fn steps(out_dir: &Path) -> Result<serde_json::Value, String> {
         app::smoke_seed_approvals(&demo_sessions());
         app::smoke_show_tab("sessions");
         pump(APPROVALS_SETTLE_MS);
-        crate::ui::panel::capture_window_png(hwnd, &out_dir.join("panel-approvals.png"))?;
+        capture(&out_dir.join("panel-approvals.png"))?;
     }
-    let (rss_panel, private_panel, webview_procs) = tree_mem();
+    let Footprint { resident: rss_panel, private: private_panel, helpers: webview_procs } =
+        <Os as Capture>::footprint(true);
 
     app::smoke_destroy_panel();
     let deadline = Instant::now() + Duration::from_secs(4);
     loop {
         pump(200);
-        if tree_working_set().1 == 0 || Instant::now() >= deadline {
+        if <Os as Capture>::footprint(true).helpers == 0 || Instant::now() >= deadline {
             break;
         }
     }
     // Settle as the idle app would: a refresh (accounts, bubble) after the trim, then measure.
     let _ = app::smoke_counts();
     pump(1000);
-    let (_, webview_after) = tree_working_set();
-    let (rss_idle, private_idle) = mem(current_pid()).unwrap_or((0, 0));
+    let webview_after = <Os as Capture>::footprint(true).helpers;
+    let Footprint { resident: rss_idle, private: private_idle, .. } = <Os as Capture>::footprint(false);
     let page_errors = app::smoke_page_errors();
     if !page_errors.is_empty() {
         log::warn(&format!("smoke: page errors: {page_errors:?}"));
@@ -412,110 +401,7 @@ fn fail(error: &str) -> i32 {
     1
 }
 
-/// Dispatch this thread's messages for `ms` milliseconds.
+/// Run UI events for `ms` milliseconds.
 fn pump(ms: u64) {
-    let end = Instant::now() + Duration::from_millis(ms);
-    let mut msg = MSG::default();
-    while Instant::now() < end {
-        // SAFETY: standard non-blocking message pump on the UI thread; `msg` is a valid out-pointer.
-        unsafe {
-            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                if msg.message == WM_QUIT {
-                    return;
-                }
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-fn current_pid() -> u32 {
-    // SAFETY: no preconditions.
-    unsafe { GetCurrentProcessId() }
-}
-
-/// Working set of `pid` in bytes.
-fn working_set(pid: u32) -> Option<u64> {
-    mem(pid).map(|m| m.0)
-}
-
-/// (working set, private commit) of `pid` in bytes.
-fn mem(pid: u32) -> Option<(u64, u64)> {
-    // SAFETY: OpenProcess with query-limited rights; the handle is closed below.
-    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
-    let mut pmc =
-        PROCESS_MEMORY_COUNTERS { cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
-    // SAFETY: `h` is a live process handle and `pmc` a correctly sized out-struct.
-    let r = unsafe { GetProcessMemoryInfo(h, &mut pmc, pmc.cb) };
-    // SAFETY: closing the handle opened above exactly once.
-    let _ = unsafe { CloseHandle(h) };
-    r.ok().map(|_| (pmc.WorkingSetSize as u64, pmc.PagefileUsage as u64))
-}
-
-fn creation_time(pid: u32) -> Option<u64> {
-    // SAFETY: OpenProcess with query-limited rights; the handle is closed below.
-    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
-    let (mut c, mut e, mut k, mut u) =
-        (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
-    // SAFETY: valid handle and out-pointers.
-    let r = unsafe { GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) };
-    // SAFETY: closing the handle opened above exactly once.
-    let _ = unsafe { CloseHandle(h) };
-    r.ok().map(|_| ((c.dwHighDateTime as u64) << 32) | c.dwLowDateTime as u64)
-}
-
-/// (working set of Sessionmux + its msedgewebview2.exe descendants, number of those descendants).
-fn tree_working_set() -> (u64, usize) {
-    let (ws, _, n) = tree_mem();
-    (ws, n)
-}
-
-/// (working set sum, private commit sum, number of WebView2 descendants).
-fn tree_mem() -> (u64, u64, usize) {
-    let me = current_pid();
-    let (mut total, mut private) = mem(me).unwrap_or((0, 0));
-    let mut entries: Vec<(u32, u32, String)> = Vec::new();
-    // SAFETY: snapshot handle closed below; PROCESSENTRY32W initialised with its size.
-    unsafe {
-        if let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
-            let mut pe =
-                PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
-            if Process32FirstW(snap, &mut pe).is_ok() {
-                loop {
-                    let len = pe.szExeFile.iter().position(|&c| c == 0).unwrap_or(pe.szExeFile.len());
-                    entries.push((
-                        pe.th32ProcessID,
-                        pe.th32ParentProcessID,
-                        win::from_wide(&pe.szExeFile[..len]).to_ascii_lowercase(),
-                    ));
-                    if Process32NextW(snap, &mut pe).is_err() {
-                        break;
-                    }
-                }
-            }
-            let _ = CloseHandle(snap);
-        }
-    }
-    let my_start = creation_time(me).unwrap_or(0);
-    let mut parents = vec![me];
-    let mut found: Vec<u32> = Vec::new();
-    while let Some(p) = parents.pop() {
-        for (pid, ppid, name) in &entries {
-            if *ppid == p && !found.contains(pid) && *pid != me && name == "msedgewebview2.exe" {
-                // Guard against pid reuse: a real child starts after its parent.
-                if creation_time(*pid).unwrap_or(0) >= my_start {
-                    found.push(*pid);
-                    parents.push(*pid);
-                }
-            }
-        }
-    }
-    for pid in &found {
-        let (w, p) = mem(*pid).unwrap_or((0, 0));
-        total += w;
-        private += p;
-    }
-    (total, private, found.len())
+    <Os as Capture>::pump(ms);
 }

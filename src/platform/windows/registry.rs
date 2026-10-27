@@ -37,7 +37,7 @@ use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_SZ,
 };
 
-use crate::util::win::wide;
+use crate::platform::windows::win::wide;
 
 /// `(Default)` of `HKCU\<subkey>` when it exists and is a non-empty REG_SZ.
 pub fn read_default(subkey: &str) -> Option<String> {
@@ -66,7 +66,7 @@ pub fn read_default(subkey: &str) -> Option<String> {
             return None;
         }
         buf.truncate(cb as usize / 2);
-        let s = crate::util::win::from_wide(&buf);
+        let s = crate::platform::windows::win::from_wide(&buf);
         return (!s.is_empty()).then_some(s);
     }
     None

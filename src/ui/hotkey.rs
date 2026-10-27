@@ -20,13 +20,8 @@
 // https://github.com/joyal-droid/sessionmux and the Sessionmux mark must stay visible in the user
 // interface of every copy and derivative; see docs/attribution.md.
 
-//! Global hotkey.
-//!
-//! API:
-//! ```ignore
-//! pub fn register(hwnd:HWND, id:i32, spec:&str /* "Ctrl+Shift+Space" */) -> Result<(),String>
-//! pub fn unregister(hwnd:HWND, id:i32)
-//! ```
+//! Global hotkey: the accelerator grammar. [`parse`] turns a spec into an [`Accel`]; the system
+//! backend (`platform::hotkey`) maps it to its own key codes and registers it.
 //!
 //! `spec` uses accelerator syntax (case-insensitive, `+`-separated, spaces tolerated):
 //! modifiers `Ctrl|Control|CommandOrControl|CmdOrCtrl|Command|Cmd`, `Shift`, `Alt|Option|AltGr`,
@@ -34,16 +29,78 @@
 //! `Esc|Escape`, `Backspace`, `Delete|Del`, `Insert|Ins`, `Home`, `End`, `PageUp`, `PageDown`,
 //! `Up|Down|Left|Right`, `Plus`, `Minus`, `num0`–`num9`, or one of `` ,.;/'[]\=-` ``.
 //! At least one modifier is required (a bare global key would swallow normal typing).
-//! WM_HOTKEY is posted to `hwnd` with wparam = `id`; MOD_NOREPEAT is always added.
+//! `CommandOrControl`, `CmdOrCtrl`, `Command` and `Cmd` mean Ctrl on Windows and ⌘ on macOS;
+//! `Win`, `Super` and `Meta` mean the Windows key or ⌘.
 
-use crate::util::win;
-use windows::Win32::Foundation::HWND;
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
-};
+#[cfg(windows)]
+pub use crate::platform::windows::hotkey::{register, unregister};
 
-/// Parse an accelerator into (modifiers without MOD_NOREPEAT, virtual-key code).
-pub fn parse(spec: &str) -> Result<(HOT_KEY_MODIFIERS, u32), String> {
+/// The key of an accelerator, independent of any keyboard layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Key {
+    /// A letter (`b'A'`–`b'Z'`) or a digit (`b'0'`–`b'9'`).
+    Char(u8),
+    /// A punctuation key, by the character it types on a US layout: one of `` ,.;/'[]\=-` ``.
+    /// `Plus` is the `=` key and `Minus` the `-` key.
+    Punct(u8),
+    /// `F1`–`F24`.
+    F(u8),
+    /// Numeric keypad `0`–`9`.
+    Num(u8),
+    Space,
+    Enter,
+    Tab,
+    Escape,
+    Backspace,
+    Delete,
+    Insert,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// A parsed accelerator: its modifiers and its one key. `meta` is the Windows key or ⌘.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Accel {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub meta: bool,
+    pub key: Key,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Modifier {
+    Ctrl,
+    Alt,
+    Shift,
+    Meta,
+}
+
+/// `Command` and its spellings: Ctrl on Windows, ⌘ on macOS.
+#[cfg(not(target_os = "macos"))]
+const COMMAND: Modifier = Modifier::Ctrl;
+#[cfg(target_os = "macos")]
+const COMMAND: Modifier = Modifier::Meta;
+
+fn modifier(name: &str) -> Option<Modifier> {
+    Some(match name {
+        "ctrl" | "control" => Modifier::Ctrl,
+        "commandorcontrol" | "cmdorctrl" | "command" | "cmd" => COMMAND,
+        "shift" => Modifier::Shift,
+        "alt" | "option" | "altgr" => Modifier::Alt,
+        "win" | "super" | "meta" | "windows" => Modifier::Meta,
+        _ => return None,
+    })
+}
+
+/// Parse an accelerator ("Ctrl+Shift+Space").
+pub fn parse(spec: &str) -> Result<Accel, String> {
     let spec = spec.trim();
     if spec.is_empty() || spec.len() > 64 {
         return Err("empty or too long hotkey".into());
@@ -57,127 +114,105 @@ pub fn parse(spec: &str) -> Result<(HOT_KEY_MODIFIERS, u32), String> {
     if plus_key {
         parts.push("plus".into());
     }
-    let mut mods = HOT_KEY_MODIFIERS(0);
-    let mut key: Option<u32> = None;
+    let mut mods: Vec<Modifier> = Vec::new();
+    let mut key: Option<Key> = None;
     for p in &parts {
-        let m = match p.as_str() {
-            "ctrl" | "control" | "commandorcontrol" | "cmdorctrl" | "command" | "cmd" => Some(MOD_CONTROL),
-            "shift" => Some(MOD_SHIFT),
-            "alt" | "option" | "altgr" => Some(MOD_ALT),
-            "win" | "super" | "meta" | "windows" => Some(MOD_WIN),
-            _ => None,
-        };
-        if let Some(m) = m {
-            if mods.0 & m.0 != 0 {
+        if let Some(m) = modifier(p) {
+            if mods.contains(&m) {
                 return Err(format!("duplicate modifier '{p}'"));
             }
-            mods |= m;
+            mods.push(m);
             continue;
         }
         if key.is_some() {
             return Err(format!("more than one key in '{spec}'"));
         }
-        key = Some(vk_for(p).ok_or_else(|| format!("unknown key '{p}'"))?);
+        key = Some(key_for(p).ok_or_else(|| format!("unknown key '{p}'"))?);
     }
     let key = key.ok_or_else(|| format!("no key in '{spec}'"))?;
-    if mods.0 == 0 {
+    if mods.is_empty() {
         return Err(format!("'{spec}' needs at least one modifier"));
     }
-    Ok((mods, key))
+    Ok(Accel {
+        ctrl: mods.contains(&Modifier::Ctrl),
+        alt: mods.contains(&Modifier::Alt),
+        shift: mods.contains(&Modifier::Shift),
+        meta: mods.contains(&Modifier::Meta),
+        key,
+    })
 }
 
-fn vk_for(name: &str) -> Option<u32> {
+fn key_for(name: &str) -> Option<Key> {
     let b = name.as_bytes();
     if b.len() == 1 {
         let c = b[0];
         return match c {
-            b'a'..=b'z' => Some((c - b'a' + b'A') as u32),
-            b'0'..=b'9' => Some(c as u32),
-            b',' => Some(0xBC),  // VK_OEM_COMMA
-            b'.' => Some(0xBE),  // VK_OEM_PERIOD
-            b';' => Some(0xBA),  // VK_OEM_1
-            b'/' => Some(0xBF),  // VK_OEM_2
-            b'`' => Some(0xC0),  // VK_OEM_3
-            b'[' => Some(0xDB),  // VK_OEM_4
-            b'\\' => Some(0xDC), // VK_OEM_5
-            b']' => Some(0xDD),  // VK_OEM_6
-            b'\'' => Some(0xDE), // VK_OEM_7
-            b'=' => Some(0xBB),  // VK_OEM_PLUS
-            b'-' => Some(0xBD),  // VK_OEM_MINUS
+            b'a'..=b'z' => Some(Key::Char(c - b'a' + b'A')),
+            b'0'..=b'9' => Some(Key::Char(c)),
+            b',' | b'.' | b';' | b'/' | b'`' | b'[' | b'\\' | b']' | b'\'' | b'=' | b'-' => Some(Key::Punct(c)),
             _ => None,
         };
     }
-    if let Some(n) = name.strip_prefix('f').and_then(|n| n.parse::<u32>().ok()) {
-        return (1..=24).contains(&n).then_some(0x70 + n - 1); // VK_F1..VK_F24
+    if let Some(n) = name.strip_prefix('f').and_then(|n| n.parse::<u8>().ok()) {
+        return (1..=24).contains(&n).then_some(Key::F(n));
     }
-    if let Some(n) = name.strip_prefix("num").and_then(|n| n.parse::<u32>().ok()) {
-        return (n <= 9).then_some(0x60 + n); // VK_NUMPAD0..9
+    if let Some(n) = name.strip_prefix("num").and_then(|n| n.parse::<u8>().ok()) {
+        return (n <= 9).then_some(Key::Num(n));
     }
     Some(match name {
-        "space" => 0x20,
-        "enter" | "return" => 0x0D,
-        "tab" => 0x09,
-        "esc" | "escape" => 0x1B,
-        "backspace" => 0x08,
-        "delete" | "del" => 0x2E,
-        "insert" | "ins" => 0x2D,
-        "home" => 0x24,
-        "end" => 0x23,
-        "pageup" => 0x21,
-        "pagedown" => 0x22,
-        "up" => 0x26,
-        "down" => 0x28,
-        "left" => 0x25,
-        "right" => 0x27,
-        "plus" => 0xBB,
-        "minus" => 0xBD,
+        "space" => Key::Space,
+        "enter" | "return" => Key::Enter,
+        "tab" => Key::Tab,
+        "esc" | "escape" => Key::Escape,
+        "backspace" => Key::Backspace,
+        "delete" | "del" => Key::Delete,
+        "insert" | "ins" => Key::Insert,
+        "home" => Key::Home,
+        "end" => Key::End,
+        "pageup" => Key::PageUp,
+        "pagedown" => Key::PageDown,
+        "up" => Key::Up,
+        "down" => Key::Down,
+        "left" => Key::Left,
+        "right" => Key::Right,
+        "plus" => Key::Punct(b'='),
+        "minus" => Key::Punct(b'-'),
         _ => return None,
     })
-}
-
-/// Register `spec` as a global hotkey delivering WM_HOTKEY(id) to `hwnd`.
-pub fn register(hwnd: HWND, id: i32, spec: &str) -> Result<(), String> {
-    let (mods, vk) = parse(spec)?;
-    // SAFETY: plain Win32 call with integer arguments; an invalid hwnd only makes it fail.
-    unsafe { RegisterHotKey(hwnd, id, mods | MOD_NOREPEAT, vk) }.map_err(|e| {
-        let detail = if e.code().0 as u32 == 0x8007_0581 {
-            "already in use by another app".to_string()
-        } else {
-            let s = e.message();
-            if s.is_empty() {
-                win::last_error()
-            } else {
-                s
-            }
-        };
-        format!("RegisterHotKey({spec}): {detail}")
-    })
-}
-
-/// Unregister; failures (never registered, window gone) are ignored.
-pub fn unregister(hwnd: HWND, id: i32) {
-    // SAFETY: plain Win32 call with integer arguments.
-    let _ = unsafe { UnregisterHotKey(hwnd, id) };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::ui_thread;
-    use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
+
+    fn accel(ctrl: bool, alt: bool, shift: bool, meta: bool, key: Key) -> Accel {
+        Accel { ctrl, alt, shift, meta, key }
+    }
 
     #[test]
     fn parses_specs() {
-        assert_eq!(parse("Ctrl+Shift+Space").unwrap(), (MOD_CONTROL | MOD_SHIFT, 0x20));
-        assert_eq!(parse(" ctrl + alt + K ").unwrap(), (MOD_CONTROL | MOD_ALT, b'K' as u32));
-        assert_eq!(parse("CommandOrControl+Shift+O").unwrap(), (MOD_CONTROL | MOD_SHIFT, b'O' as u32));
-        assert_eq!(parse("Win+F12").unwrap(), (MOD_WIN, 0x7B));
-        assert_eq!(parse("Alt+F24").unwrap(), (MOD_ALT, 0x87));
-        assert_eq!(parse("Ctrl+1").unwrap(), (MOD_CONTROL, b'1' as u32));
-        assert_eq!(parse("Ctrl++").unwrap(), (MOD_CONTROL, 0xBB));
-        assert_eq!(parse("Ctrl+Shift+/").unwrap(), (MOD_CONTROL | MOD_SHIFT, 0xBF));
-        assert_eq!(parse("Super+PageDown").unwrap(), (MOD_WIN, 0x22));
-        assert_eq!(parse("Ctrl+num5").unwrap(), (MOD_CONTROL, 0x65));
+        assert_eq!(parse("Ctrl+Shift+Space").unwrap(), accel(true, false, true, false, Key::Space));
+        assert_eq!(parse(" ctrl + alt + K ").unwrap(), accel(true, true, false, false, Key::Char(b'K')));
+        assert_eq!(parse("Win+F12").unwrap(), accel(false, false, false, true, Key::F(12)));
+        assert_eq!(parse("Super+PageDown").unwrap(), accel(false, false, false, true, Key::PageDown));
+        assert_eq!(parse("Option+F24").unwrap(), accel(false, true, false, false, Key::F(24)));
+        assert_eq!(parse("Ctrl++").unwrap(), accel(true, false, false, false, Key::Punct(b'=')));
+        assert_eq!(parse("Ctrl+Minus").unwrap(), parse("Ctrl+-").unwrap());
+        assert_eq!(parse("Ctrl+Shift+/").unwrap(), accel(true, false, true, false, Key::Punct(b'/')));
+        assert_eq!(parse("Ctrl+num5").unwrap(), accel(true, false, false, false, Key::Num(5)));
+        assert_eq!(parse("Alt+Return").unwrap().key, Key::Enter);
+    }
+
+    #[test]
+    fn command_follows_the_system() {
+        let a = parse("CommandOrControl+Shift+O").unwrap();
+        assert_eq!(a.key, Key::Char(b'O'));
+        assert!(a.shift && !a.alt);
+        let mac = cfg!(target_os = "macos");
+        assert_eq!((a.ctrl, a.meta), (!mac, mac));
+        assert_eq!(parse("Cmd+A").unwrap(), parse("CmdOrCtrl+A").unwrap());
+        // Command and Ctrl are the same modifier on Windows, and two on macOS.
+        assert_eq!(parse("Ctrl+Cmd+A").is_ok(), mac);
     }
 
     #[test]
@@ -187,25 +222,7 @@ mod tests {
         {
             assert!(parse(bad).is_err(), "accepted {bad:?}");
         }
+        assert!(parse("Ctrl+num10").is_err());
         assert!(parse(&format!("Ctrl+{}", "A".repeat(80))).is_err());
-    }
-
-    #[test]
-    fn register_and_unregister() {
-        let hwnd = ui_thread::create_msg_window(None);
-        assert!(!hwnd.is_invalid());
-        // An obscure combination nobody uses; released immediately.
-        let spec = "Ctrl+Alt+Shift+Win+F23";
-        register(hwnd, 0x3F01, spec).expect("register");
-        // A second registration of the same combination fails (the OS holds it for us).
-        assert!(register(hwnd, 0x3F02, spec).is_err());
-        unregister(hwnd, 0x3F01);
-        register(hwnd, 0x3F02, spec).expect("re-register after unregister");
-        unregister(hwnd, 0x3F02);
-        assert!(register(hwnd, 0x3F03, "nope").is_err());
-        // SAFETY: destroying the message window this test created on this thread.
-        unsafe {
-            let _ = DestroyWindow(hwnd);
-        }
     }
 }

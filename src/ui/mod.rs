@@ -20,8 +20,9 @@
 // https://github.com/joyal-droid/sessionmux and the Sessionmux mark must stay visible in the user
 // interface of every copy and derivative; see docs/attribution.md.
 
-//! Native UI: floating bubble (Direct2D), WebView2 panel, tray icon, global hotkey and the
-//! cosmetic tamper gesture.
+//! The user interface, as both systems share it: the floating bubble's layout and look, the web
+//! panel, the tray / menu bar menu, the hotkey grammar, the cosmetic tamper gesture and the
+//! panel's IPC. The windows that show them are in `platform`.
 pub mod bubble;
 pub mod gesture;
 pub mod hotkey;

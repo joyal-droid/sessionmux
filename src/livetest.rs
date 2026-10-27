@@ -35,6 +35,7 @@
 use crate::core::accounts::AccountsStore;
 use crate::core::claude_app::{self, Proc};
 use crate::core::sessions::{Session, SessionAccount, Sessions};
+use crate::platform::{Launcher, Os, Windows};
 use crate::util::paths;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -69,20 +70,20 @@ fn switch_to(loc: &claude_app::Located, procs: &[Proc], name: &str, dir: Option<
     if let Some(p) = mine.iter().find(|p| p.hwnd != 0) {
         let ok = claude_app::focus(p.pid);
         std::thread::sleep(Duration::from_millis(500));
-        let fg = claude_app::foreground_pid();
+        let fg = <Os as Windows>::foreground_pid();
         println!("   focus pid {} -> {ok}; foreground pid now {:?} (match={})", p.pid, fg, fg == Some(p.pid));
         return;
     }
     // Tray-hidden (hwnd 0) or not running: launching again hands off to Claude's single instance.
     println!("   no window: launching ({})", if mine.is_empty() { "not running" } else { "tray-hidden" });
     let r = match dir {
-        None => claude_app::launch_main(loc).map(|_| 0),
-        Some(d) => claude_app::launch(loc, d),
+        None => <Os as Launcher>::launch_main(loc).map(|_| 0),
+        Some(d) => <Os as Launcher>::launch(loc, d),
     };
     println!("   launch -> {r:?}");
     let pid = claude_app::wait_and_focus(dir, 15_000);
     std::thread::sleep(Duration::from_millis(500));
-    println!("   wait_and_focus -> {pid:?}; foreground pid now {:?}", claude_app::foreground_pid());
+    println!("   wait_and_focus -> {pid:?}; foreground pid now {:?}", <Os as Windows>::foreground_pid());
 }
 
 #[test]

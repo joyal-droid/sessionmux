@@ -20,29 +20,13 @@
 // https://github.com/joyal-droid/sessionmux and the Sessionmux mark must stay visible in the user
 // interface of every copy and derivative; see docs/attribution.md.
 
-//! Floating bubble — native layered window rendered with Direct2D, no WebView.
+//! The floating bubble's window on Windows — a layered window drawn with Direct2D, no WebView.
 //!
-//! API:
-//! ```ignore
-//! pub enum BubbleMode { Icon, Tray }
-//! pub struct BubbleAccount { pub id:String, pub name:String, pub color:u32 /*0xRRGGBB*/, pub initials:String, pub running:bool, pub active:bool, pub needs_sign_in:bool, pub limited:bool }
-//! pub struct BubbleState { pub mode:BubbleMode, pub active:Option<BubbleAccount>, pub accounts:Vec<BubbleAccount> /* ≤3 */, pub waiting:usize }
-//! pub enum BubbleEvent { Click, RightClick, AvatarClick(String), MoreClick, DragEnd(i32,i32) }
-//! impl Bubble {
-//!   pub fn create(pos:Option<(i32,i32)>, on_event: Box<dyn Fn(BubbleEvent)>) -> Result<Bubble,String>
-//!   pub fn set_state(&mut self, s:BubbleState)
-//!   pub fn hwnd(&self)->HWND;  pub fn rect(&self)->RECT;  pub fn show(&self,bool);  pub fn set_position(&self,x:i32,y:i32)
-//!   pub fn render_to_png(&self, path:&Path) -> Result<(),String>   // last rendered bitmap (smoke)
-//! }
-//! ```
-//!
-//! Implementation notes:
 //! - `WS_EX_LAYERED|WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE` popup of class `SessionmuxBubble`.
-//!   Every frame is drawn into a premultiplied 32bpp PBGRA `IWICBitmap` through a Direct2D WIC
-//!   render target whose DPI is set to the monitor DPI (so all drawing is in DIPs), copied into a
-//!   top-down DIB section and pushed with `UpdateLayeredWindow(ULW_ALPHA)`. Fully transparent
-//!   pixels are click-through.
-//! - Geometry and flat colours follow docs/design.md.
+//!   Every frame is the scene `bubble::model::scene` builds, drawn into a premultiplied 32bpp PBGRA
+//!   `IWICBitmap` through a Direct2D WIC render target whose DPI is set to the monitor DPI (so all
+//!   drawing is in DIPs), copied into a top-down DIB section and pushed with
+//!   `UpdateLayeredWindow(ULW_ALPHA)`. Fully transparent pixels are click-through.
 //! - Positions passed in / out (`create`, `set_position`, `DragEnd`) are physical
 //!   screen pixels (the process is Per-Monitor-V2 aware).
 //! - `create` shows the window (no activation).
@@ -100,253 +84,36 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::brand;
-use crate::util::{log, win};
-
-// ------------------------------------------------------------------------------------ types
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BubbleMode {
-    Icon,
-    Tray,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct BubbleAccount {
-    pub id: String,
-    pub name: String,
-    /// 0xRRGGBB
-    pub color: u32,
-    pub initials: String,
-    pub running: bool,
-    pub active: bool,
-    /// Running but not signed in yet: the status dot is `--warn` amber instead of green.
-    pub needs_sign_in: bool,
-    /// Hit its plan limit: the status dot is `--danger` red, shown even while not running.
-    pub limited: bool,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct BubbleState {
-    pub mode: BubbleMode,
-    pub active: Option<BubbleAccount>,
-    /// At most 3.
-    pub accounts: Vec<BubbleAccount>,
-    /// Requests waiting for the user's approval: a count badge on the bubble / the "⋯" button.
-    pub waiting: usize,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum BubbleEvent {
-    Click,
-    RightClick,
-    /// Account id.
-    AvatarClick(String),
-    MoreClick,
-    DragEnd(i32, i32),
-}
-
-// ------------------------------------------------------------------------------- constants
+use crate::platform::windows::win;
+use crate::platform::{BubbleHost, Rect};
+use crate::ui::bubble::model::{
+    self, anchored_rect, clamp_to_area, effective_mode, hit_test, px_size, snap_rect, Hit, Visual, DEFAULT_MARGIN_DIP,
+    DRAG_THRESHOLD_DIP, EDGE_MARGIN_DIP, MAX_TRAY,
+};
+use crate::ui::bubble::scene::{Color, Prim, Scene, LETTER_SPACING_EM, TEXT_SHADOW_DY};
+use crate::ui::bubble::{BubbleEvent, BubbleMode, BubbleState};
+use crate::util::log;
 
 const CLASS_NAME: &str = brand::CLASS_BUBBLE;
 
-/// Icon-mode window side (DIP): 52 px bubble plus room for the glow.
-const ICON_DIP: f32 = 80.0;
-/// Tray-mode window height (DIP).
-const TRAY_H_DIP: f32 = 72.0;
-const MAX_TRAY: usize = 3;
-/// Snap margin from the work-area edge (DIP).
-const EDGE_MARGIN_DIP: f32 = 12.0;
-/// Initial margin from the bottom-right corner when no position is persisted (DIP).
-const DEFAULT_MARGIN_DIP: f32 = 24.0;
-/// Movement (DIP) that turns a press into a drag.
-const DRAG_THRESHOLD_DIP: f32 = 4.0;
-
-// Flat colours (docs/design.md).
-const ACCENT: u32 = 0x8A7CFF;
-const SUCCESS: u32 = 0x34D399;
-/// `--warn` (dark theme; the bubble is always dark).
-const WARN: u32 = 0xFBBF24;
-/// `--danger` (dark theme).
-const DANGER: u32 = 0xF87171;
-const BG_SOLID: u32 = 0x101114;
-const FG: u32 = 0xECEDEF;
-const FG_MUTED: u32 = 0x9A9DA6;
-const FG_SUBTLE: u32 = 0x737784;
-const WHITE: u32 = 0xFFFFFF;
-const BLACK: u32 = 0x000000;
-
-/// Icon geometry (DIP): circle centre and outer radius (border-box 52 px).
-const ICON_C: f32 = 40.0;
-const ICON_R: f32 = 26.0;
-/// Tray geometry (DIP).
-const TRAY_CY: f32 = 36.0;
-const PILL_TOP: f32 = 12.0;
-const PILL_BOTTOM: f32 = 60.0;
-const SLOT: f32 = 44.0;
-const SLOT_GAP: f32 = 6.0;
-const FACE_R: f32 = 18.0;
-const MORE_R: f32 = 16.0;
-
-// ------------------------------------------------------------------------- pure geometry
-
-/// Tray only when there is something to show (otherwise the icon).
-fn effective_mode(s: &BubbleState) -> BubbleMode {
-    if s.mode == BubbleMode::Tray && !s.accounts.is_empty() {
-        BubbleMode::Tray
-    } else {
-        BubbleMode::Icon
-    }
-}
-
-/// Clamp the shown account count to 1..=3.
-fn tray_n(n: usize) -> usize {
-    n.clamp(1, MAX_TRAY)
-}
-
-/// Window size in DIP. Tray: 16 + 14 + n*44 + (n-1)*6 + 8 + 32 + 16 by 72.
-fn dip_size(mode: BubbleMode, n: usize) -> (f32, f32) {
-    match mode {
-        BubbleMode::Icon => (ICON_DIP, ICON_DIP),
-        BubbleMode::Tray => {
-            let n = tray_n(n) as f32;
-            (16.0 + 14.0 + n * SLOT + (n - 1.0) * SLOT_GAP + 8.0 + 32.0 + 16.0, TRAY_H_DIP)
-        }
-    }
-}
-
-/// Window size in physical pixels at `scale`.
-fn px_size(mode: BubbleMode, n: usize, scale: f32) -> (i32, i32) {
-    let (w, h) = dip_size(mode, n);
-    ((w * scale).round().max(1.0) as i32, (h * scale).round().max(1.0) as i32)
-}
-
-/// Tray layout in DIP.
-#[derive(Clone, Debug, PartialEq)]
-struct TrayLayout {
-    pill_l: f32,
-    pill_r: f32,
-    grip_l: f32,
-    /// Left edge of each 44 px avatar slot.
-    slots: Vec<f32>,
-    more_cx: f32,
-}
-
-fn tray_layout(n: usize) -> TrayLayout {
-    let k = tray_n(n);
-    let (w, _) = dip_size(BubbleMode::Tray, k);
-    let kf = k as f32;
-    // Content (grip, avatars, 8 px margin, more) + padding 4/12 + 1 px border each side.
-    let pill_w = 14.0 + kf * SLOT + (kf - 1.0) * SLOT_GAP + 8.0 + 32.0 + 16.0 + 2.0;
-    let pill_l = (w - pill_w) / 2.0;
-    let grip_l = pill_l + 1.0 + 4.0;
-    let first = grip_l + 14.0;
-    let slots: Vec<f32> = (0..k).map(|i| first + i as f32 * (SLOT + SLOT_GAP)).collect();
-    let last_end = first + kf * SLOT + (kf - 1.0) * SLOT_GAP;
-    TrayLayout { pill_l, pill_r: pill_l + pill_w, grip_l, slots, more_cx: last_end + 8.0 + MORE_R }
-}
-
-/// What a point (DIP, client coordinates) is over.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Hit {
-    None,
-    /// Icon-mode bubble.
-    Bubble,
-    /// Tray avatar slot index.
-    Avatar(usize),
-    /// Tray "⋯" button.
-    More,
-    /// Tray pill outside any button (drag only).
-    Grip,
-}
-
-impl Hit {
-    fn clickable(self) -> bool {
-        matches!(self, Hit::Bubble | Hit::Avatar(_) | Hit::More)
-    }
-}
-
-fn hit_test(mode: BubbleMode, n: usize, x: f32, y: f32) -> Hit {
-    match mode {
-        BubbleMode::Icon => {
-            let d = ((x - ICON_C).powi(2) + (y - ICON_C).powi(2)).sqrt();
-            if d <= ICON_R * 1.06 {
-                Hit::Bubble
-            } else {
-                Hit::None
-            }
-        }
-        BubbleMode::Tray => {
-            let l = tray_layout(n);
-            if x < l.pill_l || x > l.pill_r || y < PILL_TOP || y > PILL_BOTTOM {
-                return Hit::None;
-            }
-            for (i, &sx) in l.slots.iter().enumerate() {
-                if x >= sx && x < sx + SLOT && (y - TRAY_CY).abs() <= SLOT / 2.0 {
-                    return Hit::Avatar(i);
-                }
-            }
-            let d = ((x - l.more_cx).powi(2) + (y - TRAY_CY).powi(2)).sqrt();
-            if d <= MORE_R {
-                Hit::More
-            } else {
-                Hit::Grip
-            }
-        }
-    }
-}
-
-fn clampi(v: i32, min: i32, max: i32) -> i32 {
-    if max < min {
-        min
-    } else {
-        v.clamp(min, max)
-    }
-}
-
-/// Keep a `w`×`h` rect at (x,y) fully inside `area`.
-fn clamp_to_area(x: i32, y: i32, w: i32, h: i32, area: &RECT) -> (i32, i32) {
-    (clampi(x, area.left, area.right - w), clampi(y, area.top, area.bottom - h))
-}
-
-/// Snap to the nearest horizontal (left/right) edge of `area`, `margin` px in; y clamped.
-fn snap_rect(r: &RECT, area: &RECT, margin: i32) -> (i32, i32) {
-    let w = r.right - r.left;
-    let h = r.bottom - r.top;
-    let cx2 = r.left + r.right; // 2 × centre, avoids rounding
-    let mid2 = area.left + area.right;
-    let x = if cx2 < mid2 { area.left + margin } else { area.right - w - margin };
-    let y = clampi(r.top, area.top + margin, area.bottom - h - margin);
-    (x, y)
-}
-
-/// Resize `r` to `w`×`h` anchored to the edge it sits on (right half → keep right edge),
-/// vertical centre kept, then clamped into `area`.
-fn anchored_rect(r: &RECT, w: i32, h: i32, area: &RECT) -> (i32, i32) {
-    let cx2 = r.left + r.right;
-    let mid2 = area.left + area.right;
-    let x = if cx2 >= mid2 { r.right - w } else { r.left };
-    let cy2 = r.top + r.bottom;
-    let y = (cy2 - h) / 2;
-    clamp_to_area(x, y, w, h, area)
-}
-
 /// Work area of the monitor nearest `r`.
-fn work_area_for(r: &RECT) -> RECT {
+fn work_area_for(r: &Rect) -> Rect {
     let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-    // SAFETY: `r` and `mi` are valid for the duration of the calls; MonitorFromRect with
+    let rc = RECT::from(*r);
+    // SAFETY: `rc` and `mi` are valid for the duration of the calls; MonitorFromRect with
     // DEFAULTTONEAREST always returns a monitor; GetMonitorInfoW only writes into `mi`.
     let ok = unsafe {
-        let mon = MonitorFromRect(r, MONITOR_DEFAULTTONEAREST);
+        let mon = MonitorFromRect(&rc, MONITOR_DEFAULTTONEAREST);
         GetMonitorInfoW(mon, &mut mi).as_bool()
     };
     if ok {
-        mi.rcWork
+        Rect::from(mi.rcWork)
     } else {
-        RECT { left: 0, top: 0, right: 1920, bottom: 1080 }
+        Rect { x: 0, y: 0, w: 1920, h: 1080 }
     }
 }
 
-fn primary_work_area() -> RECT {
+fn primary_work_area() -> Rect {
     let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
     // SAFETY: as in work_area_for; MONITOR_DEFAULTTOPRIMARY always yields a monitor.
     let ok = unsafe {
@@ -354,9 +121,9 @@ fn primary_work_area() -> RECT {
         GetMonitorInfoW(mon, &mut mi).as_bool()
     };
     if ok {
-        mi.rcWork
+        Rect::from(mi.rcWork)
     } else {
-        RECT { left: 0, top: 0, right: 1920, bottom: 1080 }
+        Rect { x: 0, y: 0, w: 1920, h: 1080 }
     }
 }
 
@@ -407,27 +174,9 @@ fn pick_family(dwrite: &IDWriteFactory) -> Vec<u16> {
     win::wide("Segoe UI")
 }
 
-/// Interaction state that changes the look.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Visual {
-    hover: Hit,
-    pressed: Hit,
-    dragging: bool,
-}
-
-impl Default for Visual {
-    fn default() -> Self {
-        Visual { hover: Hit::None, pressed: Hit::None, dragging: false }
-    }
-}
-
-fn rgba(hex: u32, a: f32) -> D2D1_COLOR_F {
-    D2D1_COLOR_F {
-        r: ((hex >> 16) & 0xFF) as f32 / 255.0,
-        g: ((hex >> 8) & 0xFF) as f32 / 255.0,
-        b: (hex & 0xFF) as f32 / 255.0,
-        a,
-    }
+fn d2d(c: Color) -> D2D1_COLOR_F {
+    let (r, g, b) = c.channels();
+    D2D1_COLOR_F { r, g, b, a: c.a }
 }
 
 struct Painter<'a> {
@@ -485,9 +234,16 @@ impl<'a> Painter<'a> {
         }
     }
 
-    /// White text centred on (cx, cy) with a 1 px rgba(0,0,0,.35) drop shadow and
-    /// 0.04em letter spacing (CSS `.bubble__initials` / `.tray__face`).
-    fn text(&self, text: &str, size: f32, cx: f32, cy: f32) -> windows::core::Result<()> {
+    /// Text centred on (cx, cy) with the scene's letter spacing, over its shadow.
+    fn text(
+        &self,
+        text: &str,
+        size: f32,
+        cx: f32,
+        cy: f32,
+        color: D2D1_COLOR_F,
+        shadow: Option<D2D1_COLOR_F>,
+    ) -> windows::core::Result<()> {
         let wtext: Vec<u16> = text.encode_utf16().collect();
         if wtext.is_empty() {
             return Ok(());
@@ -509,7 +265,7 @@ impl<'a> Painter<'a> {
             fmt.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             let bx = size * 4.0;
             let layout = self.gfx.dwrite.CreateTextLayout(&wtext, &fmt, bx, bx)?;
-            let spacing = 0.04 * size;
+            let spacing = LETTER_SPACING_EM * size;
             if let Ok(l1) = layout.cast::<IDWriteTextLayout1>() {
                 let range = DWRITE_TEXT_RANGE { startPosition: 0, length: wtext.len() as u32 };
                 let _ = l1.SetCharacterSpacing(0.0, spacing, 0.0, range);
@@ -517,164 +273,37 @@ impl<'a> Painter<'a> {
             // Chromium also adds the letter spacing after the last glyph; keep that offset.
             let ox = cx - bx / 2.0;
             let oy = cy - bx / 2.0;
-            self.brush.SetColor(&rgba(BLACK, 0.35));
-            self.rt.DrawTextLayout(
-                D2D_POINT_2F { x: ox, y: oy + 1.0 },
-                &layout,
-                &self.brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-            );
-            self.brush.SetColor(&rgba(WHITE, 1.0));
+            if let Some(s) = shadow {
+                self.brush.SetColor(&s);
+                self.rt.DrawTextLayout(
+                    D2D_POINT_2F { x: ox, y: oy + TEXT_SHADOW_DY },
+                    &layout,
+                    &self.brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            }
+            self.brush.SetColor(&color);
             self.rt.DrawTextLayout(D2D_POINT_2F { x: ox, y: oy }, &layout, &self.brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
         }
         Ok(())
     }
 
-    /// Icon mode: 52 px account circle, 2.5 px accent ring, soft shadow, running dot.
-    fn icon(&self, st: &BubbleState, v: Visual) -> windows::core::Result<()> {
-        let s = if v.dragging || v.hover == Hit::Bubble && v.pressed == Hit::None {
-            1.06
-        } else if v.pressed == Hit::Bubble {
-            0.97
-        } else {
-            1.0
-        };
-        let (c, r) = (ICON_C, ICON_R * s);
-        // Soft shadow: 3 concentric alpha rings (accent glow 0 4px 12px .30 + dark 0 1px 3px .35).
-        self.circle(c, c + 4.0, r + 7.0, rgba(ACCENT, 0.04));
-        self.circle(c, c + 3.0, r + 4.5, rgba(ACCENT, 0.07));
-        self.circle(c, c + 1.0, r + 1.5, rgba(BLACK, 0.10));
-        match &st.active {
-            None => {
-                self.circle(c, c, r, rgba(ACCENT, 1.0));
-                self.text("C", 20.0 * s, c, c)?;
-            }
-            Some(a) => {
-                self.circle(c, c, r, rgba(ACCENT, 1.0));
-                self.circle(c, c, r - 2.5 * s, rgba(a.color, 1.0));
-                // Faint dark hairline between fill and ring.
-                self.ring(c, c, r - 3.0 * s, 1.0 * s, rgba(BLACK, 0.18));
-                self.text(&initials_of(a), 15.0 * s, c, c)?;
-                if a.running || a.limited {
-                    let d = c + 19.5 * s;
-                    self.circle(d, d, 7.0 * s, rgba(BG_SOLID, 1.0));
-                    self.circle(d, d, 5.0 * s, rgba(status_color(a), 1.0));
+    /// Draw every primitive in order; a text that cannot be laid out stops the frame.
+    fn draw(&self, scene: &Scene) -> windows::core::Result<()> {
+        for p in &scene.prims {
+            match p {
+                Prim::Circle { cx, cy, r, color } => self.circle(*cx, *cy, *r, d2d(*color)),
+                Prim::Ring { cx, cy, r, w, color } => self.ring(*cx, *cy, *r, *w, d2d(*color)),
+                Prim::RoundRect { l, t, r, b, radius, color } => self.rrect(*l, *t, *r, *b, *radius, d2d(*color)),
+                Prim::RoundRectStroke { l, t, r, b, radius, w, color } => {
+                    self.rrect_stroke(*l, *t, *r, *b, *radius, *w, d2d(*color))
+                }
+                Prim::Text { text, size, cx, cy, color, shadow } => {
+                    self.text(text, *size, *cx, *cy, d2d(*color), shadow.map(d2d))?
                 }
             }
         }
-        if st.waiting > 0 {
-            self.count_badge(st.waiting, c + 19.0 * s, c - 19.0 * s, s)?;
-        }
         Ok(())
-    }
-
-    /// Accent count badge (`9+` above nine) centred on (cx, cy), ringed in the bubble colour.
-    fn count_badge(&self, n: usize, cx: f32, cy: f32, s: f32) -> windows::core::Result<()> {
-        let label = badge_label(n);
-        let half = if label.chars().count() > 1 { 3.5 * s } else { 0.0 };
-        let r = 8.0 * s;
-        self.rrect(
-            cx - r - half - 2.0 * s,
-            cy - r - 2.0 * s,
-            cx + r + half + 2.0 * s,
-            cy + r + 2.0 * s,
-            r + 2.0 * s,
-            rgba(BG_SOLID, 1.0),
-        );
-        self.rrect(cx - r - half, cy - r, cx + r + half, cy + r, r, rgba(ACCENT, 1.0));
-        self.text(&label, 10.0 * s, cx, cy)
-    }
-
-    /// Tray mode: glass pill, grip, up to 3 avatars, "⋯" button.
-    fn tray(&self, st: &BubbleState, v: Visual) -> windows::core::Result<()> {
-        let n = tray_n(st.accounts.len());
-        let l = tray_layout(n);
-        let (pl, pr, pt, pb) = (l.pill_l, l.pill_r, PILL_TOP, PILL_BOTTOM);
-        let rad = (pb - pt) / 2.0;
-        // Shadow (0 4px 9px .5, 0 1px 3px .35) as 3 stacked alpha layers.
-        self.rrect(pl - 4.0, pt + 1.0, pr + 4.0, pb + 7.0, rad + 4.0, rgba(BLACK, 0.05));
-        self.rrect(pl - 2.5, pt + 1.0, pr + 2.5, pb + 4.5, rad + 2.5, rgba(BLACK, 0.08));
-        self.rrect(pl - 1.0, pt + 0.5, pr + 1.0, pb + 2.0, rad + 1.0, rgba(BLACK, 0.12));
-        // Pill: #101114 @ 94 %, 1 px rgba(255,255,255,.14) border.
-        self.rrect(pl, pt, pr, pb, rad, rgba(BG_SOLID, 0.94));
-        self.rrect_stroke(pl + 0.5, pt + 0.5, pr - 0.5, pb - 0.5, rad - 0.5, 1.0, rgba(WHITE, 0.14));
-        // Grip: 2×3 dots of 3 px, 3 px gap, centred in a 14 px column.
-        for col in 0..2 {
-            for row in 0..3 {
-                let x = l.grip_l + 2.5 + 1.5 + col as f32 * 6.0;
-                let y = TRAY_CY + (row as f32 - 1.0) * 6.0;
-                self.circle(x, y, 1.5, rgba(FG_SUBTLE, 1.0));
-            }
-        }
-        // Avatars.
-        for (i, a) in st.accounts.iter().take(MAX_TRAY).enumerate() {
-            let cx = l.slots[i] + SLOT / 2.0;
-            let cy = TRAY_CY;
-            let s = if !v.dragging && v.pressed == Hit::Avatar(i) {
-                0.97
-            } else if !v.dragging && v.hover == Hit::Avatar(i) && v.pressed == Hit::None {
-                1.08
-            } else {
-                1.0
-            };
-            let r = FACE_R * s;
-            if a.active {
-                // Accent glow (0 3px 10px rgba(138,124,255,.30)) then 2.5 px accent ring.
-                self.circle(cx, cy + 3.0, r + 4.0, rgba(ACCENT, 0.07));
-                self.circle(cx, cy + 2.0, r + 2.0, rgba(ACCENT, 0.12));
-                self.circle(cx, cy, r, rgba(ACCENT, 1.0));
-                self.circle(cx, cy, r - 2.5 * s, rgba(a.color, 1.0));
-            } else {
-                // 2 px rgba(255,255,255,.14) ring outside the fill.
-                self.ring(cx, cy, r + 1.0 * s, 2.0 * s, rgba(WHITE, 0.14));
-                self.circle(cx, cy, r, rgba(a.color, 1.0));
-            }
-            self.text(&initials_of(a), 12.0 * s, cx, cy)?;
-            if a.running || a.limited {
-                let (dx, dy) = (cx + 15.0 * s, cy + 15.0 * s);
-                self.circle(dx, dy, 6.0 * s, rgba(BG_SOLID, 1.0));
-                self.circle(dx, dy, 4.0 * s, rgba(status_color(a), 1.0));
-            }
-        }
-        // "⋯" button: 32 px round glass.
-        let hovered = !v.dragging && v.hover == Hit::More;
-        let fill = if v.pressed == Hit::More && !v.dragging {
-            0.10
-        } else if hovered {
-            0.07
-        } else {
-            0.045
-        };
-        let mc = l.more_cx;
-        self.circle(mc, TRAY_CY, MORE_R, rgba(WHITE, fill));
-        self.ring(mc, TRAY_CY, MORE_R - 0.5, 1.0, rgba(WHITE, 0.08));
-        let dot = if hovered { rgba(FG, 1.0) } else { rgba(FG_MUTED, 1.0) };
-        for k in -1..=1 {
-            self.circle(mc + k as f32 * 5.0, TRAY_CY, 1.3, dot);
-        }
-        if st.waiting > 0 {
-            self.count_badge(st.waiting, mc + 11.0, TRAY_CY - 11.0, 0.875)?;
-        }
-        Ok(())
-    }
-}
-
-/// Text of the waiting-count badge.
-fn badge_label(n: usize) -> String {
-    if n > 9 {
-        "9+".into()
-    } else {
-        n.to_string()
-    }
-}
-
-fn initials_of(a: &BubbleAccount) -> String {
-    let src = if a.initials.trim().is_empty() { a.name.as_str() } else { a.initials.as_str() };
-    let s: String = src.trim().chars().take(2).collect::<String>().to_uppercase();
-    if s.is_empty() {
-        "C".into()
-    } else {
-        s
     }
 }
 
@@ -706,8 +335,8 @@ fn create_solid_brush(rt: &ID2D1RenderTarget, color: &D2D1_COLOR_F) -> windows::
     }
 }
 
-/// Draw one frame into a new premultiplied BGRA WIC bitmap of `w`×`h` px at `scale`.
-/// `bg` paints an opaque background (test previews only).
+/// Draw the scene of `st` and `v` into a new premultiplied BGRA WIC bitmap of `w`×`h` px at
+/// `scale`. `bg` paints an opaque background (test previews only).
 fn paint(
     gfx: &Gfx,
     st: &BubbleState,
@@ -715,8 +344,8 @@ fn paint(
     scale: f32,
     bg: Option<u32>,
 ) -> Result<(IWICBitmap, i32, i32), String> {
-    let mode = effective_mode(st);
-    let (w, h) = px_size(mode, st.accounts.len(), scale);
+    let scene = model::scene(st, v);
+    let (w, h) = px_size(effective_mode(st), st.accounts.len(), scale);
     // SAFETY: all interfaces are created and used on this thread; the render target is dropped
     // before the bitmap is read.
     unsafe {
@@ -738,18 +367,16 @@ fn paint(
         let rt = gfx.d2d.CreateWicBitmapRenderTarget(&bmp, &props).map_err(|e| format!("D2D render target: {e}"))?;
         rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-        let brush = create_solid_brush(&rt, &rgba(WHITE, 1.0)).map_err(|e| format!("D2D brush: {e}"))?;
+        let white = D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+        let brush = create_solid_brush(&rt, &white).map_err(|e| format!("D2D brush: {e}"))?;
         rt.BeginDraw();
         let clear = match bg {
-            Some(c) => rgba(c, 1.0),
+            Some(c) => d2d(Color { rgb: c, a: 1.0 }),
             None => D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
         };
         rt.Clear(Some(&clear));
         let p = Painter { gfx, rt: &rt, brush };
-        let drawn = match mode {
-            BubbleMode::Icon => p.icon(st, v),
-            BubbleMode::Tray => p.tray(st, v),
-        };
+        let drawn = p.draw(&scene);
         drop(p);
         let ended = rt.EndDraw(None, None);
         drawn.map_err(|e| format!("draw text: {e}"))?;
@@ -828,13 +455,13 @@ struct Inner {
 }
 
 impl Inner {
-    fn window_rect(&self) -> RECT {
+    fn window_rect(&self) -> Rect {
         let mut r = RECT::default();
         // SAFETY: GetWindowRect writes into a local RECT; an invalid hwnd just fails.
         if unsafe { GetWindowRect(self.hwnd.get(), &mut r) }.is_err() {
-            return RECT::default();
+            return Rect::default();
         }
-        r
+        Rect::from(r)
     }
 
     /// Render the current model and push it to the window at `pos` (or where it is now).
@@ -847,7 +474,7 @@ impl Inner {
             }
         };
         let cur = self.window_rect();
-        let (x, y) = pos.unwrap_or((cur.left, cur.top));
+        let (x, y) = pos.unwrap_or((cur.x, cur.y));
         if let Err(e) = push_layered(self.hwnd.get(), &bmp, w, h, x, y) {
             log::warn(&format!("bubble present: {e}"));
         }
@@ -860,7 +487,7 @@ impl Inner {
         let mode = effective_mode(&m.state);
         let (w, h) = px_size(mode, m.state.accounts.len(), m.scale);
         let cur = self.window_rect();
-        let pos = if (w, h) != m.size || cur.right - cur.left != w || cur.bottom - cur.top != h {
+        let pos = if (w, h) != m.size || cur.w != w || cur.h != h {
             let area = work_area_for(&cur);
             Some(anchored_rect(&cur, w, h, &area))
         } else {
@@ -1069,7 +696,7 @@ fn handle(inner: &Inner, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> (Optio
                 if p.dragging {
                     let (w, h) = size;
                     let (nx, ny) = (p.origin.x + dx, p.origin.y + dy);
-                    let probe = RECT { left: nx, top: ny, right: nx + w, bottom: ny + h };
+                    let probe = Rect { x: nx, y: ny, w, h };
                     let area = work_area_for(&probe);
                     let (cx, cy) = clamp_to_area(nx, ny, w, h, &area);
                     // SAFETY: moving our own window.
@@ -1115,12 +742,8 @@ fn handle(inner: &Inner, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> (Optio
                 return (Some(LRESULT(0)), None);
             }
             let r = inner.window_rect();
-            m.press = Some(Press {
-                start: cursor_pos(),
-                origin: POINT { x: r.left, y: r.top },
-                target: hit,
-                dragging: false,
-            });
+            m.press =
+                Some(Press { start: cursor_pos(), origin: POINT { x: r.x, y: r.y }, target: hit, dragging: false });
             m.visual.pressed = hit;
             m.visual.hover = hit;
             // SAFETY: capturing the mouse for our own window on its thread.
@@ -1219,7 +842,7 @@ fn handle(inner: &Inner, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> (Optio
             let cur = inner.window_rect();
             let area = work_area_for(&cur);
             let (w, h) = m.size;
-            let pos = clamp_to_area(cur.left, cur.top, w, h, &area);
+            let pos = clamp_to_area(cur.x, cur.y, w, h, &area);
             inner.present(&mut m, Some(pos));
             (None, None)
         }
@@ -1234,8 +857,8 @@ pub struct Bubble {
     inner: Rc<Inner>,
 }
 
-impl Bubble {
-    pub fn create(pos: Option<(i32, i32)>, on_event: Box<dyn Fn(BubbleEvent)>) -> Result<Bubble, String> {
+impl BubbleHost for Bubble {
+    fn create(pos: Option<(i32, i32)>, on_event: Box<dyn Fn(BubbleEvent)>) -> Result<Bubble, String> {
         let gfx = Gfx::new()?;
         register_class()?;
         let sys = win::dpi_scale(HWND::default());
@@ -1245,7 +868,7 @@ impl Bubble {
             None => {
                 let a = primary_work_area();
                 let m = (DEFAULT_MARGIN_DIP * sys).round() as i32;
-                (a.right - w0 - m, a.bottom - h0 - m)
+                (a.x + a.w - w0 - m, a.y + a.h - h0 - m)
             }
         };
         let class = win::wide(CLASS_NAME);
@@ -1293,12 +916,12 @@ impl Bubble {
         // Initial position at the real DPI, clamped into the work area of its monitor.
         let (w, h) = px_size(BubbleMode::Icon, 0, scale);
         let (x, y) = if pos.is_some() {
-            let probe = RECT { left: x0, top: y0, right: x0 + w, bottom: y0 + h };
+            let probe = Rect { x: x0, y: y0, w, h };
             clamp_to_area(x0, y0, w, h, &work_area_for(&probe))
         } else {
             let a = primary_work_area();
             let m = (DEFAULT_MARGIN_DIP * scale).round() as i32;
-            (a.right - w - m, a.bottom - h - m)
+            (a.x + a.w - w - m, a.y + a.h - h - m)
         };
         {
             let mut m = inner.model.borrow_mut();
@@ -1310,7 +933,7 @@ impl Bubble {
     }
 
     /// Apply a new state: resize (anchored to the snapped edge) and re-render.
-    pub fn set_state(&mut self, s: BubbleState) {
+    fn set_state(&mut self, s: BubbleState) {
         let mut s = s;
         s.accounts.truncate(MAX_TRAY);
         let Ok(mut m) = self.inner.model.try_borrow_mut() else {
@@ -1327,15 +950,11 @@ impl Bubble {
         self.inner.relayout(&mut m);
     }
 
-    pub fn hwnd(&self) -> HWND {
-        self.hwnd
-    }
-
-    pub fn rect(&self) -> RECT {
+    fn rect(&self) -> Rect {
         self.inner.window_rect()
     }
 
-    pub fn show(&self, visible: bool) {
+    fn show(&self, visible: bool) {
         // SAFETY: plain show/z-order calls on our own window.
         unsafe {
             if visible {
@@ -1347,20 +966,20 @@ impl Bubble {
         }
     }
 
-    pub fn set_position(&self, x: i32, y: i32) {
+    fn set_position(&self, x: i32, y: i32) {
         // SAFETY: moving our own window.
         let _ = unsafe { SetWindowPos(self.hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) };
     }
 
     /// Write the last rendered frame as PNG (straight alpha) via the WIC encoder.
-    pub fn render_to_png(&self, path: &Path) -> Result<(), String> {
+    fn render_to_png(&self, path: &Path) -> Result<(), String> {
         let m = self.inner.model.try_borrow().map_err(|_| "bubble busy".to_string())?;
         let bmp = m.last.as_ref().ok_or("bubble: nothing rendered yet")?;
         write_png(&self.inner.gfx.wic, bmp, path)
     }
 
     /// Whether the window is currently shown.
-    pub fn is_visible(&self) -> bool {
+    fn is_visible(&self) -> bool {
         // SAFETY: read-only query on our own window.
         unsafe { IsWindowVisible(self.hwnd) }.as_bool()
     }
@@ -1378,22 +997,10 @@ impl Drop for Bubble {
     }
 }
 
-// ----------------------------------------------------------------------------------- tests
-
-/// Colour of an account's status dot (running, or limited).
-fn status_color(a: &BubbleAccount) -> u32 {
-    if a.limited {
-        DANGER
-    } else if a.needs_sign_in {
-        WARN
-    } else {
-        SUCCESS
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::bubble::BubbleAccount;
 
     fn acct(id: &str, name: &str, color: u32, running: bool, active: bool) -> BubbleAccount {
         BubbleAccount {
@@ -1408,23 +1015,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn status_dot_colours() {
-        let mut a = acct("a", "Work", 0x5B9CF6, true, false);
-        assert_eq!(status_color(&a), SUCCESS);
-        a.needs_sign_in = true;
-        assert_eq!(status_color(&a), WARN);
-        a.limited = true;
-        assert_eq!(status_color(&a), DANGER);
-    }
-
-    #[test]
-    fn waiting_badge_label() {
-        assert_eq!(badge_label(1), "1");
-        assert_eq!(badge_label(9), "9");
-        assert_eq!(badge_label(10), "9+");
-    }
-
     fn fake(n: usize) -> Vec<BubbleAccount> {
         let all = [
             acct("a", "Main", 0xF08A5D, true, true),
@@ -1432,76 +1022,6 @@ mod tests {
             acct("c", "Side project", 0x3DD6A1, true, false),
         ];
         all[..n].to_vec()
-    }
-
-    #[test]
-    fn bubble_sizes_scale_with_dpi() {
-        assert_eq!(dip_size(BubbleMode::Icon, 0), (80.0, 80.0));
-        assert_eq!(dip_size(BubbleMode::Tray, 1).0, 130.0);
-        assert_eq!(dip_size(BubbleMode::Tray, 2).0, 180.0);
-        assert_eq!(dip_size(BubbleMode::Tray, 3).0, 230.0);
-        assert_eq!(dip_size(BubbleMode::Tray, 9).0, 230.0);
-        assert_eq!(px_size(BubbleMode::Tray, 3, 1.5), (345, 108));
-    }
-
-    #[test]
-    fn tray_layout_matches_css() {
-        let l = tray_layout(1);
-        assert_eq!(l.pill_l, 7.0);
-        assert_eq!(l.pill_r, 123.0);
-        assert_eq!(l.slots, vec![26.0]);
-        assert_eq!(l.more_cx, 94.0);
-        let l3 = tray_layout(3);
-        assert_eq!(l3.slots, vec![26.0, 76.0, 126.0]);
-        assert_eq!(l3.more_cx, 194.0);
-        assert_eq!(l3.pill_r + 7.0, 230.0);
-    }
-
-    #[test]
-    fn hit_testing() {
-        assert_eq!(hit_test(BubbleMode::Icon, 0, 40.0, 40.0), Hit::Bubble);
-        assert_eq!(hit_test(BubbleMode::Icon, 0, 2.0, 2.0), Hit::None);
-        assert_eq!(hit_test(BubbleMode::Tray, 2, 48.0, 36.0), Hit::Avatar(0));
-        assert_eq!(hit_test(BubbleMode::Tray, 2, 98.0, 36.0), Hit::Avatar(1));
-        assert_eq!(hit_test(BubbleMode::Tray, 2, 144.0, 36.0), Hit::More);
-        assert_eq!(hit_test(BubbleMode::Tray, 2, 16.0, 36.0), Hit::Grip);
-        assert_eq!(hit_test(BubbleMode::Tray, 2, 73.0, 36.0), Hit::Grip); // gap between slots
-        assert_eq!(hit_test(BubbleMode::Tray, 2, 3.0, 36.0), Hit::None);
-        assert_eq!(hit_test(BubbleMode::Tray, 2, 48.0, 5.0), Hit::None);
-    }
-
-    #[test]
-    fn effective_mode_falls_back_to_icon() {
-        let mut s = BubbleState { mode: BubbleMode::Tray, active: None, accounts: vec![], waiting: 0 };
-        assert_eq!(effective_mode(&s), BubbleMode::Icon);
-        s.accounts = fake(1);
-        assert_eq!(effective_mode(&s), BubbleMode::Tray);
-    }
-
-    #[test]
-    fn snapping_and_anchoring() {
-        let area = RECT { left: 0, top: 0, right: 1000, bottom: 800 };
-        let r = RECT { left: 100, top: -50, right: 180, bottom: 30 };
-        assert_eq!(snap_rect(&r, &area, 12), (12, 12));
-        let r = RECT { left: 700, top: 790, right: 780, bottom: 870 };
-        assert_eq!(snap_rect(&r, &area, 12), (1000 - 80 - 12, 800 - 80 - 12));
-        // Right half: keep the right edge; vertical centre kept.
-        let r = RECT { left: 908, top: 400, right: 988, bottom: 480 };
-        assert_eq!(anchored_rect(&r, 230, 72, &area), (758, 404));
-        // Left half: keep the left edge.
-        let r = RECT { left: 12, top: 400, right: 242, bottom: 472 };
-        assert_eq!(anchored_rect(&r, 80, 80, &area), (12, 396));
-        // Clamped into the area.
-        assert_eq!(clamp_to_area(-5, 900, 80, 80, &area), (0, 720));
-    }
-
-    #[test]
-    fn initials_fallbacks() {
-        assert_eq!(initials_of(&acct("x", "work", 0, false, false)), "WO");
-        let mut a = acct("x", "", 0, false, false);
-        assert_eq!(initials_of(&a), "C");
-        a.initials = "ab".into();
-        assert_eq!(initials_of(&a), "AB");
     }
 
     /// Renders every mode/count to PNGs under %TEMP%\sessionmux-bubble-preview for visual review.
@@ -1530,7 +1050,7 @@ mod tests {
             b.render_to_png(&dir.join(format!("icon-{n}.png"))).unwrap();
             b.set_state(BubbleState { mode: BubbleMode::Tray, active, accounts, waiting: 0 });
             let r = b.rect();
-            println!("tray n={n} rect {}x{}", r.right - r.left, r.bottom - r.top);
+            println!("tray n={n} rect {}x{}", r.w, r.h);
             b.render_to_png(&dir.join(format!("tray-{n}.png"))).unwrap();
         }
         drop(b);

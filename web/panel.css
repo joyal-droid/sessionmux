@@ -775,6 +775,14 @@ body {
   gap: var(--s-3);
 }
 
+/* Advice above the fields (how to sign in where routing needs extra steps). */
+.form__note {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--fs-sm);
+  line-height: 1.4;
+}
+
 /* ---------- Sessions ---------- */
 
 .sess-toolbar {
@@ -1567,6 +1575,9 @@ kbd {
 .signin-notice .btn--sm { flex: none; height: 28px; padding: 0 10px; border-radius: var(--radius-xs); }
 .signin-notice .btn--ghost { color: inherit; }
 .signin-notice .btn--ghost:hover:not(:disabled) { background: var(--bg-hover); color: inherit; }
+/* Run from a disk image or a quarantine copy: same card in the warning colours, no button. */
+.app-notice { background: var(--warn-soft); color: var(--warn-text); padding-right: var(--s-3); }
+.app-notice .signin-notice__text { padding-top: 0; }
 
 /* Running but not signed in: amber status dots instead of green. */
 .acct__dot.is-running.needs-signin { background: var(--warn); }
@@ -1764,6 +1775,7 @@ kbd {
 .setting--note { align-items: flex-start; min-height: 0; }
 .setting__note-icon { flex: none; margin-top: 1px; color: var(--warn); }
 .setting--note .setting__desc { flex: 1; min-width: 0; }
+.setting--note .setting__text .btn--sm { align-self: flex-start; margin-top: var(--s-1); }
 
 /* Confirm dialog: the exact JSON a change adds. */
 .dialog__code {

@@ -32,8 +32,9 @@
  *     removeAccount, reorderAccounts, listSessions, transferSession, deleteSession,
  *     openSessionFolder, getSettings, setSettings, listDiscovered, adoptProfile, ignoreProfile,
  *     togglePanel, hidePanel, pinPanel, quit, openExternal,
- *     getAppInfo, openLicense, getSignIn, cancelSignIn, listApprovals, decideApproval, listWaiting,
- *     handOverSession, getHooksStatus, previewHooks, installHooks, removeHooks.
+ *     getAppInfo, openLicense, getSignIn, cancelSignIn, restoreLinkHandler, removeChanges,
+ *     openSystemSettings, listApprovals, decideApproval, listWaiting, handOverSession,
+ *     getHooksStatus, previewHooks, installHooks, removeHooks.
  *   Events (each onX(cb) returns an unsubscribe fn): onAccountsChanged, onActiveAccount,
  *     onSettings, onShowTab, onDiscoveredChanged, onSignInChanged ('signin-changed': {active, accountId, accountName, since} or
  *     {active:false, ended?, accountName?}), onHandover ('handover-done': an automatic hand-over
@@ -184,6 +185,11 @@
     // sign-in routing
     getSignIn: method('getSignIn'),
     cancelSignIn: method('cancelSignIn'),
+    restoreLinkHandler: method('restoreLinkHandler'),
+    // everything Sessionmux changed outside its own folder (hooks, link handler, login item)
+    removeChanges: method('removeChanges'),
+    // a page of the system settings: 'loginItems' | 'accessibility' | 'automation' (macOS)
+    openSystemSettings: method('openSystemSettings'),
     // events
     onAccountsChanged: function (cb) { return subscribe('accounts-changed', cb); },
     onActiveAccount: function (cb) { return subscribe('active-account', cb); },

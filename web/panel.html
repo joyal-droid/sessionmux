@@ -59,9 +59,14 @@
     <!-- Accounts -->
     <section class="view" id="view-accounts" role="tabpanel" aria-labelledby="tab-accounts" tabindex="-1">
       <div class="scroll" id="accountsScroll">
+        <!-- Where the app runs from stops some settings from working, filled by panel.js -->
+        <div class="signin-notice app-notice" id="appNotice" role="status" hidden>
+          <span class="signin-notice__text" id="appNoticeText"></span>
+        </div>
         <!-- Sign-in routing notice, filled by panel.js -->
         <div class="signin-notice" id="signinNotice" role="status" hidden>
           <span class="signin-notice__text" id="signinNoticeText"></span>
+          <button class="btn btn--sm btn--ghost signin-notice__btn" id="signinNoticeAlt" type="button" hidden></button>
           <button class="btn btn--sm btn--ghost signin-notice__btn" id="signinNoticeBtn" type="button">Cancel</button>
         </div>
         <ul class="acct-list" id="accountList" aria-label="Accounts" aria-busy="true">

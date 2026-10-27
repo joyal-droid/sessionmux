@@ -7,7 +7,7 @@ rust-version = "1.88"
 license = "CPAL-1.0"
 repository = "https://github.com/joyal-droid/sessionmux"
 readme = "README.md"
-keywords = ["claude", "account-switcher", "windows", "multi-account", "webview2"]
+keywords = ["claude", "account-switcher", "windows", "macos", "multi-account", "webview2"]
 categories = ["gui"]
 publish = false
 build = "build.rs"
@@ -17,6 +17,13 @@ name = "Sessionmux"
 path = "src/main.rs"
 
 [dependencies]
+wry = "0.57"
+raw-window-handle = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
   "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Graphics_Direct2D",
@@ -25,12 +32,22 @@ windows = { version = "0.58", features = [
   "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_System_LibraryLoader", "Win32_System_Memory",
   "Win32_System_SystemServices", "Win32_System_Kernel", "Win32_System_WindowsProgramming", "Win32_Security",
   "Win32_Storage_FileSystem", "Win32_System_Console", "Wdk_System_Threading", "Wdk_Foundation",
+  "Win32_System_Com_StructuredStorage",
 ] }
-wry = "0.47"
-raw-window-handle = "0.6"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-core-text = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-service-management = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std"] }
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

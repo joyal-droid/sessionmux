@@ -109,8 +109,9 @@ pub struct Settings {
     #[serde(rename = "bubbleMode")]
     pub bubble_mode: String,
     /// Route `claude://` sign-in links to the account that is signing in.
-    /// Default true; stores written before this setting existed read as true.
-    #[serde(rename = "signInRouting", default = "default_true")]
+    /// Default on, except where each handler change asks the user; stores written before this
+    /// setting existed read as that default.
+    #[serde(rename = "signInRouting", default = "default_sign_in_routing")]
     pub sign_in_routing: bool,
     /// Hand an account's running session over to another account when it hits its plan limit.
     /// Default false; written to the store only while on.
@@ -120,14 +121,25 @@ pub struct Settings {
     /// hooks into the user's Claude Code settings). Default false; written to the store only while on.
     #[serde(rename = "approveFromPanel", default, skip_serializing_if = "is_false")]
     pub approve_from_panel: bool,
+    /// Bring minimised Claude windows to the front through the accessibility interface, where the
+    /// system needs it for that. Default false; written to the store only while on; no effect on
+    /// Windows.
+    #[serde(rename = "raiseWindowsWithAccessibility", default, skip_serializing_if = "is_false")]
+    pub raise_windows_with_accessibility: bool,
 }
 
 fn is_false(b: &bool) -> bool {
     !*b
 }
 
-fn default_true() -> bool {
-    true
+/// Sign-in routing is on by default unless every handler change asks the user.
+fn routing_default(changes_need_consent: bool) -> bool {
+    !changes_need_consent
+}
+
+fn default_sign_in_routing() -> bool {
+    use crate::platform::{Os, UrlHandler};
+    routing_default(<Os as UrlHandler>::changes_need_consent())
 }
 
 impl Default for Settings {
@@ -142,9 +154,10 @@ impl Default for Settings {
             hotkey: "Ctrl+Shift+Space".into(),
             panel_side: "auto".into(),
             bubble_mode: "icon".into(),
-            sign_in_routing: true,
+            sign_in_routing: default_sign_in_routing(),
             auto_handover: false,
             approve_from_panel: false,
+            raise_windows_with_accessibility: false,
         }
     }
 }
@@ -423,6 +436,7 @@ struct SettingsPatch {
     sign_in_routing: Option<bool>,
     auto_handover: Option<bool>,
     approve_from_panel: Option<bool>,
+    raise_windows_with_accessibility: Option<bool>,
     bubble_position: Option<Option<Point>>,
     theme: Option<String>,
     panel_side: Option<String>,
@@ -440,6 +454,7 @@ fn sanitize_settings(partial: Option<&Value>) -> SettingsPatch {
     out.sign_in_routing = b("signInRouting");
     out.auto_handover = b("autoHandover");
     out.approve_from_panel = b("approveFromPanel");
+    out.raise_windows_with_accessibility = b("raiseWindowsWithAccessibility");
     if let Some(bp) = p.get("bubblePosition") {
         match bp {
             Value::Null => out.bubble_position = Some(None),
@@ -486,6 +501,9 @@ fn apply_settings(s: &mut Settings, p: SettingsPatch) {
     }
     if let Some(v) = p.approve_from_panel {
         s.approve_from_panel = v;
+    }
+    if let Some(v) = p.raise_windows_with_accessibility {
+        s.raise_windows_with_accessibility = v;
     }
     if let Some(v) = p.bubble_position {
         s.bubble_position = v;
@@ -1354,54 +1372,11 @@ impl AccountsStore {
         }
     }
 
-    /// `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value "Sessionmux" = `"<exe>" --hidden`
-    /// (enabled) or removed (disabled).
+    /// Start Sessionmux at login (enabled) or not. On Windows: the `HKCU\...\Run` value
+    /// "Sessionmux" = `"<exe>" --hidden`, written or removed.
     pub fn start_with_windows(enabled: bool) -> Result<(), String> {
-        use crate::util::win::wide;
-        use windows::core::PCWSTR;
-        use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
-        use windows::Win32::System::Registry::{
-            RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ,
-        };
-
-        let subkey = wide(r"Software\Microsoft\Windows\CurrentVersion\Run");
-        let value_name = wide(brand::RUN_VALUE);
-        let mut key = HKEY::default();
-        // SAFETY: `subkey` is a NUL-terminated UTF-16 buffer that outlives the call and `key`
-        // is a valid out-pointer.
-        let rc = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(subkey.as_ptr()), 0, KEY_SET_VALUE, &mut key) };
-        if rc != ERROR_SUCCESS {
-            return Err(format!("could not open the Run key (error {})", rc.0));
-        }
-        let result = if enabled {
-            let exe = std::env::current_exe().map_err(|e| e.to_string());
-            match exe {
-                Err(e) => Err(e),
-                Ok(exe) => {
-                    let cmd = format!("\"{}\" --hidden", exe.display());
-                    let data: Vec<u8> = wide(&cmd).iter().flat_map(|u| u.to_le_bytes()).collect();
-                    // SAFETY: `key` is an open key handle; `value_name` is NUL-terminated;
-                    // `data` is a NUL-terminated REG_SZ byte buffer alive for the call.
-                    let rc = unsafe { RegSetValueExW(key, PCWSTR(value_name.as_ptr()), 0, REG_SZ, Some(&data)) };
-                    if rc == ERROR_SUCCESS {
-                        Ok(())
-                    } else {
-                        Err(format!("could not write the Run value (error {})", rc.0))
-                    }
-                }
-            }
-        } else {
-            // SAFETY: `key` is an open key handle and `value_name` is NUL-terminated.
-            let rc = unsafe { RegDeleteValueW(key, PCWSTR(value_name.as_ptr())) };
-            if rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND {
-                Ok(())
-            } else {
-                Err(format!("could not remove the Run value (error {})", rc.0))
-            }
-        };
-        // SAFETY: `key` was opened above and is closed exactly once.
-        let _ = unsafe { RegCloseKey(key) };
-        result
+        use crate::platform::{Autostart, Os};
+        <Os as Autostart>::set(enabled).map(|_| ())
     }
 }
 
@@ -1594,6 +1569,38 @@ mod tests {
         let mut old = serde_json::to_value(Settings::default()).unwrap();
         old.as_object_mut().unwrap().remove("signInRouting");
         assert!(serde_json::from_value::<Settings>(old).unwrap().sign_in_routing);
+    }
+
+    #[test]
+    fn routing_default_follows_consent() {
+        assert!(routing_default(false));
+        assert!(!routing_default(true));
+        use crate::platform::{Os, UrlHandler};
+        assert_eq!(Settings::default().sign_in_routing, !<Os as UrlHandler>::changes_need_consent());
+    }
+
+    #[test]
+    fn raise_windows_setting() {
+        let env = Env::new();
+        let mut st = env.store();
+        assert!(!st.settings().raise_windows_with_accessibility);
+        assert!(env.disk()["settings"].get("raiseWindowsWithAccessibility").is_none());
+        assert!(
+            !st.set_settings(json!({ "raiseWindowsWithAccessibility": "yes" }))
+                .unwrap()
+                .raise_windows_with_accessibility
+        );
+        assert!(
+            st.set_settings(json!({ "raiseWindowsWithAccessibility": true })).unwrap().raise_windows_with_accessibility
+        );
+        assert_eq!(env.disk()["settings"]["raiseWindowsWithAccessibility"], json!(true));
+        assert!(env.store().settings().raise_windows_with_accessibility);
+        assert!(
+            !st.set_settings(json!({ "raiseWindowsWithAccessibility": false }))
+                .unwrap()
+                .raise_windows_with_accessibility
+        );
+        assert!(env.disk()["settings"].get("raiseWindowsWithAccessibility").is_none());
     }
 
     /// A settings key older builds wrote; stores that still carry it must load and drop it.
