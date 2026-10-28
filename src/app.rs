@@ -127,6 +127,9 @@ const BLUR_TOGGLE_GRACE: Duration = Duration::from_millis(300);
 const PANEL_DESTROY_MS: u32 = 30_000;
 const TRAY_MAX_ACCOUNTS: usize = 3;
 const OPEN_ALL_STAGGER: Duration = Duration::from_millis(400);
+/// macOS: the panel stays up while an open from it runs, and a failed open from anywhere shows
+/// the panel with its reason (Claude taking the activation would otherwise hide the panel first).
+const SURFACE_OPEN_FAILURES: bool = cfg!(target_os = "macos");
 
 /// Claude registers its `claude://` handler at startup: begin the relay this long after the
 /// account's window is up, so our value is the one that stays.
@@ -261,6 +264,8 @@ pub struct AppState {
     last_discovered_json: Option<String>,
     last_settings_json: String,
     last_active_json: String,
+    /// The Claude process list as last logged.
+    last_procs_log: String,
     last_bubble_state: Option<BubbleState>,
     last_blur_hide: Option<Instant>,
     panel_creating: bool,
@@ -553,7 +558,7 @@ fn dispatch(req: &IpcRequest) -> Option<Value> {
                 .unwrap_or(json!([])),
             );
         }
-        "openAccount" => open_account(id, &a0, true).map(|_| None),
+        "openAccount" => open_account(id, &a0, true, OpenFrom::Panel).map(|_| None),
         "openAll" => open_all(id).map(|_| None),
         "closeAccount" => close_account(id, &a0).map(|_| None),
         "addAccount" => state_call(|st| add_account(st, &a0)).map(Some),
@@ -863,14 +868,22 @@ fn prepare_open(st: &AppState, acc: &Account) -> UResult<OpenPlan> {
     Ok(OpenPlan { id: acc.id.clone(), name: acc.name.clone(), is_main: acc.is_main, dir, route })
 }
 
-/// Worker: focus the running window, or launch the account.
-fn open_worker(plan: &OpenPlan, located: Option<Located>, focus: bool, wake: &Option<mpsc::Sender<()>>) -> Value {
+/// Worker: focus the running window, or launch the account. `note` receives what happened, for
+/// the log.
+fn open_worker(
+    plan: &OpenPlan,
+    located: Option<Located>,
+    focus: bool,
+    wake: &Option<mpsc::Sender<()>>,
+    note: &mut String,
+) -> Value {
     let running: Vec<Proc> = claude_app::list_processes()
         .into_iter()
         .filter(|p| claude_app::matches_data_dir(p, plan.dir.as_deref()))
         .collect();
     if !running.is_empty() {
         if !focus {
+            *note = format!("already running (pid {})", running[0].pid);
             return ok();
         }
         // On macOS a running instance is never started again, so activation (and the opt-in
@@ -883,29 +896,37 @@ fn open_worker(plan: &OpenPlan, located: Option<Located>, focus: bool, wake: &Op
             } else {
                 match <Os as Focus>::focus(w.pid) {
                     FocusResult::Focused => {
+                        *note = format!("focused pid={} window={}", w.pid, w.hwnd != 0);
                         if plan.route {
                             schedule_sign_in(plan, None);
                         }
                         return ok();
                     }
-                    FocusResult::NeedsHandOff => {}
+                    FocusResult::NeedsHandOff => {
+                        *note = format!("hand-off pid={} window={}", w.pid, w.hwnd != 0);
+                    }
                     // No hand-off can show it either: the page explains what the user can do.
-                    FocusResult::Failed => {
+                    FocusResult::Failed(why) => {
+                        *note = format!("failed: {} pid={} window={}", why.reason(), w.pid, w.hwnd != 0);
                         let mut v = fail(&format!("Could not bring {}'s Claude window to the front.", plan.name));
-                        v["reason"] = json!("focus-failed");
+                        v["reason"] = json!(why.reason());
                         return v;
                     }
                 }
             }
+        } else {
+            *note = format!("running without a window (pid {})", running[0].pid);
         }
         // Running but hidden in the tray (hwnd 0) or focus refused: launching again hands off
         // to the running instance through Claude's single-instance lock, which shows it.
     }
     if is_smoke() {
         log::info("smoke: blocked claude_app::launch");
+        *note = "launch blocked (smoke)".into();
         return fail(&format!("Could not start Claude for {}.", plan.name));
     }
     let Some(loc) = located.or_else(|| claude_app::locate().ok()) else {
+        *note = "failed: Claude Desktop not found".into();
         return fail("Claude Desktop was not found on this PC.");
     };
     let r = if plan.is_main {
@@ -921,6 +942,7 @@ fn open_worker(plan: &OpenPlan, located: Option<Located>, focus: bool, wake: &Op
     };
     if let Err(e) = r {
         log::warn(&format!("open {}: {e}", plan.id));
+        *note = "failed: launch error".into();
         let msg = if e.trim().is_empty() { format!("Could not start Claude for {}.", plan.name) } else { e };
         return fail(&msg);
     }
@@ -939,6 +961,7 @@ fn open_worker(plan: &OpenPlan, located: Option<Located>, focus: bool, wake: &Op
     } else if plan.route {
         schedule_sign_in(plan, Some(plan.dir.clone()));
     }
+    *note = if note.is_empty() { "launched".into() } else { format!("launched after {note}") };
     if running.is_empty() {
         poll_later(wake.clone(), Duration::from_millis(1500)); // pick up the new process quickly
     }
@@ -964,7 +987,36 @@ fn request_poll(st: &mut AppState) {
     }
 }
 
-fn open_account(id: u64, acc_id: &Value, focus: bool) -> UResult<()> {
+/// Where an open was asked for (named in the log).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenFrom {
+    Panel,
+    Bubble,
+    Tray,
+    /// Opened right after the account was added.
+    Added,
+    /// The target of a session hand-over.
+    Handover,
+    /// Asked for by the focus check without any input event.
+    #[cfg(target_os = "macos")]
+    Check,
+}
+
+impl OpenFrom {
+    fn as_str(self) -> &'static str {
+        match self {
+            OpenFrom::Panel => "panel",
+            OpenFrom::Bubble => "bubble",
+            OpenFrom::Tray => "tray",
+            OpenFrom::Added => "add",
+            OpenFrom::Handover => "handover",
+            #[cfg(target_os = "macos")]
+            OpenFrom::Check => "check",
+        }
+    }
+}
+
+fn open_account(id: u64, acc_id: &Value, focus: bool, from: OpenFrom) -> UResult<()> {
     let (plan, located, wake, running) = state_call_raw(|st| {
         let acc = find_account(st, acc_id)?;
         st.last_opened = Some(acc.id.clone());
@@ -973,13 +1025,82 @@ fn open_account(id: u64, acc_id: &Value, focus: bool) -> UResult<()> {
         let running = st.procs.iter().find(|p| claude_app::matches_data_dir(p, plan.dir.as_deref())).map(|p| p.pid);
         Ok((plan, st.located.clone(), st.poll_wake.clone(), running))
     })?;
-    // Still inside the user's click or shortcut: where the system asks for that, the activation
-    // the worker passes to Claude is taken here.
-    if let Some(pid) = running.filter(|_| focus && !is_smoke()) {
-        <Os as Focus>::prepare_focus(pid);
+    // Runs from the posted handler of the click, menu choice or shortcut (not from within the
+    // input event itself): the platform takes what activation it can here, before the worker.
+    if focus && !is_smoke() {
+        match running {
+            Some(pid) => <Os as Focus>::prepare_focus(pid),
+            None => log::info(&format!("open {}: no running process known yet, activation not prepared", plan.id)),
+        }
     }
-    spawn_then(move || open_worker(&plan, located, focus, &wake), move |v| resolve(id, v));
+    let pin = SURFACE_OPEN_FAILURES && id != 0;
+    if pin {
+        pin_panel(true);
+    }
+    spawn_then(
+        move || {
+            let mut note = String::new();
+            let v = open_worker(&plan, located, focus, &wake, &mut note);
+            (plan, v, note)
+        },
+        move |(plan, v, note): (OpenPlan, Value, String)| {
+            let failed = v.get("ok") == Some(&Value::Bool(false));
+            let line = open_log_line(&plan.id, from, &note);
+            if failed {
+                log::warn(&format!("{line}; {}", v["error"].as_str().unwrap_or("")));
+            } else {
+                log::info(&line);
+            }
+            if failed && SURFACE_OPEN_FAILURES {
+                show_open_failure(id, &plan, &v);
+            } else if pin {
+                pin_panel(false);
+            }
+            #[cfg(target_os = "macos")]
+            let seen = crate::focuscheck::active().then(|| (plan.id.clone(), from.as_str(), note, v.clone()));
+            resolve(id, v);
+            #[cfg(target_os = "macos")]
+            if let Some((acc, surface, note, reply)) = seen {
+                let visible = with_state(|st| st.panel.as_ref().is_some_and(|p| p.is_visible())).unwrap_or(false);
+                crate::focuscheck::note_open(&acc, surface, &note, reply, visible);
+            }
+        },
+    );
     Ok(())
+}
+
+/// The log line that sums up one open: `open <account> via <surface>: <what happened>`.
+fn open_log_line(acc: &str, from: OpenFrom, note: &str) -> String {
+    format!("open {acc} via {}: {}", from.as_str(), if note.is_empty() { "ok" } else { note })
+}
+
+/// Make a failed open visible: the panel comes up (it may have hidden when Claude took the
+/// activation) and stays up for the pin time even while Claude is in front, and an open that has
+/// no reply to carry the reason is reported as `openFailed`.
+fn show_open_failure(id: u64, plan: &OpenPlan, v: &Value) {
+    pin_panel(true);
+    let visible = with_state(|st| st.panel.as_ref().is_some_and(|p| p.is_visible())).unwrap_or(false);
+    if !visible {
+        if id == 0 {
+            show_tab("accounts");
+        } else {
+            show_panel();
+        }
+    }
+    if id == 0 {
+        let payload = open_failed_payload(plan, v);
+        with_state(|st| emit(st, "openFailed", &payload));
+    }
+}
+
+/// The `openFailed` event: which account, and the reason and message a reply would have carried.
+fn open_failed_payload(plan: &OpenPlan, v: &Value) -> Value {
+    json!({
+        "id": plan.id,
+        "name": plan.name,
+        "reason": v.get("reason").cloned().unwrap_or(Value::Null),
+        "error": v.get("error").cloned().unwrap_or(Value::Null),
+    })
 }
 
 fn state_call_raw<T>(f: impl FnOnce(&mut AppState) -> UResult<T>) -> UResult<T> {
@@ -1007,16 +1128,29 @@ fn open_all(id: u64) -> UResult<()> {
     })?;
     spawn_then(
         move || {
-            for p in &plans {
-                let r = open_worker(p, located.clone(), false, &wake);
+            let mut failures = Vec::new();
+            for p in plans {
+                let mut note = String::new();
+                let r = open_worker(&p, located.clone(), false, &wake, &mut note);
                 if r.get("ok") == Some(&Value::Bool(false)) {
-                    log::warn(&format!("openAll: {} failed: {}", p.id, r["error"]));
+                    log::warn(&format!("openAll: {} failed: {} ({note})", p.id, r["error"]));
+                    failures.push((p, r));
+                } else {
+                    log::info(&format!("openAll: {}: {}", p.id, if note.is_empty() { "ok" } else { &note }));
                 }
                 std::thread::sleep(OPEN_ALL_STAGGER);
             }
-            ok()
+            failures
         },
-        move |v| resolve(id, v),
+        move |failures: Vec<(OpenPlan, Value)>| {
+            if SURFACE_OPEN_FAILURES {
+                // The reply carries no result per account, so each failure is its own event.
+                for (p, r) in &failures {
+                    show_open_failure(0, p, r);
+                }
+            }
+            resolve(id, ok());
+        },
     );
     Ok(())
 }
@@ -1068,7 +1202,7 @@ fn add_account(st: &mut AppState, opts: &Value) -> UResult<Value> {
     // Open it right away (the user signs in there); failures are only logged.
     let new_id = Value::String(rec.id.clone());
     post(move || {
-        if let Err(e) = open_account(0, &new_id, true) {
+        if let Err(e) = open_account(0, &new_id, true, OpenFrom::Added) {
             log::warn(&format!("open after add failed: {e}"));
         }
     });
@@ -2031,8 +2165,34 @@ fn on_poll(procs: Vec<Proc>, fg: Option<u32>, located: Option<Located>) {
         }
         expire_session_state(st, relay::now_secs());
         refresh(st);
+        log_procs_if_changed(st);
         start_index(st);
     });
+}
+
+/// Log the Claude processes and the account each one was matched to, when that changes.
+fn log_procs_if_changed(st: &mut AppState) {
+    let line = procs_summary(&st.procs, &st.last_accounts);
+    if line != st.last_procs_log {
+        log::info(&format!("claude processes: {line}"));
+        st.last_procs_log = line;
+    }
+}
+
+/// One entry per process: `pid=P acc=<id|none> dir=<data folder|default> window=<bool>`.
+fn procs_summary(procs: &[Proc], accounts: &[Account]) -> String {
+    if procs.is_empty() {
+        return "none".into();
+    }
+    procs
+        .iter()
+        .map(|p| {
+            let acc = accounts.iter().find(|a| a.pid == Some(p.pid)).map(|a| a.id.as_str()).unwrap_or("none");
+            let dir = p.data_dir.as_deref().unwrap_or("default");
+            format!("pid={} acc={acc} dir={dir} window={}", p.pid, p.hwnd != 0)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn start_poll_thread() -> Option<mpsc::Sender<()>> {
@@ -2225,7 +2385,7 @@ fn on_bubble_event(ev: BubbleEvent) {
     match ev {
         BubbleEvent::Click | BubbleEvent::RightClick | BubbleEvent::MoreClick => toggle_panel(),
         BubbleEvent::AvatarClick(id) => {
-            if let Err(e) = open_account(0, &Value::String(id.clone()), true) {
+            if let Err(e) = open_account(0, &Value::String(id.clone()), true, OpenFrom::Bubble) {
                 log::warn(&format!("bubble open {id}: {e}"));
             }
         }
@@ -2284,7 +2444,7 @@ fn on_tray_event(ev: TrayEvent) {
     match ev {
         TrayEvent::LeftClick => toggle_panel(),
         TrayEvent::OpenAccount(id) => {
-            if let Err(e) = open_account(0, &Value::String(id.clone()), true) {
+            if let Err(e) = open_account(0, &Value::String(id.clone()), true, OpenFrom::Tray) {
                 log::warn(&format!("tray open {id}: {e}"));
             }
         }
@@ -2314,6 +2474,8 @@ fn on_tray_event(ev: TrayEvent) {
 // ------------------------------------------------------------------ panel lifecycle
 
 fn emit(st: &AppState, event: &str, payload: &Value) {
+    #[cfg(target_os = "macos")]
+    crate::focuscheck::note_event(event, payload);
     if let Some(p) = st.panel.as_ref() {
         p.emit(event, payload);
     }
@@ -3354,7 +3516,7 @@ impl TargetWindow for DesktopWindow {
     }
 
     fn open(&self, focus: bool) -> Value {
-        open_worker(&self.plan, self.located.clone(), focus, &self.wake)
+        open_logged(&self.plan, self.located.clone(), focus, &self.wake)
     }
 
     fn restart(&self, pids: Vec<u32>) -> Value {
@@ -3443,7 +3605,15 @@ fn restart_and_open(
             std::thread::sleep(Duration::from_millis(250));
         }
     }
-    open_worker(plan, located, true, wake)
+    open_logged(plan, located, true, wake)
+}
+
+/// A hand-over's open of its target, logged like an open from the panel.
+fn open_logged(plan: &OpenPlan, located: Option<Located>, focus: bool, wake: &Option<mpsc::Sender<()>>) -> Value {
+    let mut note = String::new();
+    let v = open_worker(plan, located, focus, wake, &mut note);
+    log::info(&open_log_line(&plan.id, OpenFrom::Handover, &note));
+    v
 }
 
 /// Hook changes are allowed outside smoke mode, and in smoke mode only on the demo fixture
@@ -3658,6 +3828,7 @@ pub fn init(hidden: bool) -> Result<(), String> {
         last_discovered: Vec::new(),
         last_discovered_json: None,
         last_settings_json: String::new(),
+        last_procs_log: String::new(),
         last_active_json: String::new(),
         last_bubble_state: None,
         last_blur_hide: None,
@@ -3976,6 +4147,57 @@ pub fn smoke_approvals() -> usize {
 /// (id, name) of the first extra account, for the synthetic sign-in notice.
 pub fn smoke_extra_account() -> Option<(String, String)> {
     with_state(|st| st.last_accounts.iter().find(|a| !a.is_main).map(|a| (a.id.clone(), a.name.clone()))).flatten()
+}
+
+// ------------------------------------------------------------------ focus check helpers
+
+/// The focus check's view of account `id`: its name, the data folder its Claude runs with and
+/// its slot in the floating button's mini tray (with the number of slots shown).
+#[cfg(target_os = "macos")]
+pub fn check_account(id: &str) -> Option<(String, Option<String>, Option<usize>, usize)> {
+    with_state(|st| {
+        let acc = st.last_accounts.iter().find(|a| a.id == id)?;
+        let shown = st.last_accounts.len().clamp(1, TRAY_MAX_ACCOUNTS);
+        let slot = st.last_accounts.iter().take(TRAY_MAX_ACCOUNTS).position(|a| a.id == id);
+        Some((acc.name.clone(), proc_dir(acc), slot, shown))
+    })
+    .flatten()
+}
+
+/// Whether account `id` is listed as running.
+#[cfg(target_os = "macos")]
+pub fn check_running(id: &str) -> bool {
+    with_state(|st| st.last_accounts.iter().any(|a| a.id == id && a.running)).unwrap_or(false)
+}
+
+/// Show the panel on its Accounts tab, as the floating button does.
+#[cfg(target_os = "macos")]
+pub fn check_show_accounts() {
+    show_tab("accounts");
+}
+
+/// Hide the panel, if shown.
+#[cfg(target_os = "macos")]
+pub fn check_hide_panel() {
+    hide_panel(false);
+}
+
+/// The panel's window, whether it is visible and whether its page is ready.
+#[cfg(target_os = "macos")]
+pub fn check_panel() -> Option<(WindowId, bool, bool)> {
+    with_state(|st| st.panel.as_ref().map(|p| (p.window(), p.is_visible(), p.is_ready()))).flatten()
+}
+
+/// Run `js` in the panel's page; `done` receives the result as JSON text. False without a panel.
+#[cfg(target_os = "macos")]
+pub fn check_panel_eval(js: &str, done: impl Fn(String) + Send + 'static) -> bool {
+    with_state(|st| st.panel.as_ref().map(|p| p.eval_with_result(js, done)).unwrap_or(false)).unwrap_or(false)
+}
+
+/// Open account `id` from posted work, with no input event behind it.
+#[cfg(target_os = "macos")]
+pub fn check_open(id: &str) -> Result<(), String> {
+    open_account(0, &Value::String(id.to_string()), true, OpenFrom::Check)
 }
 
 #[cfg(test)]
@@ -4553,5 +4775,83 @@ mod tests {
         let out = run_handover(&f.sessions, &f.from, f.to.clone(), "local_missing", HandoverMode::Auto, &w);
         assert!(!out.result.ok);
         assert_eq!((w.opened.get(), w.restarted.get()), (0, 0));
+    }
+
+    #[test]
+    fn focus_failure_reasons() {
+        use crate::platform::FocusFailure as F;
+        let all = [
+            (F::Refused, "focus-refused"),
+            (F::NoWindow, "focus-no-window"),
+            (F::AutomationDenied, "focus-automation-denied"),
+            (F::AccessibilityOff, "focus-accessibility-off"),
+            (F::AccessibilityUntrusted, "focus-accessibility-untrusted"),
+            (F::Gone, "focus-gone"),
+            (F::Other, "focus-failed"),
+        ];
+        for (f, r) in all {
+            assert_eq!(f.reason(), r);
+        }
+    }
+
+    fn plan(id: &str, name: &str) -> OpenPlan {
+        OpenPlan { id: id.into(), name: name.into(), is_main: false, dir: None, route: false }
+    }
+
+    #[test]
+    fn open_log_lines() {
+        assert_eq!(open_log_line("a1", OpenFrom::Panel, ""), "open a1 via panel: ok");
+        assert_eq!(
+            open_log_line("a1", OpenFrom::Bubble, "failed: focus-no-window pid=7 window=false"),
+            "open a1 via bubble: failed: focus-no-window pid=7 window=false"
+        );
+        assert_eq!(open_log_line("a1", OpenFrom::Tray, "launched"), "open a1 via tray: launched");
+        assert_eq!(OpenFrom::Added.as_str(), "add");
+        assert_eq!(OpenFrom::Handover.as_str(), "handover");
+    }
+
+    #[test]
+    fn open_failed_event_payload() {
+        let v = json!({ "ok": false, "error": "Could not bring Work's Claude window to the front.", "reason": "focus-refused" });
+        assert_eq!(
+            open_failed_payload(&plan("a1", "Work"), &v),
+            json!({ "id": "a1", "name": "Work", "reason": "focus-refused", "error": "Could not bring Work's Claude window to the front." })
+        );
+        let v = fail("Claude Desktop was not found on this PC.");
+        assert_eq!(open_failed_payload(&plan("a2", "Home"), &v)["reason"], Value::Null);
+    }
+
+    #[test]
+    fn process_summary() {
+        assert_eq!(procs_summary(&[], &[]), "none");
+        let p = |pid: u32, dir: Option<&str>, hwnd: isize| Proc {
+            pid,
+            exe: String::new(),
+            cmdline: String::new(),
+            data_dir: dir.map(String::from),
+            hwnd,
+        };
+        let procs = [p(10, None, 5), p(11, Some("/d/acc2"), 0)];
+        let acc = |id: &str, pid: Option<u32>| Account {
+            id: id.into(),
+            name: id.into(),
+            data_dir: None,
+            color: String::new(),
+            initials: String::new(),
+            label: None,
+            is_main: false,
+            signed_in: false,
+            account_uuid: None,
+            running: pid.is_some(),
+            pid,
+            session_count: 0,
+            code_ready: false,
+            same_sign_in_as: None,
+            limited: None,
+        };
+        assert_eq!(
+            procs_summary(&procs, &[acc("main", Some(10)), acc("other", None)]),
+            "pid=10 acc=main dir=default window=true; pid=11 acc=none dir=/d/acc2 window=false"
+        );
     }
 }

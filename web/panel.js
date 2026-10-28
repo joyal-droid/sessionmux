@@ -1293,10 +1293,33 @@ function initPanel() {
     state.busyAccounts.delete(id);
     state.accountsDirty = true;
     renderAccounts();
-    if (res && res.ok === false && res.reason === 'focus-failed') {
-      toast('warn', "Couldn't switch to " + a.name, onMac() ? FOCUS_FAILED_MAC : (res.error || ''), 12000,
-        { label: 'Settings', onClick: () => showTab('settings') });
-    } else if (res && res.ok === false) toast('error', "Couldn't open " + a.name, res.error || 'Claude did not start.');
+    if (res && res.ok === false) openFailedToast(a.name, res);
+  }
+
+  /** The toast for a failed open; `res` is the reply ({error, reason}) or an openFailed event. */
+  function openFailedToast(name, res) {
+    const reason = res && res.reason;
+    const title = "Couldn't switch to " + name;
+    const settings = { label: 'Settings', onClick: () => showTab('settings') };
+    if (reason === 'focus-failed') {
+      toast('warn', title, onMac() ? FOCUS_FAILED_MAC : (res.error || ''), 12000, settings);
+    } else if (reason === 'focus-no-window') {
+      toast('warn', title, name + "'s Claude is open but its window is closed and could not be reopened. Click its Claude icon in the Dock.", 12000);
+    } else if (reason === 'focus-automation-denied') {
+      toast('warn', title, name + "'s Claude window is closed, and Sessionmux is not allowed to ask Claude to reopen it. Allow Sessionmux to control Claude in Privacy & Security > Automation, or click its Claude icon in the Dock.", 15000,
+        { label: 'Open Automation settings', onClick: () => call('openSystemSettings', 'automation') });
+    } else if (reason === 'focus-accessibility-untrusted') {
+      toast('warn', title, "macOS does not let Sessionmux raise Claude's windows. Turn Sessionmux on in Privacy & Security > Accessibility; after moving or updating Sessionmux, remove it there and add it again.", 15000,
+        { label: 'Open Accessibility settings', onClick: () => call('openSystemSettings', 'accessibility') });
+    } else if (reason === 'focus-accessibility-off') {
+      toast('warn', title, name + "'s Claude window is minimised or hidden. Turn on 'Bring minimised Claude windows to the front' in Settings, or click its Claude icon in the Dock.", 12000, settings);
+    } else if (reason === 'focus-refused') {
+      toast('warn', title, 'macOS did not let Sessionmux bring ' + name + "'s Claude forward. Click its Claude icon in the Dock.", 12000);
+    } else if (reason === 'focus-gone') {
+      toast('warn', title, name + "'s Claude quit before its window came forward. Click the account again to start it.", 12000);
+    } else {
+      toast('error', "Couldn't open " + name, (res && res.error) || 'Claude did not start.');
+    }
   }
 
   async function closeAccount(a) {
@@ -3055,6 +3078,11 @@ function initPanel() {
   subscribe('onSettings', (s) => setSettings(s));
   subscribe('onSignInChanged', (si) => setSignIn(si));
   subscribe('onHandover', (res) => handoverDone(res));
+  subscribe('onOpenFailed', (ev) => {
+    if (!ev) return;
+    const a = ev.id ? accountById(ev.id) : null;
+    openFailedToast((a && a.name) || ev.name || 'this account', ev);
+  });
   subscribe('onActiveAccount', (info) => {
     if (!info || !info.id || info.id === state.activeId) return;
     state.activeId = info.id;

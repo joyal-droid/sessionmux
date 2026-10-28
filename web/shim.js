@@ -39,13 +39,15 @@
  *     onSettings, onShowTab, onDiscoveredChanged, onSignInChanged ('signin-changed': {active, accountId, accountName, since} or
  *     {active:false, ended?, accountName?}), onHandover ('handover-done': an automatic hand-over
  *     finished; the transfer result plus toName, fromName, opened, restarted, restartNeeded,
- *     windowLeftOpen).
+ *     windowLeftOpen), onOpenFailed ('openFailed': an open from the bubble or the menu bar menu
+ *     failed; {id, name, reason, error}).
  *
  * Transport
  *   page → host : chrome.webview.postMessage(JSON.stringify({id, name, args}))
  *   host → page : window.__sessionmuxResolve(id, ok, payload)   (reply to request `id`)
  *                 window.__sessionmuxEmit(event, payload)       (event = 'accounts-changed' | …
- *                                                              | 'signin-changed' | 'handover-done')
+ *                                                              | 'signin-changed' | 'handover-done'
+ *                                                              | 'openFailed')
  *   Internal messages (id 0): {name:'__ready'} once the DOM is ready,
  *                             {name:'__error', args:[message, source, line, col, stack]}.
  *
@@ -198,6 +200,8 @@
     onDiscoveredChanged: function (cb) { return subscribe('discovered-changed', cb); },
     onSignInChanged: function (cb) { return subscribe('signin-changed', cb); },
     onHandover: function (cb) { return subscribe('handover-done', cb); },
+    // an open from the bubble or the menu bar menu failed: { id, name, reason, error }
+    onOpenFailed: function (cb) { return subscribe('openFailed', cb); },
   };
   lock(window, 'sessionmux', Object.freeze(api));
 
