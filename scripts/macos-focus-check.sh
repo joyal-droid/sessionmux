@@ -176,18 +176,24 @@ textedit_front() {
     sleep 2
 }
 
-# Close the front window of a process with Cmd-W (with its close button when Cmd-W left it open).
+# Close the front window of a process with Cmd-W (with its close button when Cmd-W left a window
+# listed). A process already in front is not activated again, which can put another instance of
+# the same app in front instead.
 close_window() {
     local out
-    out="$(sysevents -e "set frontmost of (first process whose unix id is $1) to true" -e 'delay 1' \
-        -e 'keystroke "w" using command down')"
+    if [ "$(front_pid)" = "$1" ]; then
+        out="$(sysevents -e 'keystroke "w" using command down')"
+    else
+        out="$(sysevents -e "set frontmost of (first process whose unix id is $1) to true" -e 'delay 1' \
+            -e 'keystroke "w" using command down')"
+    fi
     sleep 2
-    if has_open_window "$1"; then
+    if any_window "$1"; then
         out="$out; $(sysevents -e "set p to first process whose unix id is $1" \
             -e 'click (first button of window 1 of p whose subrole is "AXCloseButton")')"
         sleep 2
     fi
-    if has_open_window "$1"; then
+    if any_window "$1"; then
         echo "error: the window is still open ($out)"
     else
         echo "closed (windows left: $(window_count "$1"))"
