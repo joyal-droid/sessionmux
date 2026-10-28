@@ -223,11 +223,6 @@ jobs:
           cargo clippy --all-targets --locked -- -D warnings 2>&1 | tee ci-logs/clippy.log \
             || { echo 'Clippy' > ci-logs/clippy.failed; exit 1; }
 
-      - name: Test
-        run: |
-          mkdir -p ci-logs
-          cargo test --locked 2>&1 | tee ci-logs/test.log || { echo 'Test' > ci-logs/test.failed; exit 1; }
-
       - name: Build (release)
         run: |
           mkdir -p ci-logs
@@ -240,6 +235,11 @@ jobs:
           mkdir -p ci-logs
           cargo build --release --locked --target x86_64-apple-darwin 2>&1 | tee ci-logs/build-intel.log \
             || { echo 'Build Intel (release)' > ci-logs/build-intel.failed; exit 1; }
+
+      - name: Test
+        run: |
+          mkdir -p ci-logs
+          cargo test --locked 2>&1 | tee ci-logs/test.log || { echo 'Test' > ci-logs/test.failed; exit 1; }
 
       - name: Report failed steps
         if: failure()
