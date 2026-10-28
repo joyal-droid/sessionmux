@@ -258,6 +258,9 @@ pub struct AppState {
     settings: Settings,
     procs: Vec<Proc>,
     fg_pid: Option<u32>,
+    /// The last process other than Sessionmux that had the window the user worked in: the app
+    /// in front just before the user turned to the panel, the floating button or the tray.
+    last_front: Option<u32>,
     last_opened: Option<String>,
     last_accounts_json: String,
     last_discovered: Vec<Discovered>,
@@ -853,6 +856,9 @@ struct OpenPlan {
     dir: Option<String>,
     /// Begin a sign-in relay once the window is up.
     route: bool,
+    /// The process that was in front when the user clicked the account; when it is this
+    /// account's and its window still shows, the click minimises it instead.
+    toggle_front: Option<u32>,
 }
 
 /// UI-side preparation for opening `acc` (validation; mkdir + MCP sync when it will launch).
@@ -873,7 +879,7 @@ fn prepare_open(st: &AppState, acc: &Account) -> UResult<OpenPlan> {
         }
     }
     let route = wants_sign_in_route(st, acc, dir.as_deref());
-    Ok(OpenPlan { id: acc.id.clone(), name: acc.name.clone(), is_main: acc.is_main, dir, route })
+    Ok(OpenPlan { id: acc.id.clone(), name: acc.name.clone(), is_main: acc.is_main, dir, route, toggle_front: None })
 }
 
 /// Worker: focus the running window, or launch the account. `note` receives what happened, for
@@ -884,6 +890,25 @@ fn open_worker(
     focus: bool,
     wake: &Option<mpsc::Sender<()>>,
     note: &mut String,
+) -> Value {
+    open_worker_at(plan, located, focus, wake, note, &mut None)
+}
+
+/// The account's Claude process to minimise instead of bringing forward: the one that was in
+/// front when the user clicked, while its window still shows.
+fn toggle_target(front: Option<u32>, running: &[u32], showing: impl Fn(u32) -> bool) -> Option<u32> {
+    front.filter(|f| running.contains(f) && showing(*f))
+}
+
+/// [`open_worker`]; `front` receives the process now in front (`Some(None)`: none of this
+/// account's) when the open changed that.
+fn open_worker_at(
+    plan: &OpenPlan,
+    located: Option<Located>,
+    focus: bool,
+    wake: &Option<mpsc::Sender<()>>,
+    note: &mut String,
+    front: &mut Option<Option<u32>>,
 ) -> Value {
     let running: Vec<Proc> = claude_app::list_processes()
         .into_iter()
@@ -902,20 +927,32 @@ fn open_worker(
             if is_smoke() {
                 log::info("smoke: blocked claude_app::focus");
             } else {
+                let pids: Vec<u32> = running.iter().map(|p| p.pid).collect();
+                if let Some(pid) = toggle_target(plan.toggle_front, &pids, <Os as Focus>::showing) {
+                    match <Os as Focus>::minimise(pid) {
+                        FocusResult::Minimised => {
+                            *note = format!("minimised pid={pid} (its window was in front)");
+                            *front = Some(None);
+                            return json!({ "ok": true, "minimised": true });
+                        }
+                        r => *note = format!("minimise pid={pid} failed ({r:?}), "),
+                    }
+                }
                 match <Os as Focus>::focus(w.pid) {
-                    FocusResult::Focused => {
-                        *note = format!("focused pid={} window={}", w.pid, w.hwnd != 0);
+                    FocusResult::Focused | FocusResult::Minimised => {
+                        *note = format!("{note}focused pid={} window={}", w.pid, w.hwnd != 0);
+                        *front = Some(Some(w.pid));
                         if plan.route {
                             schedule_sign_in(plan, None);
                         }
                         return ok();
                     }
                     FocusResult::NeedsHandOff => {
-                        *note = format!("hand-off pid={} window={}", w.pid, w.hwnd != 0);
+                        *note = format!("{note}hand-off pid={} window={}", w.pid, w.hwnd != 0);
                     }
                     // No hand-off can show it either: the page explains what the user can do.
                     FocusResult::Failed(why) => {
-                        *note = format!("failed: {} pid={} window={}", why.reason(), w.pid, w.hwnd != 0);
+                        *note = format!("{note}failed: {} pid={} window={}", why.reason(), w.pid, w.hwnd != 0);
                         let mut v = fail(&format!("Could not bring {}'s Claude window to the front.", plan.name));
                         v["reason"] = json!(why.reason());
                         return v;
@@ -1011,6 +1048,12 @@ enum OpenFrom {
 }
 
 impl OpenFrom {
+    /// A click on an account here works like a taskbar button: when that account's window is
+    /// the one in front, the click minimises it.
+    fn toggles(self) -> bool {
+        matches!(self, OpenFrom::Panel | OpenFrom::Bubble | OpenFrom::Tray)
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             OpenFrom::Panel => "panel",
@@ -1029,7 +1072,11 @@ fn open_account(id: u64, acc_id: &Value, focus: bool, from: OpenFrom) -> UResult
         let acc = find_account(st, acc_id)?;
         st.last_opened = Some(acc.id.clone());
         set_active(st, Some(&acc.id));
-        let plan = prepare_open(st, &acc)?;
+        let mut plan = prepare_open(st, &acc)?;
+        if focus && from.toggles() && !is_smoke() {
+            note_front(&mut st.last_front, <Os as Windows>::user_front_pid());
+            plan.toggle_front = st.last_front;
+        }
         let running = st.procs.iter().find(|p| claude_app::matches_data_dir(p, plan.dir.as_deref())).map(|p| p.pid);
         Ok((plan, st.located.clone(), st.poll_wake.clone(), running))
     })?;
@@ -1048,10 +1095,14 @@ fn open_account(id: u64, acc_id: &Value, focus: bool, from: OpenFrom) -> UResult
     spawn_then(
         move || {
             let mut note = String::new();
-            let v = open_worker(&plan, located, focus, &wake, &mut note);
-            (plan, v, note)
+            let mut front = None;
+            let v = open_worker_at(&plan, located, focus, &wake, &mut note, &mut front);
+            (plan, v, note, front)
         },
-        move |(plan, v, note): (OpenPlan, Value, String)| {
+        move |(plan, v, note, front): (OpenPlan, Value, String, Option<Option<u32>>)| {
+            if let Some(f) = front {
+                with_state(|st| st.last_front = f);
+            }
             let failed = v.get("ok") == Some(&Value::Bool(false));
             let line = open_log_line(&plan.id, from, &note);
             if failed {
@@ -2170,10 +2221,11 @@ fn refresh(st: &mut AppState) {
     push_settings_if_changed(st);
 }
 
-fn on_poll(procs: Vec<Proc>, fg: Option<u32>, located: Option<Located>) {
+fn on_poll(procs: Vec<Proc>, fg: Option<u32>, front: Option<u32>, located: Option<Located>) {
     with_state(|st| {
         st.procs = procs;
         st.fg_pid = fg;
+        note_front(&mut st.last_front, front);
         if located.is_some() && located != st.located {
             st.located = located;
         }
@@ -2220,8 +2272,9 @@ fn start_poll_thread() -> Option<mpsc::Sender<()>> {
             }
             let procs = claude_app::list_processes();
             let fg = <Os as Windows>::foreground_pid();
+            let front = if cfg!(windows) { <Os as Windows>::user_front_pid() } else { fg };
             let loc = claude_app::locate().ok();
-            post(move || on_poll(procs, fg, loc));
+            post(move || on_poll(procs, fg, front, loc));
             let next_poll = Instant::now() + Duration::from_millis(POLL_MS);
             // Wait for the next poll (or a wake-up), running the debugger check on its own clock.
             loop {
@@ -2573,8 +2626,19 @@ fn reposition_panel(st: &AppState) {
     }
 }
 
+/// Remember `pid` as the app in front, unless it is Sessionmux itself (its panel, floating
+/// button or menu) or unknown.
+fn note_front(slot: &mut Option<u32>, pid: Option<u32>) {
+    if let Some(p) = pid.filter(|&p| p != 0 && p != std::process::id()) {
+        *slot = Some(p);
+    }
+}
+
 /// Show the panel (creating it on demand) next to the bubble.
 pub fn show_panel() {
+    // Read before the panel takes the focus, so a click on an account knows what was in front.
+    let front = if is_smoke() { None } else { <Os as Windows>::user_front_pid() };
+    with_state(|st| note_front(&mut st.last_front, front));
     if !ensure_panel(true) {
         return;
     }
@@ -3837,6 +3901,7 @@ pub fn init(hidden: bool) -> Result<(), String> {
         settings: settings.clone(),
         procs,
         fg_pid,
+        last_front: None,
         last_opened: None,
         last_accounts_json: String::new(),
         last_discovered: Vec::new(),
@@ -4815,7 +4880,7 @@ mod tests {
     }
 
     fn plan(id: &str, name: &str) -> OpenPlan {
-        OpenPlan { id: id.into(), name: name.into(), is_main: false, dir: None, route: false }
+        OpenPlan { id: id.into(), name: name.into(), is_main: false, dir: None, route: false, toggle_front: None }
     }
 
     #[test]
@@ -4828,6 +4893,42 @@ mod tests {
         assert_eq!(open_log_line("a1", OpenFrom::Tray, "launched"), "open a1 via tray: launched");
         assert_eq!(OpenFrom::Added.as_str(), "add");
         assert_eq!(OpenFrom::Handover.as_str(), "handover");
+    }
+
+    #[test]
+    fn a_click_minimises_only_the_window_that_was_in_front() {
+        let showing = |p: u32| p != 9;
+        // This account's window was in front and still shows: the click minimises it.
+        assert_eq!(toggle_target(Some(7), &[7, 8], showing), Some(7));
+        assert_eq!(toggle_target(Some(8), &[7, 8], showing), Some(8));
+        // Another app was in front, or nothing is known: the click brings the window forward.
+        assert_eq!(toggle_target(Some(5), &[7, 8], showing), None);
+        assert_eq!(toggle_target(None, &[7, 8], showing), None);
+        assert_eq!(toggle_target(Some(7), &[], showing), None);
+        // Already minimised or hidden: the click brings it back.
+        assert_eq!(toggle_target(Some(9), &[9], showing), None);
+    }
+
+    #[test]
+    fn only_clicks_on_an_account_toggle() {
+        assert!(OpenFrom::Panel.toggles());
+        assert!(OpenFrom::Bubble.toggles());
+        assert!(OpenFrom::Tray.toggles());
+        assert!(!OpenFrom::Added.toggles());
+        assert!(!OpenFrom::Handover.toggles());
+    }
+
+    #[test]
+    fn sessionmux_itself_is_never_the_app_in_front() {
+        let mut front = None;
+        note_front(&mut front, Some(42));
+        assert_eq!(front, Some(42));
+        note_front(&mut front, Some(std::process::id()));
+        note_front(&mut front, None);
+        note_front(&mut front, Some(0));
+        assert_eq!(front, Some(42));
+        note_front(&mut front, Some(43));
+        assert_eq!(front, Some(43));
     }
 
     #[test]

@@ -51,6 +51,9 @@ pub enum FocusResult {
     NeedsHandOff,
     /// The window did not come forward, for the given reason.
     Failed(FocusFailure),
+    /// The window was in front, and a click on its account put it away (minimised, or the app
+    /// hidden), as a click on a taskbar button does.
+    Minimised,
 }
 
 /// Why a Claude window could not be brought to the front.
@@ -214,6 +217,12 @@ pub trait Windows {
     fn main_window(pid: Pid) -> Option<WindowId>;
     /// The process owning the window the user works in.
     fn foreground_pid() -> Option<Pid>;
+    /// The process owning the window the user works in, for telling which app was in front
+    /// before a click on Sessionmux: None while the system's own taskbar or tray has the focus,
+    /// which a click on the tray icon gives it.
+    fn user_front_pid() -> Option<Pid> {
+        Self::foreground_pid()
+    }
 }
 
 /// Starting Claude Desktop.
@@ -234,6 +243,11 @@ pub trait Focus {
     /// activation on only from within such an event. Does nothing where that is not needed.
     fn prepare_focus(_pid: Pid) {}
     fn focus(pid: Pid) -> FocusResult;
+    /// Whether `pid` shows a window on screen now: not minimised, its app not hidden.
+    fn showing(pid: Pid) -> bool;
+    /// Put away `pid`'s window that is in front: [`FocusResult::Minimised`] when it is off
+    /// screen now. [`Focus::focus`] brings it back.
+    fn minimise(pid: Pid) -> FocusResult;
     /// Whether Sessionmux may raise other apps' windows; with `prompt`, the system is asked to
     /// show its grant prompt when it may not yet. None where no such permission exists.
     fn accessibility_trusted(prompt: bool) -> Option<bool>;

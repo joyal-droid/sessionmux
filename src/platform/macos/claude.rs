@@ -66,7 +66,7 @@ use super::process::{self, any_claude_mains, claude_mains, is_helper, pid_path, 
 use super::url_handler::{
     send_event_to_pid, AeSendError, AE_REOPEN_APPLICATION, CORE_EVENT_CLASS, ERR_NEEDS_CONSENT, ERR_NOT_PERMITTED,
 };
-use super::window::{front_window_owner, has_off_screen_window, on_main_wait};
+use super::window::{app_hidden, front_window_owner, has_off_screen_window, on_main_wait};
 use crate::core::claude_app::{self, Located};
 use crate::platform::{
     ClaudeInstall, Closer, Focus, FocusFailure, FocusResult, Launcher, Os, Paths, Pid, Processes, Windows,
@@ -98,6 +98,8 @@ const ACTIVE_WAIT: Duration = Duration::from_millis(500);
 /// How often that is checked, and how long one check may wait for the main thread.
 const ACTIVE_POLL: Duration = Duration::from_millis(25);
 const ACTIVE_ASK_WAIT: Duration = Duration::from_millis(250);
+/// How long a minimised or hidden window may take to leave the screen.
+const MINIMISE_WAIT: Duration = Duration::from_millis(1000);
 /// How long an instance asked to show itself may take to put a window on screen.
 const REOPEN_WAIT: Duration = Duration::from_millis(1500);
 /// How long Launch Services may take to reach a running instance.
@@ -347,6 +349,9 @@ pub(crate) trait FocusSteps {
     /// Activate Sessionmux on the main thread, so it holds activation it may pass on. Nothing on
     /// other threads: the click, menu choice or shortcut took the activation already.
     fn activate_self(&mut self);
+    /// Show `pid` again when it is hidden (as a click on Sessionmux may have left it). True when
+    /// it was hidden.
+    fn unhide(&mut self, pid: Pid) -> bool;
     /// Pass activation to `pid` and ask it to come forward with all its windows.
     fn pass_activation(&mut self, pid: Pid);
     /// Give the system time to act.
@@ -372,6 +377,7 @@ pub(crate) trait FocusSteps {
 /// else, when no window of it is on screen, a request to the instance to show itself.
 pub(crate) fn focus_with(s: &mut impl FocusSteps, pid: Pid, handoff: bool) -> FocusResult {
     s.activate_self();
+    s.unhide(pid);
     s.pass_activation(pid);
     s.settle();
     if s.in_front(pid) {
@@ -407,6 +413,33 @@ pub(crate) fn focus_with(s: &mut impl FocusSteps, pid: Pid, handoff: bool) -> Fo
         }
     }
     FocusResult::Failed(failure(ax, reopen, s.window_state(pid)))
+}
+
+/// The steps of putting away the window in front, so their order can be checked without a screen.
+pub(crate) trait MinimiseSteps {
+    /// Whether minimising windows through Accessibility is turned on and allowed.
+    fn accessibility(&mut self) -> AxState;
+    /// Minimise `pid`'s window in front through Accessibility. True when that was accepted.
+    fn minimise_with_accessibility(&mut self, pid: Pid) -> bool;
+    /// Hide the app `pid` with all its windows, as Hide in its menu does. True when the request
+    /// was accepted.
+    fn hide(&mut self, pid: Pid) -> bool;
+    /// Wait a little for `pid` to have no window on screen. True when it has none.
+    fn wait_until_gone(&mut self, pid: Pid) -> bool;
+}
+
+/// Put away `pid`'s window that is in front: minimised to the Dock through Accessibility when
+/// raising through it is allowed (so the next click can un-minimise it), else the app hidden,
+/// which needs no permission (each account is its own app instance). Activation shows a hidden
+/// app again.
+pub(crate) fn minimise_with(s: &mut impl MinimiseSteps, pid: Pid) -> FocusResult {
+    if s.accessibility() == AxState::Allowed && s.minimise_with_accessibility(pid) && s.wait_until_gone(pid) {
+        return FocusResult::Minimised;
+    }
+    if s.hide(pid) && s.wait_until_gone(pid) {
+        return FocusResult::Minimised;
+    }
+    FocusResult::Failed(FocusFailure::Refused)
 }
 
 /// Why a window did not come forward, from what was tried and where its windows are now.
@@ -489,6 +522,15 @@ impl FocusSteps for SystemFocus {
         if let Some(mtm) = MainThreadMarker::new() {
             take_activation(mtm);
         }
+    }
+
+    fn unhide(&mut self, pid: Pid) -> bool {
+        let shown = set_hidden(pid, false);
+        if let Some(sent) = shown {
+            log::debug(&format!("claude_app: pid {pid} was hidden; shown again: {sent}"));
+            self.report.activation.push(format!("unhide={sent}"));
+        }
+        shown.is_some()
     }
 
     /// macOS 14 and later: only the active app can pass activation on, so this waits briefly for
@@ -575,6 +617,71 @@ impl FocusSteps for SystemFocus {
             std::thread::sleep(POLL);
         }
     }
+}
+
+/// Hide or show the app `pid`, on the main thread, when it is not already so. None when nothing
+/// had to change (or the app is unknown); else whether the request was accepted.
+fn set_hidden(pid: Pid, hide: bool) -> Option<bool> {
+    let p = ns_pid(pid)?;
+    on_main_wait(MAIN_WAIT, move |_| {
+        let app = NSRunningApplication::runningApplicationWithProcessIdentifier(p)?;
+        if app.isHidden() == hide {
+            return None;
+        }
+        Some(if hide { app.hide() } else { app.unhide() })
+    })
+    .flatten()
+}
+
+/// The real minimise steps.
+#[derive(Default)]
+struct SystemMinimise {
+    notes: Vec<String>,
+}
+
+impl MinimiseSteps for SystemMinimise {
+    fn accessibility(&mut self) -> AxState {
+        let state = if !raise_setting_on() {
+            AxState::Off
+        } else if <Os as Focus>::accessibility_trusted(false) == Some(true) {
+            AxState::Allowed
+        } else {
+            AxState::Untrusted
+        };
+        self.notes.push(format!("ax={}", state.name()));
+        state
+    }
+
+    fn minimise_with_accessibility(&mut self, pid: Pid) -> bool {
+        let (ok, note) = ax_minimise(pid);
+        self.notes.push(format!("ax-minimise [{note}]"));
+        ok
+    }
+
+    fn hide(&mut self, pid: Pid) -> bool {
+        let sent = set_hidden(pid, true);
+        self.notes.push(format!("hide={}", sent.map_or_else(|| "not needed".to_string(), |b| b.to_string())));
+        sent.unwrap_or(true)
+    }
+
+    fn wait_until_gone(&mut self, pid: Pid) -> bool {
+        let deadline = Instant::now() + MINIMISE_WAIT;
+        loop {
+            if !showing(pid) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                self.notes.push("still on screen".into());
+                return false;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+/// True when `pid` has a window on screen and its app is not hidden.
+fn showing(pid: Pid) -> bool {
+    !app_hidden(pid) && <Os as Windows>::main_window(pid).is_some()
 }
 
 /// Where `pid`'s windows are, read from the window server's list.
@@ -749,6 +856,40 @@ fn ax_raise(pid: Pid) -> (bool, String) {
     let frontmost = ax_set_bool(&app, "AXFrontmost", true);
     let note = format!("windows {count}, unminimise {unminimised}, raise {raised}, main {main}, frontmost {frontmost}");
     (raised == AX_SUCCESS || frontmost == AX_SUCCESS, note)
+}
+
+/// Minimise `pid`'s focused window (else its main one, else its largest) through Accessibility.
+/// True when the request was accepted; with the result codes, for the log.
+fn ax_minimise(pid: Pid) -> (bool, String) {
+    let Some(p) = ns_pid(pid) else { return (false, "bad pid".into()) };
+    // SAFETY: creating an accessibility object for a pid has no preconditions; it returns a new
+    // reference, owned below.
+    let Some(app) = owned(unsafe { AXUIElementCreateApplication(p) }) else {
+        return (false, "no application element".into());
+    };
+    // SAFETY: `app` is a live accessibility object; a failure only keeps the default timeout.
+    unsafe { AXUIElementSetMessagingTimeout(&app, AX_TIMEOUT_SECS) };
+    let (win, which) = match ax_attr(&app, "AXFocusedWindow") {
+        Some(w) => (w, "focused"),
+        None => match ax_attr(&app, "AXMainWindow") {
+            Some(w) => (w, "main"),
+            None => {
+                let list = match ax_attr_or_code(&app, "AXWindows") {
+                    Ok(v) => v,
+                    Err(code) => return (false, format!("windows error {code}")),
+                };
+                let Ok(list) = list.downcast::<CFArray>() else { return (false, "windows is not a list".into()) };
+                // SAFETY: the windows attribute is documented as an array of accessibility
+                // objects; they are only passed back to Accessibility calls.
+                let list: CFRetained<CFArray<CFType>> = unsafe { CFRetained::cast_unchecked(list) };
+                let largest = list.iter().map(|w| (ax_area(&w), w)).max_by(|a, b| a.0.total_cmp(&b.0));
+                let Some((_, w)) = largest else { return (false, "windows 0".into()) };
+                (w, "largest")
+            }
+        },
+    };
+    let code = ax_set_bool(&win, "AXMinimized", true);
+    (code == AX_SUCCESS, format!("{which} window, minimise {code}"))
 }
 
 // ───────────────────────────────────────────────────────────── close ──
@@ -988,6 +1129,21 @@ impl Focus for Os {
         r
     }
 
+    fn showing(pid: Pid) -> bool {
+        showing(pid)
+    }
+
+    /// Put away `pid`'s window in front and log one line with what was tried.
+    fn minimise(pid: Pid) -> FocusResult {
+        if !<Os as Processes>::alive(pid) {
+            return FocusResult::Failed(FocusFailure::Gone);
+        }
+        let mut s = SystemMinimise::default();
+        let r = minimise_with(&mut s, pid);
+        log::info(&format!("claude_app: minimise pid {pid}: {r:?} [{}]", s.notes.join(", ")));
+        r
+    }
+
     /// Whether Accessibility is allowed for Sessionmux; with `prompt`, the system shows its grant
     /// prompt when it is not.
     fn accessibility_trusted(prompt: bool) -> Option<bool> {
@@ -1193,6 +1349,8 @@ mod tests {
 
     struct Script {
         steps: Vec<String>,
+        /// Whether the app is hidden when the focus starts.
+        hidden: bool,
         /// `in_front` answers, in order; false once used up.
         front: VecDeque<bool>,
         ax: AxState,
@@ -1207,6 +1365,7 @@ mod tests {
         fn default() -> Script {
             Script {
                 steps: Vec::new(),
+                hidden: false,
                 front: VecDeque::new(),
                 ax: AxState::Off,
                 ax_raised: false,
@@ -1220,6 +1379,14 @@ mod tests {
     impl FocusSteps for Script {
         fn activate_self(&mut self) {
             self.steps.push("activate-self".into());
+        }
+        fn unhide(&mut self, pid: Pid) -> bool {
+            // Only a hidden app has anything to do here, so the other scripts stay as they are.
+            let was = std::mem::take(&mut self.hidden);
+            if was {
+                self.steps.push(format!("unhide-{pid}"));
+            }
+            was
         }
         fn pass_activation(&mut self, pid: Pid) {
             self.steps.push(format!("pass-{pid}"));
@@ -1270,6 +1437,85 @@ mod tests {
         let mut s = script(&[true], AxState::Allowed, true);
         assert_eq!(focus_with(&mut s, 7, false), FocusResult::Focused);
         assert_eq!(s.steps, ["activate-self", "pass-7", "settle", "front?-7"]);
+    }
+
+    #[test]
+    fn a_hidden_instance_is_shown_again_before_activation() {
+        let mut s = Script { hidden: true, front: VecDeque::from([true]), ..Script::default() };
+        assert_eq!(focus_with(&mut s, 7, false), FocusResult::Focused);
+        assert_eq!(s.steps, ["activate-self", "unhide-7", "pass-7", "settle", "front?-7"]);
+    }
+
+    // ── minimise order ──
+
+    struct Put {
+        steps: Vec<String>,
+        ax: AxState,
+        ax_ok: bool,
+        hide_ok: bool,
+        /// `wait_until_gone` answers, in order; false once used up.
+        gone: VecDeque<bool>,
+    }
+
+    impl MinimiseSteps for Put {
+        fn accessibility(&mut self) -> AxState {
+            self.steps.push("ax?".into());
+            self.ax
+        }
+        fn minimise_with_accessibility(&mut self, pid: Pid) -> bool {
+            self.steps.push(format!("ax-minimise-{pid}"));
+            self.ax_ok
+        }
+        fn hide(&mut self, pid: Pid) -> bool {
+            self.steps.push(format!("hide-{pid}"));
+            self.hide_ok
+        }
+        fn wait_until_gone(&mut self, pid: Pid) -> bool {
+            self.steps.push(format!("gone?-{pid}"));
+            self.gone.pop_front().unwrap_or(false)
+        }
+    }
+
+    fn put(ax: AxState, ax_ok: bool, hide_ok: bool, gone: &[bool]) -> Put {
+        Put { steps: Vec::new(), ax, ax_ok, hide_ok, gone: gone.iter().copied().collect() }
+    }
+
+    #[test]
+    fn minimise_uses_accessibility_when_allowed() {
+        let mut s = put(AxState::Allowed, true, true, &[true]);
+        assert_eq!(minimise_with(&mut s, 7), FocusResult::Minimised);
+        assert_eq!(s.steps, ["ax?", "ax-minimise-7", "gone?-7"]);
+    }
+
+    #[test]
+    fn minimise_hides_the_app_without_accessibility() {
+        for ax in [AxState::Off, AxState::Untrusted] {
+            let mut s = put(ax, true, true, &[true]);
+            assert_eq!(minimise_with(&mut s, 7), FocusResult::Minimised);
+            assert_eq!(s.steps, ["ax?", "hide-7", "gone?-7"]);
+        }
+        // Accessibility refused the request, or the window stayed: the app is hidden instead.
+        let mut s = put(AxState::Allowed, false, true, &[true]);
+        assert_eq!(minimise_with(&mut s, 7), FocusResult::Minimised);
+        assert_eq!(s.steps, ["ax?", "ax-minimise-7", "hide-7", "gone?-7"]);
+        let mut s = put(AxState::Allowed, true, true, &[false, true]);
+        assert_eq!(minimise_with(&mut s, 7), FocusResult::Minimised);
+        assert_eq!(s.steps, ["ax?", "ax-minimise-7", "gone?-7", "hide-7", "gone?-7"]);
+    }
+
+    #[test]
+    fn a_window_that_stays_on_screen_is_reported() {
+        let mut s = put(AxState::Off, true, false, &[]);
+        assert_eq!(minimise_with(&mut s, 7), failed(FocusFailure::Refused));
+        assert_eq!(s.steps, ["ax?", "hide-7"]);
+        let mut s = put(AxState::Off, true, true, &[false]);
+        assert_eq!(minimise_with(&mut s, 7), failed(FocusFailure::Refused));
+    }
+
+    #[test]
+    fn the_real_minimise_leaves_a_missing_process_alone() {
+        assert_eq!(Os::minimise(0), failed(FocusFailure::Gone));
+        assert!(!Os::showing(0));
     }
 
     #[test]

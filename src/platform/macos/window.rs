@@ -29,7 +29,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use objc2::MainThreadMarker;
-use objc2_app_kit::NSWorkspace;
+use objc2_app_kit::{NSRunningApplication, NSWorkspace};
 use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType, CGRect};
 use objc2_core_graphics::{
     kCGNullWindowID, kCGWindowAlpha, kCGWindowBounds, kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
@@ -94,6 +94,18 @@ pub(crate) fn has_off_screen_window(pid: Pid) -> bool {
     window_list(CGWindowListOption::OptionAll | CGWindowListOption::ExcludeDesktopElements)
         .iter()
         .any(|w| w.pid == pid && w.layer == 0 && w.w >= MIN_SIDE && w.h >= MIN_SIDE)
+}
+
+/// True when the app `pid` is hidden (its windows are then off screen until it is shown again).
+pub(crate) fn app_hidden(pid: Pid) -> bool {
+    let Ok(p) = libc::pid_t::try_from(pid) else { return false };
+    if p <= 0 {
+        return false;
+    }
+    on_main_wait(FRONT_WAIT, move |_| {
+        NSRunningApplication::runningApplicationWithProcessIdentifier(p).is_some_and(|a| a.isHidden())
+    })
+    .unwrap_or(false)
 }
 
 /// The windows the window server lists for `opts`.
@@ -216,6 +228,8 @@ mod tests {
             assert!(x.id != 0);
         }
         assert_eq!(Os::main_window(u32::MAX), None);
+        assert!(!app_hidden(0));
+        assert!(!app_hidden(u32::MAX));
         assert_eq!(main_windows(&HashSet::new()).len(), 0);
     }
 

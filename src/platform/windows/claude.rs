@@ -52,7 +52,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYBD_EVENT_FLAGS
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsIconic, PostMessageW,
-    SetForegroundWindow, ShowWindow, ASFW_ANY, SW_RESTORE, SW_SHOWNORMAL, WM_CLOSE,
+    SetForegroundWindow, ShowWindow, ShowWindowAsync, ASFW_ANY, SW_MINIMIZE, SW_RESTORE, SW_SHOWNORMAL, WM_CLOSE,
 };
 
 use super::process::{
@@ -61,7 +61,7 @@ use super::process::{
 use super::win::{from_wide, wide};
 use super::window::{hwnd_of, main_window, main_windows};
 use crate::core::claude_app::{self, Located};
-use crate::platform::{ClaudeInstall, Closer, Focus, FocusResult, Launcher, Os, Pid};
+use crate::platform::{ClaudeInstall, Closer, Focus, FocusFailure, FocusResult, Launcher, Os, Pid};
 use crate::util::{log, paths};
 
 const GRACEFUL_WAIT: Duration = Duration::from_secs(3);
@@ -294,6 +294,41 @@ fn focus(pid: u32) -> bool {
             }
         }
         GetForegroundWindow() == hwnd
+    }
+}
+
+/// How long a minimise request may take to show.
+const MINIMISE_WAIT: Duration = Duration::from_millis(500);
+
+/// True when the process's main window is shown and not minimised.
+fn showing(pid: u32) -> bool {
+    let h = main_window(pid);
+    // SAFETY: IsIconic validates the handle and answers false for a stale one.
+    h != 0 && !unsafe { IsIconic(hwnd_of(h)) }.as_bool()
+}
+
+/// Minimise the process's main window (its frontmost one), as its taskbar button does. The
+/// request does not wait for a busy window. A note for the log on success.
+fn minimise(pid: u32) -> Result<String, String> {
+    let h = main_window(pid);
+    if h == 0 {
+        return Err("no window".into());
+    }
+    let hwnd = hwnd_of(h);
+    // SAFETY: the handle may be stale; user32 validates it and fails then. No memory is passed.
+    if !unsafe { ShowWindowAsync(hwnd, SW_MINIMIZE) }.as_bool() {
+        return Err("the request was not accepted".into());
+    }
+    let start = Instant::now();
+    loop {
+        // SAFETY: as above.
+        if unsafe { IsIconic(hwnd) }.as_bool() {
+            return Ok(format!("window minimised after {} ms", start.elapsed().as_millis()));
+        }
+        if start.elapsed() >= MINIMISE_WAIT {
+            return Ok("minimise requested".into());
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -613,6 +648,23 @@ impl Focus for Os {
         }
     }
 
+    fn showing(pid: Pid) -> bool {
+        showing(pid)
+    }
+
+    fn minimise(pid: Pid) -> FocusResult {
+        match minimise(pid) {
+            Ok(note) => {
+                log::info(&format!("claude_app: minimise pid {pid}: {note}"));
+                FocusResult::Minimised
+            }
+            Err(e) => {
+                log::info(&format!("claude_app: minimise pid {pid}: {e}"));
+                FocusResult::Failed(FocusFailure::Refused)
+            }
+        }
+    }
+
     /// Windows needs no permission to bring a window forward.
     fn accessibility_trusted(_prompt: bool) -> Option<bool> {
         None
@@ -645,6 +697,13 @@ impl Closer for Os {
 mod tests {
     use super::*;
     use crate::platform::windows::process::{parse_user_data_dir, split_cmdline};
+
+    #[test]
+    fn a_missing_process_shows_nothing_and_is_not_minimised() {
+        assert!(!showing(0));
+        assert!(minimise(0).is_err());
+        assert_eq!(Os::minimise(0), FocusResult::Failed(FocusFailure::Refused));
+    }
 
     #[test]
     fn launch_cmdline_round_trips() {

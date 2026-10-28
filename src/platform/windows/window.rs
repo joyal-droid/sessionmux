@@ -27,8 +27,8 @@ use std::ffi::c_void;
 
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
-    IsWindowVisible, GWL_EXSTYLE, GW_OWNER, WS_EX_TOOLWINDOW,
+    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
+    GetWindowThreadProcessId, IsWindowVisible, GWL_EXSTYLE, GW_OWNER, WS_EX_TOOLWINDOW,
 };
 
 use crate::platform::{Os, Pid, WindowId, Windows};
@@ -82,6 +82,32 @@ impl Windows for Os {
     fn foreground_pid() -> Option<Pid> {
         foreground_pid()
     }
+
+    /// The foreground window's process, unless the window is the taskbar or its tray flyout.
+    fn user_front_pid() -> Option<Pid> {
+        // SAFETY: GetForegroundWindow has no preconditions.
+        let fg = unsafe { GetForegroundWindow() };
+        if fg.0.is_null() || is_shell_tray(&class_name(fg)) {
+            return None;
+        }
+        foreground_pid()
+    }
+}
+
+/// The window classes of the taskbars and of the flyout of hidden tray icons.
+fn is_shell_tray(class: &str) -> bool {
+    matches!(
+        class,
+        "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "NotifyIconOverflowWindow" | "TopLevelWindowForOverflowXamlIsland"
+    )
+}
+
+/// The class name of a window, empty when it cannot be read.
+fn class_name(hwnd: HWND) -> String {
+    let mut buf = [0u16; 128];
+    // SAFETY: `buf` is a writable buffer of the length passed; a stale handle makes the call fail.
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) };
+    String::from_utf16_lossy(&buf[..n.clamp(0, buf.len() as i32) as usize])
 }
 
 /// PID owning the current foreground window.
@@ -109,5 +135,16 @@ mod tests {
     fn no_window_for_a_missing_process() {
         assert_eq!(Os::main_window(0), None);
         assert_eq!(hwnd_of(0), HWND(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn the_taskbar_is_not_an_app_in_front() {
+        assert!(is_shell_tray("Shell_TrayWnd"));
+        assert!(is_shell_tray("Shell_SecondaryTrayWnd"));
+        assert!(is_shell_tray("NotifyIconOverflowWindow"));
+        assert!(is_shell_tray("TopLevelWindowForOverflowXamlIsland"));
+        assert!(!is_shell_tray("Chrome_WidgetWin_1"));
+        assert!(!is_shell_tray(""));
+        assert_eq!(class_name(HWND(std::ptr::null_mut())), "");
     }
 }

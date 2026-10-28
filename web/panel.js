@@ -1293,6 +1293,8 @@ function initPanel() {
     state.busyAccounts.delete(id);
     state.accountsDirty = true;
     renderAccounts();
+    // The account's window was in front, so the click minimised it: nothing to report.
+    if (res && res.minimised) return;
     if (res && res.ok === false) openFailedToast(a.name, res);
   }
 
