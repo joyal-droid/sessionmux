@@ -50,7 +50,9 @@ mod smoke;
 mod ui;
 mod util;
 
-use platform::{EventLoop, Misc, Os, SingleInstance};
+#[cfg(windows)]
+use platform::EventLoop;
+use platform::{Misc, Os, SingleInstance};
 use util::{log, paths};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -301,6 +303,7 @@ fn real_main() -> i32 {
     code
 }
 
+#[cfg(windows)]
 fn run_app(args: Args) -> i32 {
     log::init(&paths::log_file());
 
@@ -322,6 +325,37 @@ fn run_app(args: Args) -> i32 {
     app::shutdown();
     drop(guard);
     log::info("exit");
+    code
+}
+
+/// The app on macOS: AppKit's loop runs first and the app starts once AppKit finished launching,
+/// so a link that launched Sessionmux is not lost. A start the system made as a login item is a
+/// hidden start, like `--hidden`.
+#[cfg(target_os = "macos")]
+fn run_app(args: Args) -> i32 {
+    log::init(&paths::log_file());
+
+    let Some(guard) = platform::instance::Os::acquire() else {
+        log::info("another instance is running; handing off");
+        platform::instance::Os::notify_existing();
+        return 0;
+    };
+
+    log::info(&format!("{} {} starting{}", brand::NAME, brand::VERSION, if args.hidden { " (hidden)" } else { "" }));
+    let hidden = args.hidden;
+    let launch = move |login_item: bool| {
+        if login_item && !hidden {
+            log::info("started as a login item");
+        }
+        app::init(hidden || login_item).inspect_err(|e| log::error(&format!("startup failed: {e}")))
+    };
+    // Also run when the system ends the process for a logout; the lock is released with the process.
+    fn finish() {
+        app::shutdown();
+        log::info("exit");
+    }
+    let code = platform::event_loop::run_app(launch, finish);
+    drop(guard);
     code
 }
 

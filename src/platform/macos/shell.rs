@@ -20,24 +20,90 @@
 // https://github.com/joyal-droid/sessionmux and the Sessionmux mark must stay visible in the user
 // interface of every copy and derivative; see docs/attribution.md.
 
-//! Opening links and showing files. Not built yet: each call reports an error the panel shows.
+//! Opening links, files and System Settings pages, and showing files in Finder, through
+//! `NSWorkspace`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use super::unsupported;
+use objc2::rc::Retained;
+use objc2_app_kit::NSWorkspace;
+use objc2_foundation::{NSArray, NSString, NSURL};
+
 use crate::platform::{Os, PrivacyPane, Shell};
 
+/// What [`Shell::open_url`] may open.
+#[derive(Debug, PartialEq, Eq)]
+enum Target {
+    /// An http(s) link, opened in the default browser.
+    Web(String),
+    /// A local file, opened in its default app.
+    File(PathBuf),
+}
+
+/// Sort a request into a link or a file; anything else (other schemes, relative paths) is refused.
+fn target(url: &str) -> Result<Target, String> {
+    let u = url.trim();
+    let lower = u.to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("http://") {
+        return Ok(Target::Web(u.to_string()));
+    }
+    let p = Path::new(u);
+    if p.is_absolute() {
+        return Ok(Target::File(p.to_path_buf()));
+    }
+    Err("only web links and local files can be opened".into())
+}
+
+/// The System Settings page for `pane` (Privacy & Security).
+fn privacy_url(pane: PrivacyPane) -> &'static str {
+    match pane {
+        PrivacyPane::Automation => "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation",
+        PrivacyPane::Accessibility => "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+    }
+}
+
+fn file_url(path: &Path) -> Retained<NSURL> {
+    NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()))
+}
+
+/// Open `url` with the app the system picks for it.
+fn open(url: &NSURL, what: &str) -> Result<(), String> {
+    if NSWorkspace::sharedWorkspace().openURL(url) {
+        Ok(())
+    } else {
+        Err(format!("NSWorkspace openURL: {what} could not be opened"))
+    }
+}
+
 impl Shell for Os {
-    fn open_url(_url: &str) -> Result<(), String> {
-        Err(unsupported("Opening links"))
+    fn open_url(url: &str) -> Result<(), String> {
+        match target(url)? {
+            Target::Web(u) => {
+                let ns = NSURL::URLWithString(&NSString::from_str(&u)).ok_or("the link is not a valid URL")?;
+                open(&ns, "the link")
+            }
+            Target::File(p) => {
+                if !p.exists() {
+                    return Err(format!("{} does not exist", p.display()));
+                }
+                open(&file_url(&p), "the file")
+            }
+        }
     }
 
-    fn reveal(_path: &Path) -> Result<(), String> {
-        Err(unsupported("Show in Finder"))
+    /// Show `path` selected in a Finder window.
+    fn reveal(path: &Path) -> Result<(), String> {
+        if !path.is_absolute() || !path.exists() {
+            return Err(format!("{} does not exist", path.display()));
+        }
+        let urls = NSArray::from_retained_slice(&[file_url(path)]);
+        NSWorkspace::sharedWorkspace().activateFileViewerSelectingURLs(&urls);
+        Ok(())
     }
 
-    fn open_privacy_settings(_pane: PrivacyPane) -> Result<(), String> {
-        Err(unsupported("Opening System Settings"))
+    fn open_privacy_settings(pane: PrivacyPane) -> Result<(), String> {
+        let ns = NSURL::URLWithString(&NSString::from_str(privacy_url(pane))).ok_or("System Settings link")?;
+        open(&ns, "System Settings")
     }
 }
 
@@ -46,9 +112,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn calls_report_an_error() {
-        assert!(Os::open_url("https://example.com/").is_err());
-        assert!(Os::reveal(Path::new("/tmp")).is_err());
-        assert!(Os::open_privacy_settings(PrivacyPane::Automation).is_err());
+    fn targets() {
+        assert_eq!(target("https://example.com/a"), Ok(Target::Web("https://example.com/a".into())));
+        assert_eq!(target(" HTTP://example.com/ "), Ok(Target::Web("HTTP://example.com/".into())));
+        assert_eq!(
+            target("/Applications/Sessionmux.app/LICENSE.txt"),
+            Ok(Target::File("/Applications/Sessionmux.app/LICENSE.txt".into()))
+        );
+        for bad in [
+            "",
+            "file:///etc/passwd",
+            "claude://x",
+            "javascript:alert(1)",
+            "LICENSE.txt",
+            "x-apple.systempreferences:x",
+        ] {
+            assert!(target(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn privacy_pages() {
+        assert!(privacy_url(PrivacyPane::Automation).ends_with("?Privacy_Automation"));
+        assert!(privacy_url(PrivacyPane::Accessibility).ends_with("?Privacy_Accessibility"));
+        for p in [PrivacyPane::Automation, PrivacyPane::Accessibility] {
+            assert!(NSURL::URLWithString(&NSString::from_str(privacy_url(p))).is_some());
+        }
+    }
+
+    #[test]
+    fn missing_files_are_refused_without_opening_anything() {
+        assert!(Os::open_url("/nonexistent/sessionmux-test/file.txt").is_err());
+        assert!(Os::reveal(Path::new("/nonexistent/sessionmux-test")).is_err());
+        assert!(Os::reveal(Path::new("relative")).is_err());
+        assert!(Os::open_url("ftp://example.com/").is_err());
     }
 }

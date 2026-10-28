@@ -21,12 +21,48 @@
 // interface of every copy and derivative; see docs/attribution.md.
 
 //! Small system facts: the local time offset, symbolic links, file-sharing errors, memory
-//! trimming, executable comparison and the debugger check.
+//! trimming, executable comparison, where this copy runs from, the UI thread's preparation and
+//! the debugger check.
 
 use std::io;
 use std::path::Path;
+use std::sync::OnceLock;
+
+use objc2::MainThreadMarker;
+use objc2_foundation::NSBundle;
 
 use crate::platform::{Debugger, Misc, Os, Paths};
+use crate::util::log;
+
+extern "C" {
+    /// Hands free memory of a malloc zone (all zones for null) back to the system; returns the
+    /// number of bytes released.
+    fn malloc_zone_pressure_relief(zone: *mut libc::c_void, goal: libc::size_t) -> libc::size_t;
+}
+
+/// `P_TRACED` in `extern_proc.p_flag`: a debugger is attached.
+const P_TRACED: i32 = 0x0000_0800;
+/// Offset of `p_flag` in `struct kinfo_proc` (its first member `kp_proc` starts with a 16-byte
+/// union and two pointers) on 64-bit macOS.
+const P_FLAG_OFFSET: usize = 32;
+/// `sizeof(struct kinfo_proc)` on 64-bit macOS.
+const KINFO_PROC_SIZE: usize = 648;
+
+/// True when a `kinfo_proc` record's process flags say a debugger is attached.
+fn traced(kinfo: &[u8]) -> bool {
+    let Some(b) = kinfo.get(P_FLAG_OFFSET..P_FLAG_OFFSET + 4) else { return false };
+    let flag = i32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
+    flag & P_TRACED != 0
+}
+
+/// True for a bundle that runs from a place it cannot stay in: a copy the system moved aside
+/// before its first open (App Translocation) or one opened straight from a mounted disk image.
+/// A program outside a bundle (a development build) never counts.
+fn runs_from_temporary_place(bundle_path: &str) -> bool {
+    let p = bundle_path.trim_end_matches('/');
+    let is_bundle = p.len() > 4 && p[p.len() - 4..].eq_ignore_ascii_case(".app");
+    is_bundle && (p.contains("/AppTranslocation/") || p.starts_with("/Volumes/"))
+}
 
 impl Misc for Os {
     /// `tm_gmtoff` of `now` in local time; 0 when the conversion fails.
@@ -51,22 +87,39 @@ impl Misc for Os {
         false
     }
 
-    /// Not done yet: memory is left to the system.
-    fn trim_memory() {}
+    /// Return the allocator's free pages to the system (macOS has no working-set call).
+    fn trim_memory() {
+        // SAFETY: a null zone means every zone; the call only releases memory no allocation uses.
+        let released = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+        log::debug(&format!("memory: released {} KB", released / 1024));
+    }
 
-    /// The same path after normalisation (case kept).
+    /// The same path after normalisation (case kept), or the same file.
     fn same_exe(a: &str, b: &str) -> bool {
         let (a, b) = (a.trim(), b.trim());
         Os::same_path(a, b)
     }
 
-    /// Not checked yet: the copy is treated as installed where it runs.
+    /// The app bundle runs translocated or from a disk image (read once).
     fn translocated() -> bool {
-        false
+        static AT: OnceLock<bool> = OnceLock::new();
+        *AT.get_or_init(|| {
+            let path = NSBundle::mainBundle().bundlePath().to_string();
+            let t = runs_from_temporary_place(&path);
+            if t {
+                log::warn("this copy runs from a disk image or a temporary location; recording its path is off");
+            }
+            t
+        })
     }
 
-    /// Nothing to prepare yet.
+    /// Create the shared application as an accessory app (no Dock icon) before any window
+    /// exists. Nothing to undo afterwards.
     fn init_ui_thread() -> bool {
+        match MainThreadMarker::new() {
+            Some(mtm) => super::event_loop::prepare(mtm),
+            None => log::warn("the UI is not starting on the main thread"),
+        }
         false
     }
 
@@ -74,9 +127,32 @@ impl Misc for Os {
 }
 
 impl Debugger for Os {
-    /// Not checked yet: reports no debugger.
+    /// The process flags of this process (`sysctl` `KERN_PROC_PID`) carry `P_TRACED`.
     fn present() -> bool {
-        false
+        // SAFETY: getpid has no preconditions.
+        let pid = unsafe { libc::getpid() };
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+        // Eight-byte aligned, as the record holds pointers.
+        let mut buf = [0u64; KINFO_PROC_SIZE / 8];
+        let mut len: libc::size_t = KINFO_PROC_SIZE;
+        // SAFETY: `mib` names four valid levels, `buf` is writable for `len` bytes and `len` is
+        // updated with the size written; no new value is set.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return false;
+        }
+        // SAFETY: `buf` is `KINFO_PROC_SIZE` initialised bytes and `len` is at most that.
+        let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), len.min(KINFO_PROC_SIZE)) };
+        traced(bytes)
     }
 }
 
@@ -114,11 +190,44 @@ mod tests {
     }
 
     #[test]
-    fn the_rest_is_inert() {
-        Os::trim_memory();
-        assert!(!Os::translocated());
-        assert!(!Os::init_ui_thread());
-        Os::uninit_ui_thread();
+    fn traced_flag_is_read_from_the_record() {
+        let mut rec = vec![0u8; KINFO_PROC_SIZE];
+        assert!(!traced(&rec));
+        rec[P_FLAG_OFFSET..P_FLAG_OFFSET + 4].copy_from_slice(&(P_TRACED | 0x4).to_ne_bytes());
+        assert!(traced(&rec));
+        rec[P_FLAG_OFFSET..P_FLAG_OFFSET + 4].copy_from_slice(&0x4i32.to_ne_bytes());
+        assert!(!traced(&rec));
+        assert!(!traced(&rec[..20]));
+        assert!(!traced(&[]));
+    }
+
+    #[test]
+    fn no_debugger_under_the_test_runner() {
+        // `cargo test` does not trace its test binaries.
         assert!(!Os::present());
+    }
+
+    #[test]
+    fn temporary_places() {
+        assert!(runs_from_temporary_place("/private/var/folders/xy/T/AppTranslocation/1A2B-3C/d/Sessionmux.app"));
+        assert!(runs_from_temporary_place("/Volumes/Sessionmux/Sessionmux.app"));
+        assert!(runs_from_temporary_place("/Volumes/Sessionmux/Sessionmux.APP/"));
+        assert!(!runs_from_temporary_place("/Applications/Sessionmux.app"));
+        assert!(!runs_from_temporary_place("/Users/me/Applications/Sessionmux.app"));
+        // Development builds are not bundles.
+        assert!(!runs_from_temporary_place("/Volumes/Work/sessionmux/target/release"));
+        assert!(!runs_from_temporary_place(""));
+    }
+
+    #[test]
+    fn the_rest_is_safe_to_call() {
+        Os::trim_memory();
+        // The test binary is not inside a bundle.
+        assert!(!Os::translocated());
+        // Nothing is left to undo, whichever thread prepares the UI.
+        if objc2::MainThreadMarker::new().is_none() {
+            assert!(!Os::init_ui_thread());
+            Os::uninit_ui_thread();
+        }
     }
 }
