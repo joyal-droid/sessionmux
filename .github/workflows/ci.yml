@@ -268,9 +268,9 @@ jobs:
           run 'not json' --approve-hook
           run '' --approve-hook
 
-      # The app starts on the runner and runs its start-up with the demo data. Captures and the
-      # panel are not available on macOS yet, so a failed self-check is reported as a warning;
-      # a crash, a panic or a hang fails the step.
+      # The self-check with the demo data: floating button and panel captures, the panel's
+      # requests answered, memory figures. A crash, a hang or a result other than {"ok":true}
+      # fails the step; the captures are uploaded below.
       - name: Smoke
         env:
           SESSIONMUX_SMOKE_FIXTURE: '1'
@@ -280,15 +280,14 @@ jobs:
           perl -e 'alarm shift; exec @ARGV or die' 90 target/release/Sessionmux --smoke > ci-logs/smoke.log 2>&1
           code=$?
           set -e
+          # The app's own log goes into the step log, so a failure report shows it too.
+          for f in smoke/userData/*.log; do [ -e "$f" ] && cat "$f" >> ci-logs/smoke.log; done
+          echo "smoke exit code: $code" >> ci-logs/smoke.log
           cat ci-logs/smoke.log
-          for f in smoke/userData/*.log; do [ -e "$f" ] && cat "$f"; done
-          echo "smoke exit code: $code"
-          if [ "$code" -ne 0 ] && [ "$code" -ne 1 ]; then
+          ls -l smoke/*.png || true
+          if [ "$code" -ne 0 ] || ! grep -q '"ok":true' ci-logs/smoke.log; then
             echo 'Smoke' > ci-logs/smoke.failed
             exit 1
-          fi
-          if [ "$code" -ne 0 ]; then
-            echo "::warning title=Smoke::the macOS self-check did not pass yet (see the smoke-macos artifact)"
           fi
 
       - name: Upload smoke output
