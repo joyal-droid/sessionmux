@@ -646,13 +646,16 @@ mod tests {
         assert_eq!(status, 0, "LSRegisterURL {}", app.display());
     }
 
-    /// Copy the stand-in Claude.app to `dir/Other.app` under another bundle id.
-    fn second_app(f: &fake::FakeClaude, dir: &Path) -> PathBuf {
-        let other = dir.join("Other.app");
+    /// Copy the stand-in Claude.app to `dir/<name>.app` under a bundle id no other copy has.
+    /// Launch Services keeps a scheme's handler by bundle id, so copies that share one (other
+    /// tests build their own stand-ins) could be read back in place of this one.
+    fn app_copy(f: &fake::FakeClaude, dir: &Path, name: &str) -> PathBuf {
+        let other = dir.join(format!("{name}.app"));
         let status = std::process::Command::new("/bin/cp").arg("-R").arg(&f.bundle).arg(&other).status().unwrap();
         assert!(status.success());
         let plist = other.join("Contents").join("Info.plist");
-        let text = std::fs::read_to_string(&plist).unwrap().replace(fake::BUNDLE_ID, "test.sessionmux.fakeother");
+        let id = format!("test.sessionmux.{}.{}", name.to_ascii_lowercase(), std::process::id());
+        let text = std::fs::read_to_string(&plist).unwrap().replace(fake::BUNDLE_ID, &id);
         std::fs::write(&plist, text).unwrap();
         other.canonicalize().unwrap()
     }
@@ -680,8 +683,9 @@ mod tests {
             }
         };
         let d = tempfile::tempdir().unwrap();
-        let first = f.bundle.canonicalize().unwrap();
-        let second = second_app(&f, &d.path().canonicalize().unwrap());
+        let root = d.path().canonicalize().unwrap();
+        let first = app_copy(&f, &root, "First");
+        let second = app_copy(&f, &root, "Second");
         register(&first);
         register(&second);
 
