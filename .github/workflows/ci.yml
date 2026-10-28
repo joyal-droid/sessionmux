@@ -247,6 +247,61 @@ jobs:
           mkdir -p ci-logs
           cargo test --locked 2>&1 | tee ci-logs/test.log || { echo 'Test' > ci-logs/test.failed; exit 1; }
 
+      # The hook helpers exit 0 with no app running, whatever they are given.
+      - name: Hook helper CLI
+        run: |
+          mkdir -p ci-logs
+          run() {
+            input=$1
+            shift
+            printf '%s' "$input" | target/release/Sessionmux "$@" || {
+              echo "Sessionmux $* with input '$input' exited with $?" | tee -a ci-logs/hooks.log
+              echo 'Hook helper CLI' > ci-logs/hooks.failed
+              exit 1
+            }
+            echo "Sessionmux $* with input '$input': exit 0" | tee -a ci-logs/hooks.log
+          }
+          run '{}' --notify-hook
+          run 'not json' --notify-hook
+          run '' --notify-hook
+          run '{}' --approve-hook
+          run 'not json' --approve-hook
+          run '' --approve-hook
+
+      # The app starts on the runner and runs its start-up with the demo data. Captures and the
+      # panel are not available on macOS yet, so a failed self-check is reported as a warning;
+      # a crash, a panic or a hang fails the step.
+      - name: Smoke
+        env:
+          SESSIONMUX_SMOKE_FIXTURE: '1'
+        run: |
+          mkdir -p ci-logs
+          set +e
+          perl -e 'alarm shift; exec @ARGV or die' 90 target/release/Sessionmux --smoke > ci-logs/smoke.log 2>&1
+          code=$?
+          set -e
+          cat ci-logs/smoke.log
+          for f in smoke/userData/*.log; do [ -e "$f" ] && cat "$f"; done
+          echo "smoke exit code: $code"
+          if [ "$code" -ne 0 ] && [ "$code" -ne 1 ]; then
+            echo 'Smoke' > ci-logs/smoke.failed
+            exit 1
+          fi
+          if [ "$code" -ne 0 ]; then
+            echo "::warning title=Smoke::the macOS self-check did not pass yet (see the smoke-macos artifact)"
+          fi
+
+      - name: Upload smoke output
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: smoke-macos
+          path: |
+            ci-logs/smoke.log
+            smoke/userData/*.log
+            smoke/*.png
+          if-no-files-found: warn
+
       - name: Report failed steps
         if: failure()
         shell: bash
