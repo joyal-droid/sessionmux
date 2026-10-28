@@ -176,6 +176,29 @@ mod tests {
         assert_eq!(norm_path(r"C:\X\"), r"c:\x");
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn path_rules_follow_the_system() {
+        assert_eq!(norm_path("/Users/A//b/./c/"), "/Users/A/b/c");
+        assert_eq!(norm_path("\"/a b/\""), "/a b");
+        assert_eq!(norm_path("/"), "/");
+        assert!(same_path("/Users/A/b", "/Users/A//b/"));
+        assert!(!same_path("/no/such/A", "/no/such/a"));
+        assert!(!same_path("", ""));
+        assert!(is_under("/a/b/c", "/a/b/"));
+        assert!(is_under("/a/b", "/a/b"));
+        assert!(!is_under("/a/bc", "/a/b"));
+        assert!(!is_under("/no/such/B/c", "/no/such/b"));
+        // `/var` is a link to `/private/var`: both spellings name one folder.
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().canonicalize().unwrap();
+        let real = real.to_string_lossy();
+        if let Some(short) = real.strip_prefix("/private") {
+            assert!(same_path(&real, short));
+            assert!(same_path(short, &format!("{real}/")));
+        }
+    }
+
     #[test]
     fn user_data_override() {
         let d = tempfile::tempdir().unwrap();

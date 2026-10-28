@@ -179,6 +179,21 @@ mod tests {
         assert!(!matches_data_dir(&x, None));
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn matches_data_dir_rules() {
+        let main = proc_with(None);
+        let dir = "/Users/u/Library/Application Support/Claude-X";
+        assert!(!matches_data_dir(&main, Some(dir)));
+        let x = proc_with(Some(dir));
+        assert!(matches_data_dir(&x, Some(dir)));
+        assert!(matches_data_dir(&x, Some("/Users/u/Library//Application Support/./Claude-X/")));
+        assert!(matches_data_dir(&x, Some(&format!("  {dir}  "))));
+        assert!(!matches_data_dir(&x, Some("/Users/u/Library/Application Support/claude-x")));
+        assert!(!matches_data_dir(&x, Some("/Users/u/Library/Application Support/Claude-XY")));
+        assert!(!matches_data_dir(&x, None));
+    }
+
     /// Read-only check against this machine: `cargo test -p sessionmux claude_app -- --ignored --nocapture`.
     #[test]
     #[ignore]

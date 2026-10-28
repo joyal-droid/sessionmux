@@ -1481,6 +1481,26 @@ mod tests {
         p.to_string_lossy().into_owned()
     }
 
+    /// `p` spelled another way that still names the same folder: other case and a trailing `\`
+    /// on Windows, where paths compare case-insensitively; a `.` part and a trailing `/`
+    /// elsewhere, where case is kept.
+    fn other_spelling(p: &Path) -> String {
+        if cfg!(windows) {
+            s(p).to_uppercase() + "\\"
+        } else {
+            format!("{}/./", s(p))
+        }
+    }
+
+    /// The Windows fixture on Windows, the POSIX one elsewhere.
+    fn per_os<'a>(windows: &'a str, posix: &'a str) -> &'a str {
+        if cfg!(windows) {
+            windows
+        } else {
+            posix
+        }
+    }
+
     #[test]
     fn discovery_marker_rules() {
         let env = Env::new();
@@ -1550,25 +1570,32 @@ mod tests {
 
     #[test]
     fn sign_in_routing_setting() {
+        // On by default, except where every handler change asks the user (then off).
+        let def = Settings::default().sign_in_routing;
         let env = Env::new();
         let mut st = env.store();
-        assert!(st.settings().sign_in_routing);
-        assert_eq!(env.disk()["settings"]["signInRouting"], json!(true));
+        assert_eq!(st.settings().sign_in_routing, def);
+        assert_eq!(env.disk()["settings"]["signInRouting"], json!(def));
         // Non-booleans are ignored exactly like the other boolean settings.
         for bad in [json!("no"), json!(0), json!(null), json!({})] {
-            assert!(st.set_settings(json!({ "signInRouting": bad })).unwrap().sign_in_routing);
+            assert_eq!(st.set_settings(json!({ "signInRouting": bad })).unwrap().sign_in_routing, def);
         }
-        assert!(!st.set_settings(json!({"signInRouting": false})).unwrap().sign_in_routing);
-        assert_eq!(env.disk()["settings"]["signInRouting"], json!(false));
-        assert!(!env.store().settings().sign_in_routing);
-        // A store written before the setting existed reads it as true (normalise + plain serde).
+        assert_eq!(st.set_settings(json!({ "signInRouting": !def })).unwrap().sign_in_routing, !def);
+        assert_eq!(env.disk()["settings"]["signInRouting"], json!(!def));
+        assert_eq!(env.store().settings().sign_in_routing, !def);
+        for on in [false, true] {
+            assert_eq!(st.set_settings(json!({ "signInRouting": on })).unwrap().sign_in_routing, on);
+            assert_eq!(env.store().settings().sign_in_routing, on);
+        }
+        st.set_settings(json!({ "signInRouting": !def })).unwrap();
+        // A store written before the setting existed reads the default (normalise + plain serde).
         let mut v = env.disk();
         v["settings"].as_object_mut().unwrap().remove("signInRouting");
         fs::write(env.user_data.join("sessionmux.json"), serde_json::to_string(&v).unwrap()).unwrap();
-        assert!(env.store().settings().sign_in_routing);
+        assert_eq!(env.store().settings().sign_in_routing, def);
         let mut old = serde_json::to_value(Settings::default()).unwrap();
         old.as_object_mut().unwrap().remove("signInRouting");
-        assert!(serde_json::from_value::<Settings>(old).unwrap().sign_in_routing);
+        assert_eq!(serde_json::from_value::<Settings>(old).unwrap().sign_in_routing, def);
     }
 
     #[test]
@@ -1752,7 +1779,7 @@ mod tests {
         let main_org = env.main_data_dir.join("claude-code-sessions").join("a").join("o");
         fs::create_dir_all(&main_org).unwrap();
         fs::write(main_org.join("local_x.json"), "{}").unwrap();
-        let procs = vec![proc_(100, None), proc_(200, Some(s(&design).to_uppercase() + "\\"))];
+        let procs = vec![proc_(100, None), proc_(200, Some(other_spelling(&design)))];
         let mut st = env.store();
         let d_rec = env.adopt(&mut st, &design, None, None).unwrap();
         let list = env.list(&st, &procs);
@@ -1930,7 +1957,7 @@ mod tests {
         assert_eq!(env.list(&s2, &[]).iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), ["main"]);
         assert!(env.discovered(&mut s2).is_empty());
 
-        // A folder outside %APPDATA%\Claude-* is never deleted.
+        // A folder that is not a Claude-* folder of the profiles folder is never deleted.
         let outside = env.root.join("elsewhere").join("Claude-X");
         mk_profile(&outside, json!({}));
         fs::write(
@@ -2051,7 +2078,8 @@ mod tests {
         assert!(env.adopt(&mut st, &work, None, Some("red")).is_err());
         assert_eq!(st.change_count(), c0);
 
-        let r = st.adopt_profile(&s(&work).to_uppercase(), None, None, None, env.main_uuid().as_deref()).unwrap();
+        let spelling = if cfg!(windows) { s(&work).to_uppercase() } else { other_spelling(&work) };
+        let r = st.adopt_profile(&spelling, None, None, None, env.main_uuid().as_deref()).unwrap();
         assert_eq!(r.name, "work");
         assert_eq!(r.data_dir, Some(s(&work)));
         let acc = env.list(&st, &[]).into_iter().find(|a| a.id == r.id).unwrap();
@@ -2232,15 +2260,20 @@ mod tests {
     #[test]
     fn normalise_drops_unknown_keys_dedupes_and_assigns_colours() {
         let env = Env::new();
+        // B names A's folder in another spelling: other case on Windows, extra separators elsewhere.
+        let dir_a = per_os("C:\\x\\Claude-A", "/x/Claude-A");
+        let dir_b = per_os("c:\\X\\claude-a\\", "/x//Claude-A/");
+        let dir_c = per_os("C:\\x\\Claude-C", "/x/Claude-C");
+        let ignored = per_os("C:\\i", "/i");
         fs::write(
             env.user_data.join("sessionmux.json"),
             json!({"version": 1, "extra": true, "accounts": [
-                {"id": "a", "name": "  A  ", "dataDir": " C:\\x\\Claude-A ", "color": "#abcdef", "order": 2, "junk": 1},
-                {"id": "b", "name": "", "dataDir": "c:\\X\\claude-a\\", "order": 3},
-                {"id": "c", "dataDir": "C:\\x\\Claude-C", "color": "nope", "label": "  l  ", "order": 1.5},
+                {"id": "a", "name": "  A  ", "dataDir": format!(" {dir_a} "), "color": "#abcdef", "order": 2, "junk": 1},
+                {"id": "b", "name": "", "dataDir": dir_b, "order": 3},
+                {"id": "c", "dataDir": dir_c, "color": "nope", "label": "  l  ", "order": 1.5},
                 {"id": "d", "name": "no dir"},
                 "garbage"
-            ], "settings": {"theme": "light", "bogus": 1}, "ignoredDataDirs": ["C:\\i", 5]})
+            ], "settings": {"theme": "light", "bogus": 1}, "ignoredDataDirs": [ignored, 5]})
             .to_string(),
         )
         .unwrap();
@@ -2256,13 +2289,13 @@ mod tests {
         assert_eq!(accs[1]["name"], "Claude-C");
         assert_eq!(accs[1]["label"], "l");
         assert_eq!(accs[2]["name"], "A");
-        assert_eq!(accs[2]["dataDir"], "C:\\x\\Claude-A");
+        assert_eq!(accs[2]["dataDir"], dir_a);
         assert_eq!(accs[2]["color"], "#ABCDEF");
         assert_eq!(accs.iter().map(|a| a["order"].as_u64().unwrap()).collect::<Vec<_>>(), [0, 1, 2]);
         // Main gets the least-used colour first (palette[0]), then C gets palette[1].
         assert_eq!(accs[0]["color"], PALETTE[0]);
         assert_eq!(accs[1]["color"], PALETTE[1]);
-        assert_eq!(disk["ignoredDataDirs"], json!(["C:\\i"]));
+        assert_eq!(disk["ignoredDataDirs"], json!([ignored]));
         assert_eq!(st.settings().theme, "light");
         assert_eq!(keys(&disk["settings"]), keys(&serde_json::to_value(Settings::default()).unwrap()));
     }
@@ -2272,11 +2305,20 @@ mod tests {
     fn store_bytes_are_stable() {
         let env = Env::new();
         let sample = "{\n  \"version\": 2,\n  \"accounts\": [\n    {\n      \"id\": \"main\",\n      \"name\": \"Main\",\n      \"dataDir\": null,\n      \"color\": \"#F08A5D\",\n      \"label\": null,\n      \"order\": 0\n    },\n    {\n      \"id\": \"11111111-2222-4333-8444-555555555555\",\n      \"name\": \"Design\",\n      \"dataDir\": \"C:\\\\Users\\\\example\\\\AppData\\\\Roaming\\\\Claude-Design\",\n      \"color\": \"#5B9CF6\",\n      \"label\": \"me@example.com\",\n      \"order\": 1\n    }\n  ],\n  \"settings\": {\n    \"startWithWindows\": false,\n    \"shareMcpConfig\": true,\n    \"showBubble\": true,\n    \"bubblePosition\": {\n      \"x\": 1840,\n      \"y\": 512\n    },\n    \"theme\": \"dark\",\n    \"hotkey\": \"Ctrl+Shift+Space\",\n    \"panelSide\": \"auto\",\n    \"bubbleMode\": \"tray\"\n  },\n  \"ignoredDataDirs\": [\n    \"C:\\\\Users\\\\example\\\\AppData\\\\Roaming\\\\Claude-old\"\n  ]\n}";
+        // The same layout with POSIX folders where paths are POSIX.
+        let sample = if cfg!(windows) {
+            sample.to_string()
+        } else {
+            sample.replace("C:\\\\Users\\\\example\\\\AppData\\\\Roaming", "/Users/example/Library/Application Support")
+        };
+        let sample = sample.as_str();
+        assert_eq!(sample.contains("/Users/example/"), !cfg!(windows));
         fs::write(env.user_data.join("sessionmux.json"), sample).unwrap();
         let st = env.store();
-        // Same bytes, plus Sessionmux's own `signInRouting` (default true) after bubbleMode.
+        // Same bytes, plus Sessionmux's own `signInRouting` (at its default) after bubbleMode.
         let expected = with_sign_in_routing(sample);
-        assert!(expected.contains("\"bubbleMode\": \"tray\",\n    \"signInRouting\": true\n  },"));
+        let def = Settings::default().sign_in_routing;
+        assert!(expected.contains(&format!("\"bubbleMode\": \"tray\",\n    \"signInRouting\": {def}\n  }},")));
         assert_eq!(fs::read_to_string(env.user_data.join("sessionmux.json")).unwrap(), expected);
         let parsed: Store = serde_json::from_str(sample).unwrap();
         assert_eq!(st.snapshot(), parsed);
@@ -2286,8 +2328,8 @@ mod tests {
         assert_eq!(again.snapshot(), parsed);
     }
 
-    /// A store text as Sessionmux writes it: a missing `signInRouting` is inserted as `true` after
-    /// the bubbleMode line, and a retired settings line is dropped.
+    /// A store text as Sessionmux writes it: a missing `signInRouting` is inserted at its default
+    /// after the bubbleMode line, and a retired settings line is dropped.
     fn with_sign_in_routing(text: &str) -> String {
         let mut text = text.to_string();
         if let Some(at) = text.find(&format!("\n    \"{RETIRED_KEY}\": ")) {
@@ -2298,7 +2340,8 @@ mod tests {
         if !text.contains("\"signInRouting\"") {
             let at = text.find("\n    \"bubbleMode\": ").expect("settings line");
             let eol = at + 1 + text[at + 1..].find('\n').expect("end of settings line");
-            text = format!("{},\n    \"signInRouting\": true{}", &text[..eol], &text[eol..]);
+            let def = Settings::default().sign_in_routing;
+            text = format!("{},\n    \"signInRouting\": {def}{}", &text[..eol], &text[eol..]);
         }
         text
     }

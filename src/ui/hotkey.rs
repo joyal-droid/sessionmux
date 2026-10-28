@@ -216,6 +216,21 @@ mod tests {
     }
 
     #[test]
+    fn mac_modifier_names() {
+        assert_eq!(parse("Option+K").unwrap(), parse("Alt+K").unwrap());
+        assert_eq!(parse("Command+K").unwrap(), parse("Cmd+K").unwrap());
+        assert_eq!(parse("CommandOrControl+K").unwrap(), parse("CmdOrCtrl+K").unwrap());
+        let a = parse("Cmd+Option+Shift+K").unwrap();
+        assert!(a.alt && a.shift);
+        let mac = cfg!(target_os = "macos");
+        assert_eq!((a.ctrl, a.meta), (!mac, mac));
+        // On macOS Command is the Meta key; elsewhere Meta is the Windows key and Command is Ctrl.
+        assert_eq!(parse("Cmd+K").unwrap() == parse("Meta+K").unwrap(), mac);
+        assert_eq!(parse("Cmd+K").unwrap() == parse("Ctrl+K").unwrap(), !mac);
+        assert!(parse("Option+Alt+K").is_err());
+    }
+
+    #[test]
     fn rejects_bad_specs() {
         for bad in
             ["", "Space", "Ctrl", "Ctrl+Shift", "Ctrl+A+B", "Ctrl+Ctrl+A", "Ctrl+F25", "Ctrl+Foo", "Ctrl+F0", "Hyper+A"]

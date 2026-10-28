@@ -1122,7 +1122,7 @@ mod tests {
     const ACCT_B: &str = "bbbbbbbb-0000-0000-0000-000000000002";
     const ORG_A: &str = "org-a";
     const ORG_B: &str = "org-b";
-    /// A dead pid: very large numbers are never assigned on Windows test boxes.
+    /// A dead pid: numbers this large are never assigned to a process.
     const DEAD_PID: u32 = 2147483000;
     const SCRATCH_LEAF: &str = "scratch-2026-10-26-abc123";
 
@@ -1810,9 +1810,19 @@ mod tests {
         assert_eq!(json_escaped(r"C:\a b"), r"C:\\a b");
         let pairs = vec![("ab".to_string(), "X".to_string()), ("abc".to_string(), "Y".to_string())];
         assert_eq!(replace_all("abcab", &pairs), "YX");
-        assert_eq!(rel_inside(Path::new(r"C:\A\b"), r"c:\a\B\c\D"), Some(vec!["c".to_string(), "D".to_string()]));
-        assert_eq!(rel_inside(Path::new(r"C:\A\b"), r"C:\A\bc"), None);
-        assert_eq!(rel_inside(Path::new(r"C:\A\b"), r"C:\A\b\"), Some(vec![]));
+        let parts = |v: &[&str]| Some(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        if cfg!(windows) {
+            assert_eq!(rel_inside(Path::new(r"C:\A\b"), r"c:\a\B\c\D"), parts(&["c", "D"]));
+            assert_eq!(rel_inside(Path::new(r"C:\A\b"), r"C:\A\bc"), None);
+            assert_eq!(rel_inside(Path::new(r"C:\A\b"), r"C:\A\b\"), parts(&[]));
+        } else {
+            assert_eq!(rel_inside(Path::new("/A/b"), "/a/B/c/D"), parts(&["c", "D"]));
+            assert_eq!(rel_inside(Path::new("/A/b"), "/A//b/./c/"), parts(&["c"]));
+            assert_eq!(rel_inside(Path::new("/A/b"), "/A/bc"), None);
+            assert_eq!(rel_inside(Path::new("/A/b"), "/A"), None);
+            assert_eq!(rel_inside(Path::new("/A/b"), "/A/b/"), parts(&[]));
+        }
+        assert_eq!(rel_inside(Path::new("/A/b"), ""), None);
         let v: OVal = serde_json::from_str(r#"{"b":1,"a":2.0,"b":3}"#).unwrap();
         assert_eq!(serde_json::to_string(&v).unwrap(), r#"{"b":3,"a":2}"#);
     }

@@ -709,7 +709,25 @@ impl Parser<'_> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     const EXE: &str = r"C:\Program Files\Sessionmux\Sessionmux.exe";
+    #[cfg(not(windows))]
+    const EXE: &str = "/Applications/Sessionmux.app/Contents/MacOS/Sessionmux";
+    /// Another program's hook command.
+    #[cfg(windows)]
+    const AUDIT: &str = r"C:\tools\audit.exe";
+    #[cfg(not(windows))]
+    const AUDIT: &str = "/usr/local/bin/audit";
+
+    /// [`EXE`] written another way that names the same file: other case and `/` separators on
+    /// Windows; quoted with a `.` part and a doubled `/` elsewhere, where case is kept.
+    fn other_spelling() -> String {
+        if cfg!(windows) {
+            EXE.to_uppercase().replace('\\', "/")
+        } else {
+            format!("\"{}\"", EXE.replace("/Contents/", "/./Contents//"))
+        }
+    }
 
     fn exe() -> &'static Path {
         Path::new(EXE)
@@ -917,12 +935,14 @@ mod tests {
     fn our_entries_are_found_in_any_spelling() {
         let (_d, p) = fixture();
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        let other_spelling = EXE.to_uppercase().replace('\\', "/");
+        let other_spelling = other_spelling();
+        assert_ne!(other_spelling, EXE);
+        assert!(same_exe(&other_spelling, EXE));
         let file = json!({
             "hooks": {
                 "PermissionRequest": [{"matcher": "", "hooks": [
                     {"type": "command", "command": other_spelling, "args": [ARG_APPROVE], "timeout": 90},
-                    {"type": "command", "command": "C:\\tools\\audit.exe", "args": [ARG_APPROVE]}
+                    {"type": "command", "command": AUDIT, "args": [ARG_APPROVE]}
                 ]}],
                 "Stop": [{"hooks": [{"type": "command", "command": EXE, "args": ["--relay"]}]}],
                 "SessionStart": []
@@ -937,7 +957,7 @@ mod tests {
         // A foreign hook in our matcher entry, a hook of ours with other arguments and an
         // empty array that was already there all stay.
         assert_eq!(v["hooks"]["PermissionRequest"][0]["hooks"].as_array().unwrap().len(), 1);
-        assert_eq!(v["hooks"]["PermissionRequest"][0]["hooks"][0]["command"], "C:\\tools\\audit.exe");
+        assert_eq!(v["hooks"]["PermissionRequest"][0]["hooks"][0]["command"], AUDIT);
         assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["args"][0], "--relay");
         assert_eq!(v["hooks"]["SessionStart"], json!([]));
         assert!(v["hooks"].get("Notification").is_none() && v["hooks"].get("StopFailure").is_none());
