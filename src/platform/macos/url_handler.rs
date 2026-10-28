@@ -49,6 +49,11 @@ impl UrlHandler for Os {
         true
     }
 
+    /// Quitting and logging out never change the handler; the next start gives it back.
+    fn restore_at_exit() -> bool {
+        false
+    }
+
     fn retake_limit() -> Option<u32> {
         Some(0)
     }
@@ -75,6 +80,7 @@ mod tests {
         assert!(matches!(Os::restore("claude", None, None), HandlerChange::Failed(_)));
         assert!(!Os::is_us(&HandlerId("/Applications/Sessionmux.app".into())));
         assert!(Os::changes_need_consent());
+        assert!(!Os::restore_at_exit());
         assert_eq!(Os::retake_limit(), Some(0));
         assert!(Os::unavailable().is_some());
         assert!(Os::forward(&Located::default(), None, None, "claude://x").is_err());

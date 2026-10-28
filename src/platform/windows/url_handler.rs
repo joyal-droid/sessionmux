@@ -125,6 +125,11 @@ impl UrlHandler for Os {
         false
     }
 
+    /// Quitting gives the handler back before the process ends.
+    fn restore_at_exit() -> bool {
+        true
+    }
+
     /// Claude registering itself again on a start is taken back every time.
     fn retake_limit() -> Option<u32> {
         None
@@ -236,6 +241,7 @@ mod tests {
         assert_eq!(default_command(r"C:\a b\Claude.exe"), r#""C:\a b\Claude.exe" "%1""#);
         assert_eq!(command_exe(r"C:\x\a.exe --relay %1"), r"C:\x\a.exe");
         assert!(!Os::changes_need_consent());
+        assert!(Os::restore_at_exit());
         assert_eq!(Os::retake_limit(), None);
     }
 

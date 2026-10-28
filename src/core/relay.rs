@@ -40,8 +40,8 @@
 //! pub struct RelayState { active, account_id, account_name, data_dir, since, original_command,
 //!                         handler_pending, handler_declined, retakes, restore_pending, restore_declined }
 //! impl Relay { open(user_data), open_with(user_data, Option<protocol>), state(), begin(id, name, dir),
-//!              ensure() -> Result<bool, String>, end(), defer_restore(), restore_settled(), restore_now(),
-//!              expired(now_secs) }
+//!              ensure() -> Result<bool, String>, end(), defer_restore(), exit_defers_restore(),
+//!              restore_settled(), restore_now(), expired(now_secs) }
 //! pub fn validate_url(url) -> Result<String, String>; pub fn relay_target(Option<&RelayState>) -> Option<String>;
 //! pub fn forward(url, exe, data_dir) -> Result<(), ForwardError>; pub fn forward_to(l, data_dir, pid, url);
 //! pub fn redact(url) -> String; pub fn now_secs() -> u64; pub fn signal_bad_link();
@@ -337,6 +337,12 @@ impl<H: UrlHandler> Relay<H> {
         Ok(())
     }
 
+    /// True when quitting must leave the handler alone and only mark the restore for the next
+    /// start ([`Relay::defer_restore`]); false when quitting gives it back now ([`Relay::end`]).
+    pub fn exit_defers_restore() -> bool {
+        !H::restore_at_exit() || H::changes_need_consent()
+    }
+
     /// Give the links back because the user asked: also after an earlier refusal.
     #[allow(dead_code)]
     pub fn restore_now(&self) -> Result<(), String> {
@@ -540,6 +546,7 @@ mod tests {
         takes: VecDeque<HandlerChange>,
         restores: VecDeque<HandlerChange>,
         consent: bool,
+        keep_at_exit: bool,
         limit: Option<u32>,
         take_calls: u32,
         restore_calls: u32,
@@ -584,6 +591,9 @@ mod tests {
         }
         fn changes_need_consent() -> bool {
             fake(|s| s.consent)
+        }
+        fn restore_at_exit() -> bool {
+            fake(|s| !s.keep_at_exit)
         }
         fn retake_limit() -> Option<u32> {
             fake(|s| s.limit)
@@ -752,6 +762,48 @@ mod tests {
         // Nothing saved: nothing to defer.
         r.defer_restore().unwrap();
         assert_eq!(r.state(), None);
+    }
+
+    /// What quitting does with the relay, as the app's quit and logout paths run it.
+    fn end_at_exit(r: &Relay<Fake>) {
+        if Relay::<Fake>::exit_defers_restore() {
+            r.defer_restore().unwrap();
+        } else {
+            r.end().unwrap();
+        }
+    }
+
+    #[test]
+    fn the_quit_path_never_changes_the_handler_where_exit_keeps_it() {
+        let d = tempfile::tempdir().unwrap();
+        let r = fake_relay(d.path());
+        fake(|s| s.keep_at_exit = true);
+        r.begin("a1", "Work", DIR).unwrap();
+        let (takes, restores) = fake(|s| (s.take_calls, s.restore_calls));
+        end_at_exit(&r);
+        assert_eq!(fake(|s| (s.take_calls, s.restore_calls)), (takes, restores));
+        assert_eq!(fake(|s| s.current.clone()).as_deref(), Some(US));
+        assert!(r.state().unwrap().restore_pending);
+        // Quitting again with the restore still pending changes nothing either.
+        end_at_exit(&r);
+        assert_eq!(fake(|s| (s.take_calls, s.restore_calls)), (takes, restores));
+    }
+
+    #[test]
+    fn the_quit_path_gives_the_handler_back_where_exit_restores() {
+        let d = tempfile::tempdir().unwrap();
+        let r = fake_relay(d.path());
+        r.begin("a1", "Work", DIR).unwrap();
+        end_at_exit(&r);
+        assert_eq!(fake(|s| s.restore_calls), 1);
+        assert_eq!(fake(|s| s.current.clone()).as_deref(), Some(CLAUDE_APP));
+        assert_eq!(r.state(), None);
+        // Where each change asks the user, quitting never restores either.
+        r.begin("a1", "Work", DIR).unwrap();
+        fake(|s| s.consent = true);
+        end_at_exit(&r);
+        assert_eq!(fake(|s| s.restore_calls), 1);
+        assert!(r.state().unwrap().restore_pending);
     }
 
     #[test]

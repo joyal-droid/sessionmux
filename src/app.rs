@@ -1372,14 +1372,15 @@ fn end_sign_in(st: &mut AppState, reason: &str) {
     });
 }
 
-/// Quitting ends the sign-in routing without waiting for the user. Where handler changes ask
-/// nobody, the relay worker gives the handler back now (waited for, after any change already
-/// queued); where each change asks the user, the restore is left to the next start.
+/// Quitting ends the sign-in routing without waiting for the user. Where quitting gives the
+/// handler back, the relay worker does it now (waited for, after any change already queued);
+/// elsewhere, and wherever each change asks the user, the restore is left to the next start and
+/// the handler is not touched.
 fn end_relay_at_exit(st: &mut AppState, why: &str) {
     if st.relay.state().is_none() {
         return;
     }
-    let r = if <Os as UrlHandler>::changes_need_consent() {
+    let r = if Relay::<Os>::exit_defers_restore() {
         st.relay.defer_restore()
     } else {
         relay_job_wait(st, |rl| rl.end(), EXIT_RESTORE_WAIT)

@@ -224,6 +224,9 @@ pub trait UrlHandler {
     fn is_us(h: &HandlerId) -> bool;
     /// True where each handler change asks the user. Sign-in routing is off by default there.
     fn changes_need_consent() -> bool;
+    /// True where quitting or logging out gives the handler back right away; false where the
+    /// restore is left to the next start.
+    fn restore_at_exit() -> bool;
     /// How often one sign-in takes the handler back after Claude claimed it again: `None` = every
     /// time. Where changes need consent, never.
     fn retake_limit() -> Option<u32>;
