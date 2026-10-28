@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist of Sessionmux.app, filled in by scripts/bundle-macos.sh: the short version string
+  gets the full version (for example 1.1.0-preview.1) and CFBundleVersion its numeric part
+  (1.1.0), because CFBundleVersion takes numbers only. LSMultipleInstancesProhibited must never
+  be added: macOS applies it across every logged-in user, so a second user on the same Mac could
+  not open Sessionmux. Sessionmux keeps one copy per user with its own lock file instead, and
+  the bundle script refuses the key.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Sessionmux</string>
+	<key>CFBundleName</key>
+	<string>Sessionmux</string>
+	<key>CFBundleExecutable</key>
+	<string>Sessionmux</string>
+	<key>CFBundleIconFile</key>
+	<string>Sessionmux</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.joyal-droid.sessionmux</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@BUNDLE_VERSION@</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSSupportsAutomaticTermination</key>
+	<false/>
+	<key>NSSupportsSuddenTermination</key>
+	<false/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright (c) 2026 joyal-droid. CPAL-1.0. Powered by Sessionmux.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Sessionmux sends a sign-in link to the Claude account that is signing in.</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>Claude sign-in links</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>claude</string>
+			</array>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+		</dict>
+	</array>
+</dict>
+</plist>

@@ -1,6 +1,7 @@
 # Build output
 /target
 /dist
+/dist-macos
 *.rs.bk
 *.pdb
 
