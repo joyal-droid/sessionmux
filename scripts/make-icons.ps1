@@ -22,8 +22,8 @@
 
 <#
 .SYNOPSIS
-  Draws assets\icon.ico (the application icon) and assets\tray.ico (the notification area icon)
-  from the Sessionmux mark.
+  Draws assets\icon.ico (the application icon), assets\tray.ico (the notification area icon) and
+  the macOS images in assets\macos from the Sessionmux mark.
 
 .DESCRIPTION
   The mark is a rounded tile (24-unit grid, x and y 3.5 to 20.5, corner radius 3.7) split by a
@@ -39,8 +39,17 @@
   Every frame is drawn with System.Drawing and stored as a PNG entry; the ICO container is
   written here, and each file is loaded back with System.Drawing.Icon as a check. The frames are
   also saved as PNG files to -Frames (by default a folder in the temporary directory, outside the
-  repository) for review. build.rs embeds both icons. Regenerate after the mark changes, from the
-  repository root:
+  repository) for review. build.rs embeds both icons.
+
+  For macOS, assets\macos\Sessionmux.iconset holds the application icon as the ten PNG files
+  the system's icon format is built from (16, 32, 128, 256 and 512 points, each also at twice
+  the pixels as @2x), drawn like icon.ico; the macOS build turns the folder into Sessionmux.icns.
+  assets\macos\trayTemplate.png (18 x 18) and trayTemplate@2x.png (36 x 36) are the menu bar
+  icon: the small variant of the mark in black on transparent, which macOS tints for light and
+  dark menu bars. Each PNG records 72 dpi, or 144 dpi for @2x files, so its size in points is
+  its 1x size.
+
+  Regenerate after the mark changes, from the repository root:
 
     .\scripts\make-icons.ps1
 #>
@@ -82,17 +91,22 @@ function New-Panes([float]$d) {
 }
 
 # Draws the mark so that its tile covers the square at ($x, $y) with side $side: both panes are
-# filled by one gradient laid over the tile bounds, so the colour runs on across the gap.
-function Draw-Mark($g, [float]$x, [float]$y, [float]$side, [bool]$small) {
+# filled by one gradient laid over the tile bounds, so the colour runs on across the gap. With
+# $solid (a colour) both panes are filled with that colour instead.
+function Draw-Mark($g, [float]$x, [float]$y, [float]$side, [bool]$small, $solid = $null) {
     $k = $side / $Tile.Size
     $m = New-Object System.Drawing.Drawing2D.Matrix
     $m.Translate($x - $Tile.X * $k, $y - $Tile.X * $k)
     $m.Scale($k, $k)
     $d = if ($small) { $SmallWiden } else { 0 }
     $panes = New-Panes $d
-    $bounds = New-Object System.Drawing.RectangleF(($x - 0.5), ($y - 0.5), ($side + 1), ($side + 1))
-    $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush($bounds, $violet, $blue, [float]45, $true)
-    $brush.WrapMode = [System.Drawing.Drawing2D.WrapMode]::TileFlipXY
+    if ($null -ne $solid) {
+        $brush = New-Object System.Drawing.SolidBrush($solid)
+    } else {
+        $bounds = New-Object System.Drawing.RectangleF(($x - 0.5), ($y - 0.5), ($side + 1), ($side + 1))
+        $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush($bounds, $violet, $blue, [float]45, $true)
+        $brush.WrapMode = [System.Drawing.Drawing2D.WrapMode]::TileFlipXY
+    }
     foreach ($p in $panes) {
         $p.Transform($m)
         $g.FillPath($brush, $p)
@@ -120,6 +134,49 @@ function New-Frame([int]$size) {
         Draw-Mark $g $margin $margin ($size - 2 * $margin) ($size -le 24)
     } finally { $g.Dispose() }
     return $bmp
+}
+
+# One menu bar template frame: the small variant of the mark in black, one pixel in from each
+# edge per 18 pixels, on a transparent background.
+function New-TemplateFrame([int]$size) {
+    $bmp, $g = New-Canvas $size
+    try {
+        $margin = [int]($size / 18)
+        Draw-Mark $g $margin $margin ($size - 2 * $margin) $true ([System.Drawing.Color]::Black)
+    } finally { $g.Dispose() }
+    return $bmp
+}
+
+# Saves $bmp as a PNG file recording $dpi, and a copy to the frames folder as macos-<name>.
+function Save-Png($bmp, [string]$path, [int]$dpi) {
+    $bmp.SetResolution($dpi, $dpi)
+    $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+    [System.IO.File]::Copy($path, (Join-Path $script:FrameDir ('macos-' + (Split-Path -Leaf $path))), $true)
+}
+
+# Writes the macOS images to $macDir (see the description).
+function Write-MacImages([string]$macDir) {
+    $iconset = Join-Path $macDir 'Sessionmux.iconset'
+    [void](New-Item -ItemType Directory -Force -Path $iconset)
+    foreach ($pt in @(16, 32, 128, 256, 512)) {
+        foreach ($scale in @(1, 2)) {
+            $suffix = if ($scale -eq 2) { '@2x' } else { '' }
+            $bmp = New-Frame ($pt * $scale)
+            try {
+                Save-Png $bmp (Join-Path $iconset ('icon_{0}x{0}{1}.png' -f $pt, $suffix)) (72 * $scale)
+            } finally { $bmp.Dispose() }
+        }
+    }
+    foreach ($scale in @(1, 2)) {
+        $suffix = if ($scale -eq 2) { '@2x' } else { '' }
+        $bmp = New-TemplateFrame (18 * $scale)
+        try {
+            Save-Png $bmp (Join-Path $macDir ('trayTemplate{0}.png' -f $suffix)) (72 * $scale)
+        } finally { $bmp.Dispose() }
+    }
+    $count = (Get-ChildItem $iconset -Filter '*.png').Count
+    if ($count -ne 10) { throw "Sessionmux.iconset: expected 10 PNG files, found $count" }
+    Write-Host ("macos: Sessionmux.iconset {0} PNG files, trayTemplate 18/36 px" -f $count)
 }
 
 # Writes an ICO file whose entries are PNG images: ICONDIR, one ICONDIRENTRY per image (a side of
@@ -181,4 +238,5 @@ $script:FrameDir = [System.IO.Path]::GetFullPath($Frames)
 [void](New-Item -ItemType Directory -Force -Path $script:FrameDir)
 Write-Ico (Join-Path $dir 'icon.ico') @(16, 20, 24, 32, 40, 48, 64, 128, 256) { param($s) New-Frame $s }
 Write-Ico (Join-Path $dir 'tray.ico') @(16, 20, 24, 32, 48) { param($s) New-Frame $s }
+Write-MacImages (Join-Path $dir 'macos')
 Write-Host ("frames: {0} PNG files" -f (Get-ChildItem $script:FrameDir -Filter '*.png').Count)
