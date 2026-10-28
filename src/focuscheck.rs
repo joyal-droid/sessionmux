@@ -806,7 +806,8 @@ mod tests {
         let out = Outcome { setup: Some("no window"), ..out };
         assert_eq!(judge(&out).0, "unproven");
         let plain = step(Via::Panel, Expect::Front);
-        let out = Outcome { step: &plain, setup: None, target: Some("no row"), ..out };
+        let elsewhere = Seen::default();
+        let out = Outcome { step: &plain, setup: None, target: Some("no row"), before: &elsewhere, ..out };
         assert_eq!(judge(&out).0, "fail");
     }
 
