@@ -31,6 +31,14 @@ on Windows, and a [preview for macOS](#macos-preview) built from the same code.
 
 ⭐ If Sessionmux saves you a log-out, star the repo — it helps others find it.
 
+## See it in action
+
+| Switch accounts from the floating button | Move a session to another account |
+| --- | --- |
+| ![The floating button opens the panel, a click on Personal brings the Personal window forward and the button changes from WO to PE](docs/demo/switch.gif) | ![On the Sessions tab, the Work session Quarterly report is moved to Client with Move to, and then appears under Client](docs/demo/transfer.gif) |
+| **Approve a waiting step** | **Hand over a session at the limit** |
+| ![The floating button shows a waiting badge, the panel opens on the approval card for npm test and a click on Allow clears it](docs/demo/approve.gif) | ![Client shows its usage limit, and its session Quarterly report is handed over to Work from the session menu](docs/demo/handover.gif) |
+
 ## Why Sessionmux
 
 Claude Desktop runs one account at a time. Switching means logging out and back in, which closes
