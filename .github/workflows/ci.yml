@@ -290,14 +290,26 @@ jobs:
           sh scripts/bundle-macos.sh 0.0.0-ci dist-macos 2>&1 | tee ci-logs/bundle.log \
             || { echo 'Bundle' > ci-logs/bundle.failed; exit 1; }
 
+      # The scan's report is kept in ci-logs/ (without the lines that mask the private terms),
+      # so its hits are reported as annotations when it fails.
       - name: Privacy scan
-        shell: pwsh
         env:
           # Extra words for the privacy scan that are kept out of the repository (optional secret).
           SESSIONMUX_PRIVACY_TERMS: ${{ secrets.SESSIONMUX_PRIVACY_TERMS }}
         run: |
-          & ./scripts/check-binary-privacy.ps1 dist-macos/Sessionmux.app dist-macos/BUILDINFO-macOS.txt
-          exit $LASTEXITCODE
+          mkdir -p ci-logs
+          set +e
+          pwsh -NoProfile -File scripts/check-binary-privacy.ps1 dist-macos/Sessionmux.app dist-macos/BUILDINFO-macOS.txt \
+            > ci-logs/privacy.raw 2>&1
+          code=$?
+          set -e
+          cat ci-logs/privacy.raw
+          grep -v '^::add-mask::' ci-logs/privacy.raw > ci-logs/privacy.log || true
+          rm -f ci-logs/privacy.raw
+          if [ "$code" -ne 0 ]; then
+            echo 'Privacy scan' > ci-logs/privacy.failed
+            exit 1
+          fi
 
       - name: SHA-256 of the macOS files
         run: cat dist-macos/SHA256SUMS-macos
@@ -397,7 +409,7 @@ jobs:
             perl -i -ne 'print unless /^successes:$/ .. /^(failures:|test result:.*)$/' "$plain"
             # The failing tests and compiler errors first, then the end of the output, in pieces
             # small enough for one annotation each.
-            { grep -E -A8 '^---- |panicked at|^error(\[|:)|^bundle-macos: ' "$plain" | head -n 400; echo '[...]'; tail -n 25 "$plain"; } \
+            { grep -E -A8 '^---- |panicked at|^error(\[|:)|^bundle-macos: |^FOUND |^check-binary-privacy: ' "$plain" | head -n 400; echo '[...]'; tail -n 25 "$plain"; } \
               > "$f.txt"
             split -b 3500 "$f.txt" "$f.part."
             for p in $(ls "$f".part.* | head -n 8); do
