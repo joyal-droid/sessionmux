@@ -74,8 +74,13 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------- patterns
 # Strings that are public on purpose. They are blanked out (same length, so offsets stay exact)
 # before the patterns run.
-# The drive-letter path is a literal in the app's own source (an example in a comment).
-$Allowed = @('joyal-droid', 'C:\a\b\')
+# The drive-letter paths are literals in the app's own source: an example in a comment and the
+# folders of the self-check's demo data.
+$Allowed = @('joyal-droid', 'C:\a\b\', 'C:\Projects\')
+# The handle can also be stored in pieces: a compiler may write a short string constant with a
+# few eight-byte immediate stores, in any order, so "om/joyal" (from github.com/joyal-droid) and
+# "-droid/s" end up apart. The name part right after "om/" counts as the handle.
+$AllowedSplit = @('(?<=om/)joyal')
 
 $Patterns = New-Object System.Collections.Generic.List[object]
 function Add-Pattern([string]$name, [string]$regex) {
@@ -154,6 +159,9 @@ $Latin1 = [System.Text.Encoding]::GetEncoding(28591)
 function Hide-Allowed([string]$text) {
   foreach ($a in $Allowed) {
     $text = [regex]::Replace($text, [regex]::Escape($a), { param($m) '#' * $m.Length }, 'IgnoreCase')
+  }
+  foreach ($a in $AllowedSplit) {
+    $text = [regex]::Replace($text, $a, { param($m) '#' * $m.Length }, 'IgnoreCase')
   }
   return $text
 }

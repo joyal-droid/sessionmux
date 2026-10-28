@@ -291,7 +291,9 @@ jobs:
             || { echo 'Bundle' > ci-logs/bundle.failed; exit 1; }
 
       # The scan's report is kept in ci-logs/ (without the lines that mask the private terms),
-      # so its hits are reported as annotations when it fails.
+      # so its hits are reported as annotations when it fails. Everything in the app except the
+      # icon is scanned: the icon is compressed image data packed from the PNG files in
+      # assets/macos/Sessionmux.iconset, where short random byte runs can look like a pattern.
       - name: Privacy scan
         env:
           # Extra words for the privacy scan that are kept out of the repository (optional secret).
@@ -299,8 +301,9 @@ jobs:
         run: |
           mkdir -p ci-logs
           set +e
-          pwsh -NoProfile -File scripts/check-binary-privacy.ps1 dist-macos/Sessionmux.app dist-macos/BUILDINFO-macOS.txt \
-            > ci-logs/privacy.raw 2>&1
+          c=dist-macos/Sessionmux.app/Contents
+          pwsh -NoProfile -File scripts/check-binary-privacy.ps1 "$c/MacOS" "$c/Info.plist" "$c/PkgInfo" \
+            "$c/_CodeSignature" dist-macos/BUILDINFO-macOS.txt > ci-logs/privacy.raw 2>&1
           code=$?
           set -e
           cat ci-logs/privacy.raw

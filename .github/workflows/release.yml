@@ -358,12 +358,16 @@ jobs:
       - name: Build and package
         run: sh scripts/bundle-macos.sh "$VERSION" dist-macos
 
+      # Everything in the app except the icon, which is compressed image data packed from the PNG
+      # files in assets/macos/Sessionmux.iconset (short random byte runs there can look like a
+      # pattern).
       - name: Privacy scan
         shell: pwsh
         env:
           SESSIONMUX_PRIVACY_TERMS: ${{ secrets.SESSIONMUX_PRIVACY_TERMS }}
         run: |
-          & ./scripts/check-binary-privacy.ps1 dist-macos/Sessionmux.app dist-macos/BUILDINFO-macOS.txt
+          $c = 'dist-macos/Sessionmux.app/Contents'
+          & ./scripts/check-binary-privacy.ps1 "$c/MacOS" "$c/Info.plist" "$c/PkgInfo" "$c/_CodeSignature" dist-macos/BUILDINFO-macOS.txt
           exit $LASTEXITCODE
 
       # The macOS part of the release notes; the publish job puts it right after the Windows
