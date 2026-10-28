@@ -61,9 +61,10 @@ use crate::platform::{ClaudeInstall, Closer, Focus, FocusResult, Launcher, Os, P
 use crate::util::{json, log, paths};
 
 /// Whether starting Claude again on a data folder that already runs hands over to the running
-/// instance (which then shows its window or opens the link) and exits. It does not: the second
-/// process keeps running beside the first. While this is false, nothing ever starts Claude on a
-/// folder that already runs.
+/// instance (which then shows its window or opens the link) and exits. It does not, whether the
+/// second start goes through Launch Services or runs the executable directly: the second process
+/// keeps running beside the first on the same folder. While this is false, nothing ever starts
+/// Claude on a folder that already runs.
 pub(crate) const RELAUNCH_HANDOFF: bool = false;
 
 /// Claude Desktop's bundle id.
