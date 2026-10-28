@@ -230,9 +230,14 @@ above.
 
 **Uninstalling.** In **Settings**, choose **Remove Sessionmux's changes** (it removes the hook
 entries, gives `claude://` links back to Claude and turns off Open at login), then quit Sessionmux
-and move it to the Trash. Without the panel, the same is done in Terminal by
-`/Applications/Sessionmux.app/Contents/MacOS/Sessionmux --remove-hooks` followed by
-`/Applications/Sessionmux.app/Contents/MacOS/Sessionmux --end-relay`.
+and move it to the Trash. Without the panel, Terminal can remove the hook entries with
+`/Applications/Sessionmux.app/Contents/MacOS/Sessionmux --remove-hooks` and end a sign-in that is
+still under way with `/Applications/Sessionmux.app/Contents/MacOS/Sessionmux --end-relay`. These
+commands leave Open at login alone: turn it off in Settings first, or remove Sessionmux from
+**System Settings > General > Login Items** (and delete
+`~/Library/LaunchAgents/io.github.joyal-droid.sessionmux.plist` if it exists). If you refused
+earlier to give the links back to Claude, `--end-relay` leaves them as they are; use **Remove
+Sessionmux's changes** in the panel instead.
 Your accounts' Claude data folders and `~/Library/Application Support/Sessionmux` are kept; delete
 them yourself if you no longer need them.
 
