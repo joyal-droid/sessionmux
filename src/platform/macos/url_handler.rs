@@ -638,12 +638,18 @@ mod tests {
         fn LSRegisterURL(url: *const c_void, update: u8) -> i32;
     }
 
-    /// Tell Launch Services about the app at `app`.
+    const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/\r
+                              LaunchServices.framework/Support/lsregister";
+
+    /// Tell Launch Services about the app at `app`, including the schemes it declares.
     fn register(app: &Path) {
-        let url = NSURL::fileURLWithPath_isDirectory(&NSString::from_str(&app.to_string_lossy()), true);
-        // SAFETY: an NSURL is accepted wherever a CFURL is; `url` lives for the call.
-        let status = unsafe { LSRegisterURL(objc2::rc::Retained::as_ptr(&url).cast(), 1) };
-        assert_eq!(status, 0, "LSRegisterURL {}", app.display());
+        let forced = std::process::Command::new(LSREGISTER).arg("-f").arg(app).status();
+        if !forced.is_ok_and(|s| s.success()) {
+            let url = NSURL::fileURLWithPath_isDirectory(&NSString::from_str(&app.to_string_lossy()), true);
+            // SAFETY: an NSURL is accepted wherever a CFURL is; `url` lives for the call.
+            let status = unsafe { LSRegisterURL(objc2::rc::Retained::as_ptr(&url).cast(), 1) };
+            assert_eq!(status, 0, "LSRegisterURL {}", app.display());
+        }
     }
 
     /// Copy the stand-in Claude.app to `dir/<name>.app` under a bundle id no other copy has.
@@ -700,6 +706,10 @@ mod tests {
         let second = app_copy(&f, &root, "Second");
         register(&first);
         register(&second);
+        assert!(
+            wait_for(10, || Os::current(fake::SCHEME).is_some()),
+            "Launch Services lists no app for the test scheme after registering two"
+        );
 
         let (a, b) = (first.clone(), second.clone());
         let worker = std::thread::spawn(move || {
