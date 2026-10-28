@@ -6,6 +6,16 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- A click on an account whose Claude window is in front (in the panel, on the floating button or
+  in the tray or menu bar menu) minimises that window, as a click on a taskbar button does; the
+  next click brings it back. On macOS this needs **Bring minimised Claude windows to the front**
+  (Accessibility): macOS does not let Sessionmux hide another app, so without it the click brings
+  the window forward as before.
+- The Accounts tab shows the shortcut that shows or hides the panel under its buttons, while that
+  shortcut is registered.
+
 ## [1.1.0-preview.2] - 2026-10-28
 
 The second macOS preview, again a GitHub pre-release built from the `macos` branch, with a Windows

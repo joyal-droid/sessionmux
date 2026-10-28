@@ -2790,12 +2790,16 @@ function initPanel() {
         parts.map((p) => h('kbd', { text: p }))));
   }
 
-  /** The quiet show/hide shortcut line under the Accounts footer buttons; hidden without a shortcut. */
+  /**
+   * The quiet show/hide shortcut line under the Accounts footer buttons; hidden without a
+   * shortcut, or when the system did not register it (another app holds the same keys).
+   */
   function renderHotkeyHint() {
     const hint = $('hotkeyHint');
     if (!hint) return;
     const mac = onMac();
-    const parts = hotkeyParts(state.settings && state.settings.hotkey, mac);
+    const registered = !(state.settings && state.settings.hotkeyRegistered === false);
+    const parts = registered ? hotkeyParts(state.settings && state.settings.hotkey, mac) : [];
     hint.textContent = '';
     hint.hidden = parts.length === 0;
     if (!parts.length) return;

@@ -264,6 +264,8 @@ pub struct AppState {
     /// The system reports each change of the app in front, so `last_front` is kept from those
     /// reports and no longer from the poll, which can be up to one poll old.
     front_tracked: bool,
+    /// The show/hide shortcut was registered at start (another app may hold the same keys).
+    hotkey_registered: bool,
     last_opened: Option<String>,
     last_accounts_json: String,
     last_discovered: Vec<Discovered>,
@@ -2077,6 +2079,7 @@ fn panel_settings(st: &AppState) -> Value {
         o.insert("autoHandover".into(), json!(st.settings.auto_handover));
         o.insert("approveFromPanel".into(), json!(st.settings.approve_from_panel));
         o.insert("appVersion".into(), json!(env!("CARGO_PKG_VERSION")));
+        o.insert("hotkeyRegistered".into(), json!(st.hotkey_registered));
         // What the system says about login start, the window-raising permission and routing.
         o.insert("autostartStatus".into(), json!(<Os as Autostart>::status().as_str()));
         if let Some(trusted) = <Os as Focus>::accessibility_trusted(false) {
@@ -3889,9 +3892,12 @@ pub fn init(hidden: bool) -> Result<(), String> {
             }
         }
     };
+    // The self-check registers no shortcut but shows the panel as a user would see it.
+    let mut hotkey_registered = true;
     if !smoke {
         if let Err(e) = <Os as HotkeyHost>::register(HOTKEY_ID, &settings.hotkey) {
             log::warn(&format!("hotkey {}: {e}", settings.hotkey));
+            hotkey_registered = false;
         }
         if is_packaged() {
             apply_login_item(settings.start_with_windows); // keep the exe path current
@@ -3914,6 +3920,7 @@ pub fn init(hidden: bool) -> Result<(), String> {
         fg_pid,
         last_front: None,
         front_tracked: false,
+        hotkey_registered,
         last_opened: None,
         last_accounts_json: String::new(),
         last_discovered: Vec::new(),
