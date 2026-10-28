@@ -27,7 +27,7 @@ use std::ffi::CStr;
 use std::fs;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -101,6 +101,33 @@ fn no_sigpipe(s: &UnixStream) {
     };
 }
 
+/// Create `dir` (mode 0700) when it is missing, then check it: a folder, not a symbolic link,
+/// owned by this user. Group and other access is removed; anything else is refused. Run before
+/// the folder holds the lock or the socket.
+pub(super) fn secure_dir(dir: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(dir) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?
+        }
+        Err(e) => return Err(e),
+    }
+    let meta = fs::symlink_metadata(dir)?;
+    if !meta.file_type().is_dir() {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{} is not a folder", dir.display())));
+    }
+    if meta.uid() != my_uid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} belongs to another user", dir.display()),
+        ));
+    }
+    if meta.mode() & 0o077 != 0 {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 /// A socket served by this user, ready for use; any other peer is refused.
 fn checked(s: UnixStream) -> io::Result<UnixStream> {
     if peer_uid(&s) != Some(my_uid()) {
@@ -135,30 +162,32 @@ impl IpcTransport for Os {
         }
     }
 
-    /// A stale socket nobody serves is replaced; a live one makes this fail. The socket file is
-    /// readable and writable by the owner only.
+    /// The socket's folder is checked first ([`secure_dir`]). A stale socket of this user that
+    /// nobody serves is replaced; a live one makes this fail. The socket file is created readable
+    /// and writable by the owner only.
     fn listen(endpoint: &str) -> io::Result<Listener> {
         if endpoint.is_empty() {
             return Err(io::Error::other("the socket has no path"));
         }
         let path = PathBuf::from(endpoint);
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty() && !d.exists()) {
-            fs::create_dir_all(dir)?;
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            secure_dir(dir)?;
         }
         if let Ok(meta) = fs::symlink_metadata(&path) {
             if UnixStream::connect(&path).is_ok() {
                 return Err(io::Error::new(io::ErrorKind::AddrInUse, "another server holds the socket"));
             }
-            if !meta.file_type().is_socket() {
+            if !meta.file_type().is_socket() || meta.uid() != my_uid() {
                 return Err(io::Error::new(io::ErrorKind::AlreadyExists, "the socket path is taken by a file"));
             }
             fs::remove_file(&path)?;
         }
-        let inner = UnixListener::bind(&path)?;
-        let listener = Listener { inner, path };
-        fs::set_permissions(&listener.path, fs::Permissions::from_mode(0o600))?;
-        Ok(listener)
+        // SAFETY: umask only swaps the process file-creation mask; the old one is put back below.
+        let old = unsafe { libc::umask(0o177) };
+        let bound = UnixListener::bind(&path);
+        // SAFETY: as above.
+        unsafe { libc::umask(old) };
+        Ok(Listener { inner: bound?, path })
     }
 
     fn accept(l: &mut Listener) -> io::Result<Option<UnixStream>> {
@@ -176,6 +205,11 @@ impl IpcTransport for Os {
             return Err(io::Error::new(io::ErrorKind::NotFound, "the socket has no path"));
         }
         let path = Path::new(endpoint);
+        // Only a socket file of this user is ever connected to.
+        let meta = fs::symlink_metadata(path)?;
+        if !meta.file_type().is_socket() || meta.uid() != my_uid() {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the socket is not this user's"));
+        }
         loop {
             match UnixStream::connect(path) {
                 Ok(s) => return checked(s),
@@ -265,6 +299,33 @@ mod tests {
         let mode = fs::metadata(&name).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         drop(l);
+    }
+
+    #[test]
+    fn the_data_folder_is_private() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("a").join("b");
+        secure_dir(&dir).unwrap();
+        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        secure_dir(&dir).unwrap();
+        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(secure_dir(&link).is_err());
+        let file = d.path().join("file");
+        fs::write(&file, b"").unwrap();
+        assert!(secure_dir(&file).is_err());
+        assert!(Os::listen(&link.join("hook.sock").to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn only_sockets_are_connected_to() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("hook.sock");
+        fs::write(&file, b"").unwrap();
+        let err = Os::connect(&file.to_string_lossy(), Instant::now()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]

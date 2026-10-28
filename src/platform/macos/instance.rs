@@ -24,10 +24,10 @@
 //! the life of the process (the system releases it when the process ends, also on a crash). A
 //! second start asks the first one to show its panel over the hook socket.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -54,9 +54,8 @@ fn lock_path() -> PathBuf {
 /// The lock file at `path` opened and locked; `Ok(None)` while another holder has it.
 fn try_lock(path: &Path, create: bool) -> io::Result<Option<File>> {
     if create {
-        if let Some(dir) = path.parent().filter(|d| !d.exists()) {
-            fs::create_dir_all(dir)?;
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        if let Some(dir) = path.parent() {
+            super::ipc::secure_dir(dir)?;
         }
     }
     let file = OpenOptions::new().read(true).write(true).create(create).truncate(false).mode(0o600).open(path)?;
@@ -98,6 +97,8 @@ impl SingleInstance for Os {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn the_lock_is_exclusive_while_held() {
