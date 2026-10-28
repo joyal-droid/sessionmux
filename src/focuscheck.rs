@@ -31,9 +31,11 @@
 //! surface it is opened from (`via`: `panel` — a click on its row in the panel; `bubble` — a
 //! click on its avatar in the floating button's mini tray; `posted` — opened from posted work
 //! with no input event at all), what must happen (`expect`: `front` — its Claude window ends up
-//! in front; `visible-failure` — the open fails and the panel shows why; `record` — nothing is
-//! judged), optionally a settings patch applied first (`settings`) and whether a window of the
-//! account must be on screen before the click (`windowBefore`).
+//! in front; `minimised` — its Claude window was in front and the click put it away: minimised
+//! or the app hidden, no window of it on screen any more; `visible-failure` — the open fails and
+//! the panel shows why; `record` — nothing is judged), optionally a settings patch applied first
+//! (`settings`) and whether a window of the account must be on screen before the click
+//! (`windowBefore`).
 //!
 //! For every step:
 //! 1. the script arranges the windows and writes `<sync>/<name>.go`, optionally with a JSON
@@ -198,6 +200,7 @@ impl Via {
 #[serde(rename_all = "kebab-case")]
 enum Expect {
     Front,
+    Minimised,
     VisibleFailure,
     Record,
 }
@@ -226,6 +229,8 @@ struct Seen {
     /// Whether one of them has a normal window off screen (minimised, closed to the Dock, on
     /// another Space).
     target_off_screen: bool,
+    /// Whether one of them is hidden.
+    target_hidden: bool,
     panel_visible: bool,
 }
 
@@ -233,6 +238,15 @@ impl Seen {
     fn target_in_front(&self) -> bool {
         let is_target = |p: Option<Pid>| p.is_some_and(|p| self.target_pids.contains(&p));
         is_target(self.front_app_pid) && is_target(self.top_window_pid) && self.target_on_screen
+    }
+
+    /// The account's Claude shows no window: none on screen, none in front. Its app may stay the
+    /// active one only with its window minimised to the Dock (as after Minimise in its menu); a
+    /// hidden app never is.
+    fn target_put_away(&self) -> bool {
+        let is_target = |p: Option<Pid>| p.is_some_and(|p| self.target_pids.contains(&p));
+        let minimised = self.target_off_screen && !self.target_hidden;
+        !self.target_on_screen && !is_target(self.top_window_pid) && (!is_target(self.front_app_pid) || minimised)
     }
 }
 
@@ -265,6 +279,9 @@ fn judge(o: &Outcome) -> (&'static str, String) {
     if o.step.expect == Expect::Front && o.before.target_in_front() {
         return ("unproven", "the account's Claude window was already in front before the click".into());
     }
+    if o.step.expect == Expect::Minimised && !o.before.target_in_front() {
+        return ("unproven", format!("the account's Claude window was not in front before the click: {:?}", o.before));
+    }
     if let Some(e) = o.target {
         return ("fail", format!("the click target could not be found: {e}"));
     }
@@ -296,6 +313,20 @@ fn judge(o: &Outcome) -> (&'static str, String) {
                 ("fail", format!("the open replied ok but the account's window is not in front: {:?}", o.after))
             } else {
                 ("pass", "the account's Claude window is in front".into())
+            }
+        }
+        Expect::Minimised => {
+            if !ok {
+                ("fail", format!("the open failed: {} ({reason})", reply["error"].as_str().unwrap_or("")))
+            } else if reply["minimised"] != true {
+                ("fail", format!("the open did not minimise the window: {}", open["note"]))
+            } else if !o.after.target_put_away() {
+                ("fail", format!("the open replied minimised but the account's window still shows: {:?}", o.after))
+            } else if !o.toasts.is_empty() {
+                ("fail", format!("the panel shows a message: {:?}", o.toasts))
+            } else {
+                let how = if o.after.target_hidden { "the app is hidden" } else { "the window is minimised" };
+                ("pass", format!("the account's Claude window was put away ({how})"))
             }
         }
         Expect::VisibleFailure => {
@@ -442,12 +473,14 @@ fn observe(dir: Option<&str>) -> Seen {
     let target_pids = target_pids(dir);
     let target_on_screen = target_pids.iter().any(|&p| <Os as Windows>::main_window(p).is_some());
     let target_off_screen = target_pids.iter().any(|&p| platform::window::has_off_screen_window(p));
+    let target_hidden = target_pids.iter().any(|&p| platform::window::app_hidden(p));
     Seen {
         front_app_pid: <Os as Windows>::foreground_pid(),
         top_window_pid: platform::window::front_window_owner(),
         target_pids,
         target_on_screen,
         target_off_screen,
+        target_hidden,
         panel_visible: on_main(|| app::check_panel().is_some_and(|(_, visible, _)| visible)).unwrap_or(false),
     }
 }
@@ -762,6 +795,52 @@ mod tests {
     }
 
     #[test]
+    fn minimised_needs_the_window_in_front_before_and_put_away_after() {
+        let s = step(Via::Panel, Expect::Minimised);
+        let c = Clicked { posted: true, detail: String::new() };
+        let put = |reply: Value| json!({ "account": "a", "via": "panel", "note": "", "panelVisibleAtReply": true, "reply": reply });
+        let minimised = put(json!({ "ok": true, "minimised": true }));
+        let judged = |before: &Seen, open: &Value, after: &Seen, toasts: &[String]| {
+            judge(&Outcome {
+                step: &s,
+                setup: None,
+                target: None,
+                before,
+                clicked: Some(&c),
+                clicks: 1,
+                open: Some(open),
+                after,
+                toasts,
+            })
+            .0
+        };
+        let in_front = front(&[7], true);
+        // Hidden: nothing of it on screen, another app in front.
+        let hidden = Seen {
+            front_app_pid: Some(3),
+            top_window_pid: Some(3),
+            target_pids: vec![7],
+            target_off_screen: true,
+            target_hidden: true,
+            ..Seen::default()
+        };
+        assert_eq!(judged(&in_front, &minimised, &hidden, &[]), "pass");
+        // Minimised to the Dock: the app may stay active, with no window on screen.
+        let docked = Seen { front_app_pid: Some(7), target_hidden: false, ..hidden.clone() };
+        assert_eq!(judged(&in_front, &minimised, &docked, &[]), "pass");
+        // Hidden yet reported in front, or a window still on screen: not put away.
+        let odd = Seen { front_app_pid: Some(7), ..hidden.clone() };
+        assert_eq!(judged(&in_front, &minimised, &odd, &[]), "fail");
+        assert_eq!(judged(&in_front, &minimised, &in_front, &[]), "fail");
+        // Brought forward instead, a failure or a message in the panel.
+        assert_eq!(judged(&in_front, &put(json!({ "ok": true })), &hidden, &[]), "fail");
+        assert_eq!(judged(&in_front, &put(json!({ "ok": false, "error": "e", "reason": "r" })), &hidden, &[]), "fail");
+        assert_eq!(judged(&in_front, &minimised, &hidden, &["Couldn't switch".to_string()]), "fail");
+        // Not in front before the click: the click proves nothing.
+        assert_eq!(judged(&hidden, &minimised, &hidden, &[]), "unproven");
+    }
+
+    #[test]
     fn a_visible_failure_needs_the_panel_and_a_message() {
         let s = step(Via::Panel, Expect::VisibleFailure);
         let c = Clicked { posted: true, detail: String::new() };
@@ -819,12 +898,14 @@ mod tests {
             "out": "/tmp/out.json", "sync": "/tmp/sync", "waitForRunning": ["main"],
             "steps": [{ "name": "S1", "account": "main", "via": "panel", "expect": "front", "windowBefore": true },
                       { "name": "S6", "account": "main", "via": "posted", "expect": "record" },
+                      { "name": "S8", "account": "main", "via": "panel", "expect": "minimised" },
                       { "name": "S5", "account": "main", "via": "bubble", "expect": "visible-failure" }],
         });
         std::fs::write(&p, plan.to_string()).unwrap();
         let read = read_plan(&p).unwrap();
-        assert_eq!(read.steps.len(), 3);
-        assert_eq!(read.steps[2].expect, Expect::VisibleFailure);
+        assert_eq!(read.steps.len(), 4);
+        assert_eq!(read.steps[2].expect, Expect::Minimised);
+        assert_eq!(read.steps[3].expect, Expect::VisibleFailure);
         assert_eq!(read.steps[0].window_before, Some(true));
         let bad = json!({ "out": "/o", "sync": "/s", "steps": [{ "name": "../x", "account": "a", "via": "panel", "expect": "front" }] });
         std::fs::write(&p, bad.to_string()).unwrap();

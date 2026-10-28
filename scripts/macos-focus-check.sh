@@ -22,8 +22,9 @@
 # interface of every copy and derivative; see docs/attribution.md.
 
 # Checks on this Mac that clicking an account in Sessionmux brings that account's Claude window
-# forward, with the real Claude Desktop and real mouse clicks, and that a click that cannot do so
-# shows why in the panel.
+# forward, with the real Claude Desktop and real mouse clicks, that a click on the account whose
+# window is in front puts that window away and the next click brings it back, and that a click
+# that cannot bring a window forward shows why in the panel.
 #
 # Usage: scripts/macos-focus-check.sh <out-dir>
 #
@@ -53,12 +54,16 @@
 #       S6  opened from posted work, with no input event               recorded
 #       S7  panel row, Second's window closed with Cmd-W, raise setting   must reopen and come forward
 #           on (Accessibility recorded for Sessionmux when the runner lets it)
+#       S8  panel row, Second's window open and Second in front        must be put away: minimised
+#           (with the raise setting on and Accessibility allowed) or Second hidden, no window
+#           of it on screen and no message in the panel
+#       S9  panel row, Second's window as S8 left it                    must come back in front
 #
 # Leaves in <out-dir>: focus-check.json, sessionmux.log, startup.txt, script.log, summary.txt
 # and one screenshot per step. Prints one GitHub notice per step. Exits 0 when the startup log
-# check and the steps S1, S2, S4, S5 and S7 passed, 1 otherwise. A step that could not prove anything
-# (its click never reached Sessionmux, or the windows could not be arranged) is reported as
-# unproven and fails the run too, unless SESSIONMUX_FOCUS_ALLOW_UNPROVEN=1 is set.
+# check and the steps S1, S2, S4, S5, S7, S8 and S9 passed, 1 otherwise. A step that could not
+# prove anything (its click never reached Sessionmux, or the windows could not be arranged) is
+# reported as unproven and fails the run too, unless SESSIONMUX_FOCUS_ALLOW_UNPROVEN=1 is set.
 
 set -uo pipefail
 
@@ -92,8 +97,8 @@ RUNNER_LABEL="${FOCUS_RUNNER:-macOS $(sw_vers -productVersion 2>/dev/null)}"
 SCRIPT_LOG="$OUT/script.log"
 SUMMARY="$OUT/summary.txt"
 # S7 turns the raise setting on for the rest of the run and S5 leaves Second's Claude slow to
-# answer after it is resumed, so S7 runs before S5 and S5 runs last.
-STEPS="S1 S2 S3 S4 S6 S7 S5"
+# answer after it is resumed, so S7 runs before S5 and S5 runs last. S9 starts from what S8 left.
+STEPS="S1 S2 S3 S4 S6 S7 S8 S9 S5"
 STOPPED_PID=""
 
 rm -rf "$WORK"
@@ -208,6 +213,16 @@ restore_windows() {
     sleep 1
 }
 
+# Show a hidden process again and put it in front.
+bring_front() {
+    sysevents -e "set p to first process whose unix id is $1" -e 'set visible of p to true' \
+        -e 'set frontmost of p to true'
+    sleep 2
+}
+
+# The unix id of the app in front, as System Events sees it.
+front_pid() { sysevents -e 'unix id of first process whose frontmost is true'; }
+
 # ---------------------------------------------------------------- hand-shake with Sessionmux
 
 write_atomic() { # file text
@@ -253,7 +268,23 @@ setup_step() {
             textedit_front
             case "$r" in error*) echo "$r" ;; *) echo "note: $r, TextEdit in front" ;; esac
             ;;
+        S8)
+            restore_windows "$second"
+            r="$(bring_front "$second")"
+            if ! has_open_window "$second"; then
+                echo "error: Second's Claude has no open window ($(open_window "$second"); windows: $(window_count "$second"))"
+            elif [ "$(front_pid)" != "$second" ]; then
+                echo "error: Second's Claude did not come to the front (front pid $(front_pid)${r:+, $r})"
+            else
+                echo "note: window open, Second in front"
+            fi
+            ;;
+        S9)
+            echo "note: windows as S8 left them (front pid $(front_pid); windows: $(window_info "$second"))"
+            ;;
         S5)
+            # Second may still be hidden when S9 failed; it is shown again before its window is closed.
+            sysevents -e "set visible of (first process whose unix id is $second) to true" >/dev/null
             # A stopped app's visible window is still brought forward by the window server, so
             # the window is closed first: a stopped Claude cannot show it again.
             restore_windows "$second"
@@ -454,6 +485,8 @@ cat >"$WORK/plan.json" <<JSON
     { "name": "S6", "account": "$SECOND_ID", "via": "posted", "expect": "record", "windowBefore": true },
     { "name": "S7", "account": "$SECOND_ID", "via": "panel", "expect": "front", "windowBefore": false,
       "settings": { "raiseWindowsWithAccessibility": true } },
+    { "name": "S8", "account": "$SECOND_ID", "via": "panel", "expect": "minimised", "windowBefore": true },
+    { "name": "S9", "account": "$SECOND_ID", "via": "panel", "expect": "front", "windowBefore": false },
     { "name": "S5", "account": "$SECOND_ID", "via": "panel", "expect": "visible-failure" }
   ]
 }
@@ -492,10 +525,11 @@ import os
 import sys
 
 path, runner, startup, grant, launch, summary, ax_grant = sys.argv[1:8]
-ASSERTED = {"S1", "S2", "S4", "S5", "S7"}
+ASSERTED = {"S1", "S2", "S4", "S5", "S7", "S8", "S9"}
 ALLOW_UNPROVEN = os.environ.get("SESSIONMUX_FOCUS_ALLOW_UNPROVEN") == "1"
 KEY = ("open ", "claude_app: focus", "claude_app: reopen", "claude_app: activation", "claude_app: Accessibility",
-       "focus check: step", "ipc: openAccount", "bubble event", "panel: hidden")
+       "claude_app: minimise", "claude_app: pid", "focus check: step", "ipc: openAccount", "bubble event",
+       "panel: hidden")
 
 
 def esc(s):
@@ -518,7 +552,7 @@ except Exception as e:  # the check never wrote its result
 if not doc.get("finished"):
     failed.append("the focus check did not finish")
 seen = {s.get("name"): s for s in doc.get("steps", [])}
-for name in ["S1", "S2", "S3", "S4", "S5", "S6", "S7"]:
+for name in ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9"]:
     s = seen.get(name)
     if s is None:
         verdict, why, body = "missing", "the step did not run", ""
@@ -535,6 +569,7 @@ for name in ["S1", "S2", "S3", "S4", "S5", "S6", "S7"]:
             f"before: front={b.get('frontAppPid')} top={b.get('topWindowPid')} target={b.get('targetPids')} "
             f"onScreen={b.get('targetOnScreen')} offScreen={b.get('targetOffScreen')}",
             f"after: front={a.get('frontAppPid')} top={a.get('topWindowPid')} onScreen={a.get('targetOnScreen')} "
+            f"offScreen={a.get('targetOffScreen')} hidden={a.get('targetHidden')} "
             f"panel={a.get('panelVisible')} toasts={json.dumps(s.get('toasts'))}",
             "log:",
             *key[:25],
