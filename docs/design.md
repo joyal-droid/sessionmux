@@ -1,12 +1,13 @@
 # Design
 
-The visual rules for the panel (`web/`) and the floating bubble (`src/ui/bubble.rs`). The look is
+The visual rules for the panel (`web/`) and the floating bubble (`src/ui/bubble/`), the same on
+Windows and macOS. The look is
 called "Dark Glass": a dark, slightly translucent card with flat colour fills.
 
 ## Principles
 
 1. **Flat colours.** Fills, borders and text use solid colours or solid colours with alpha. No
-   gradients anywhere (CSS `*-gradient()` or Direct2D gradient brushes).
+   gradients anywhere (CSS `*-gradient()`, Direct2D or Core Graphics gradients).
 2. **Tokens only.** Every colour, radius, spacing step, font size and duration in CSS comes from a
    custom property in `web/shared.css`. `panel.css` never hard-codes a colour. The bubble uses the
    same values as Rust constants that mirror the dark tokens.
@@ -71,8 +72,8 @@ they stay legible on every palette colour.
 | `--radius-xs` | 8 px | small chips |
 | `--radius-pill` | 999 px | pills, badges, the mini tray |
 | `--s-1` … `--s-6` | 4, 8, 12, 16, 24, 32 px | spacing on an 8 px grid with a 4 px half step |
-| `--font` | Segoe UI Variable Display / Segoe UI | all UI text, weight 400 (500 or 600 for a few emphasised labels) |
-| `--font-mono` | Cascadia Code / Consolas | paths |
+| `--font` | Segoe UI Variable Display / Segoe UI (the system font on macOS) | all UI text, weight 400 (500 or 600 for a few emphasised labels) |
+| `--font-mono` | Cascadia Code / Consolas (the system monospace font on macOS) | paths |
 | `--fs-xs` … `--fs-lg` | 11, 12, 13, 15 px | text sizes (13 px body) |
 
 The panel is 380 × 580 DIP: a header with the Sessionmux mark and name and three tabs (Accounts,
@@ -81,7 +82,8 @@ Sessions, Settings), then a scrolling view. Focus is always visible (`--focus-ri
 
 ## Bubble
 
-All sizes are DIP and scale with the monitor DPI.
+All sizes are DIP (points on macOS) and scale with the monitor DPI (the display's backing scale
+on macOS). The macOS bubble draws its text with the system font at the same sizes.
 
 - **Icon mode** (80 × 80 window): a 52 px circle in the active account's colour with its initials
   (15 px), a 2.5 px `#8A7CFF` ring, a soft shadow made of three concentric translucent rings, and a

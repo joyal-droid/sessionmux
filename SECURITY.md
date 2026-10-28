@@ -7,6 +7,7 @@ Security fixes go into the latest release. Please update to it before reporting.
 | Version | Supported |
 | --- | --- |
 | 1.0.x | yes |
+| 1.1.0 previews (macOS preview) | yes, on a best-effort basis while the macOS app is a preview |
 
 ## Reporting a vulnerability
 
@@ -18,9 +19,10 @@ Report them privately through GitHub's private vulnerability reporting:
 
 Include:
 
-- the Sessionmux version (**Settings > About**) and the Windows version,
+- the Sessionmux version (**Settings > About**) and the Windows or macOS version,
 - what an attacker can do and the steps to reproduce it,
-- relevant lines from `%APPDATA%\Sessionmux\sessionmux.log`, with personal data removed.
+- relevant lines from `%APPDATA%\Sessionmux\sessionmux.log` (on macOS
+  `~/Library/Application Support/Sessionmux/sessionmux.log`), with personal data removed.
 
 You can expect an acknowledgement within 7 days and an assessment within 30 days. Fixes are
 released as a new version and credited in the advisory unless you prefer otherwise.
@@ -32,7 +34,8 @@ not paid.
 
 This section describes what Sessionmux does on your PC, in terms you can check yourself in the
 source, with Process Monitor or with the Windows tools named below. It describes the code in this
-repository; it is not a promise that the code is free of bugs.
+repository; it is not a promise that the code is free of bugs. The macOS app follows the same
+model; what differs is in [On macOS](#on-macos).
 
 ### What it writes
 
@@ -153,7 +156,56 @@ These exist only while **Show waiting sessions and approve from Sessionmux** is 
   shortcuts for your user only.
 - **No services, no drivers, no scheduled tasks, no browser extensions.**
 
+### On macOS
+
+The macOS app (a preview) keeps the same rules with the system's own mechanisms. Where it stores
+files is listed in [PRIVACY.md](PRIVACY.md#what-sessionmux-stores-and-where).
+
+- **One app, no helpers.** `Sessionmux.app` holds one program, `Contents/MacOS/Sessionmux`, which
+  is also the hook helper (`--approve-hook`, `--notify-hook`, `--remove-hooks`) and the relay
+  command (`--end-relay`). No installer, no helper apps, no privileged helper, no kernel or system
+  extension, nothing outside your user.
+- **The hook socket.** Instead of the named pipe, the helpers reach the running app over a Unix
+  socket, `~/Library/Application Support/Sessionmux/hook.sock`. The folder is created with mode
+  `0700` (Sessionmux removes group and other access from it, and refuses a folder that is a
+  symbolic link or belongs to someone else), and the socket is `0600`. Both ends check the other
+  end's user id (`getpeereid`) and drop the connection unless it is your own. When the folder's path
+  is too long for a socket address, the socket is `sessionmux.sock` in your per-user temporary
+  folder (`confstr(_CS_DARWIN_USER_TEMP_DIR)`) instead. Messages are the same newline-delimited JSON of at most 64 KB as on Windows.
+- **One copy per user.** A lock on `instance.lock` (mode `0600`) keeps one Sessionmux per macOS
+  user; a second start asks the running one to show its panel and exits. Two macOS users logged in
+  at the same time each run their own, and neither can reach the other's socket.
+- **Other programs.** It lists your own user's processes and reads the start arguments of Claude
+  Desktop's processes (`sysctl` `KERN_PROCARGS2`, the same call `ps` uses) to find each account's
+  `--user-data-dir`. It reads the window list (`CGWindowListCopyWindowInfo`) for owner, layer and
+  position only, never window titles or contents. It starts Claude through Launch Services with
+  `--user-data-dir=<folder>`, never twice on the same folder, and closes an account by asking its
+  Claude to quit (`NSRunningApplication terminate`), then after 3 seconds ends the remaining
+  processes of that account, restricted to Claude Desktop's own programs and re-checked against
+  their start time.
+- **Sign-in links.** While an extra account signs in, Sessionmux becomes the app that opens
+  `claude://` links (`NSWorkspace setDefaultApplicationAtURL:toOpenURLsWithScheme:`) and gives them
+  back to Claude afterwards; quitting never changes it, the next start does. It passes a link to
+  the account's Claude as a get-URL Apple Event addressed to that process id, which macOS allows
+  only after you grant Automation. The Info.plist declares `claude` links with the rank
+  `Alternate`, so installing the app does not make it the handler.
+- **Permissions.** The core features need none. Automation is asked for when a sign-in link is
+  first passed on; Accessibility only when you turn on **Bring minimised Claude windows to the
+  front** (then used only to un-minimise and raise Claude's windows). Sessionmux never asks for
+  Input Monitoring, Screen Recording or Full Disk Access, installs no event taps and is not
+  sandboxed (a sandboxed app could not start Claude with a data folder or change the link handler).
+- **Open at login** uses `SMAppService` for the app itself, or, if that is not available, a
+  LaunchAgent in `~/Library/LaunchAgents` that starts the app with `--hidden`. Both are removed
+  when you turn the option off or choose **Remove Sessionmux's changes**.
+- **Running from a disk image.** Opened from the disk image or a quarantine copy, the app does not
+  let you turn on approval from the panel, Open at login or sign-in routing, because the program
+  path they record would point to a temporary location; move it to Applications first.
+- **No network connections.** As on Windows. You can check with
+  `lsof -a -i -p $(pgrep -x Sessionmux)`, which lists nothing.
+
 ## Verifying a download
+
+### Windows
 
 Each release carries the installer under two names, `Sessionmux-Setup-<version>.exe` and
 `Sessionmux-Setup.exe` (the same file, under a name that always points at the newest release),
@@ -210,6 +262,60 @@ workflow run through GitHub's OIDC identity, not to a key someone holds.
 Authenticode code signing may be added to releases as an extra; none of the checks above depends
 on it.
 
+### macOS (preview)
+
+The macOS app is published in pre-releases such as
+[v1.1.0-preview.1](https://github.com/joyal-droid/sessionmux/releases/tag/v1.1.0-preview.1),
+built from the `macos` branch by the same `release.yml` workflow. Each one carries
+`Sessionmux-macOS.dmg` and `Sessionmux-macOS.zip`, the same files with the version in the name,
+and `BUILDINFO-macOS.txt` (the Rust, Xcode and macOS SDK versions that built it). The release's
+`SHA256SUMS` lists all of them and the program inside the app,
+`Sessionmux.app/Contents/MacOS/Sessionmux`.
+
+**Signing.** The app is signed **ad hoc** (`codesign --sign -`): the signature seals the app's
+contents so any change breaks it, but it names no developer, and the app is not notarized by Apple.
+That is why macOS asks you to confirm the first start with **Open Anyway**. The attestation and the
+hashes below are what tie the download to this repository.
+
+1. **SHA-256**, in the folder with the download and the release's `SHA256SUMS`:
+
+   ```sh
+   grep '  Sessionmux-macOS.dmg$' SHA256SUMS | shasum -a 256 -c
+   ```
+
+2. **Attestation** (needs the [GitHub CLI](https://cli.github.com)):
+
+   ```sh
+   gh attestation verify Sessionmux-macOS.dmg --repo joyal-droid/sessionmux --signer-workflow joyal-droid/sessionmux/.github/workflows/release.yml --source-ref refs/tags/v1.1.0-preview.1
+   ```
+
+   The same works for the zip and the versioned names.
+
+3. **The signature** of the installed app (it only shows that the app is unchanged since it was
+   signed, not who signed it):
+
+   ```sh
+   codesign --verify --strict --verbose=2 /Applications/Sessionmux.app
+   ```
+
+4. **Rebuild from source** on a Mac with the toolchain named in `BUILDINFO-macOS.txt`:
+
+   ```sh
+   git clone https://github.com/joyal-droid/sessionmux
+   cd sessionmux
+   git checkout v1.1.0-preview.1
+   sh scripts/bundle-macos.sh 1.1.0-preview.1 dist-macos
+   shasum -a 256 dist-macos/Sessionmux.app/Contents/MacOS/Sessionmux
+   ```
+
+   Compare the result with the `Sessionmux.app/Contents/MacOS/Sessionmux` line in `SHA256SUMS`.
+   The script takes the build date from the commit, removes build-machine paths, sets
+   `ZERO_AR_DATE` and signs without a timestamp, so that the same commit built with the same
+   toolchain should give the same program. A weekly CI job builds the app twice from one commit
+   and compares the two; matching a release build on your own Mac has not been confirmed yet, so a
+   different hash from a different Xcode or macOS SDK is expected and is not by itself a sign of
+   tampering. Compare the program, not the disk image or zip, whose bytes change with every build.
+
 ## Scope
 
 Areas where a report is most valuable:
@@ -221,9 +327,11 @@ Areas where a report is most valuable:
 - folder deletion when an account or session is removed, and session transfer (including of
   sessions that are open in Claude, and hand-over),
 - the Claude Code hook helpers (`--approve-hook`, `--notify-hook`, `--remove-hooks`), the edits to
-  `%USERPROFILE%\.claude\settings.json` and the approval pipe,
+  `%USERPROFILE%\.claude\settings.json` and the approval pipe (on macOS the hook socket),
+- on macOS: the `claude://` handler change through Launch Services, the Apple Event forward, the
+  instance lock and the app bundle (`scripts/bundle-macos.sh`, `packaging/macos/Info.plist.in`),
 - the installer and uninstaller (`installer/sessionmux.nsi`),
 - the release workflow (`.github/workflows/release.yml`) and the provenance of published files.
 
-Problems in Claude Desktop itself or in the WebView2 Runtime should be reported to Anthropic or
-Microsoft respectively.
+Problems in Claude Desktop itself, in the WebView2 Runtime or in macOS should be reported to
+Anthropic, Microsoft or Apple respectively.

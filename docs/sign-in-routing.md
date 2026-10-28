@@ -1,7 +1,8 @@
 # Sign-in routing
 
 How Sessionmux lets an extra Claude Desktop account sign in with Google or Apple, and why it needs
-to touch the `claude://` protocol handler to do so.
+to touch the `claude://` protocol handler to do so. The sections up to [macOS](#macos) describe
+Windows; the state machine in `core::relay` is shared, and the macOS section lists what differs.
 
 ## The problem
 
@@ -129,5 +130,52 @@ profile, even though it matches `Claude-*`. Discovery therefore requires a profi
   `HKCU\Software\Classes\sessionmux-test-<uuid>` key.
 - Links are passed straight to the local Claude process; they are not stored, and the log omits
   their query string.
+
+## macOS
+
+The macOS app is a preview, and routing on a Mac has not been tried with a real sign-in yet.
+
+**The problem on a Mac.** Launch Services opens a `claude://` link in the app registered for the
+scheme, Claude, and delivers it as a get-URL Apple Event to a running Claude, which belongs to
+whichever account macOS picks. A second start of Claude with `--user-data-dir` does not help: on
+macOS a second start on a folder that already runs keeps running beside the first instead of
+handing its arguments over (checked on GitHub's macOS 15 and 26 machines), so Sessionmux never
+starts an account twice, and links are never sent that way.
+
+**Taking and giving back the handler.** `platform::macos::url_handler` changes the handler with
+`NSWorkspace setDefaultApplicationAtURL:toOpenURLsWithScheme:` and reads it back with
+`URLForApplicationToOpenURL:`. `relay.json` (in `~/Library/Application Support/Sessionmux/`)
+stores the previous handler as an app path instead of a command. Changes run on worker threads
+only, never on the main thread, because the call may wait for the user.
+
+- **macOS 13 to 26.3:** a change completes at once without a question (seen on macOS 15: take and
+  restore in about 130 ms). Claude makes itself the handler again whenever one of its instances
+  starts; routing takes it back once per sign-in.
+- **macOS 26.4 and later:** every change shows a system "Use / Keep" question and completes only
+  when the user answers. `changes_need_consent()` is true there, so the setting `signInRouting`
+  defaults to off and the Add-account dialog recommends e-mail code sign-in. With routing on, a
+  sign-in asks two or three times (Sessionmux takes the handler, Claude may claim it when it
+  starts, Sessionmux gives it back), and routing never re-takes the handler after Claude claims
+  it. A change with no answer yet is `pending`, not a failure; **Keep** is a clean refusal that is
+  not retried. A declined restore sets `restoreDeclined`, and Settings then offers **Give sign-in
+  links back to Claude**.
+
+**Forwarding.** A link reaches Sessionmux as a get-URL Apple Event (installed before launch
+finishes, so the link that launched the app is kept). The app validates it like `--relay` does
+and sends it, as a new get-URL Apple Event addressed by process id (`typeKernelProcessID`), to the
+waiting account's Claude process, starting that account first if it is not running. The first
+send asks for Automation permission (`AEDeterminePermissionToAutomateTarget`, Info.plist
+`NSAppleEventsUsageDescription`); when it is denied, the panel shows a notice with a button to the
+Automation settings and recommends e-mail code sign-in. A link that arrives while no sign-in is
+waiting goes to Main and gives the handler back to Claude if it still points at Sessionmux.
+
+**Ending.** As on Windows, except that quitting and logging out never change the handler, since
+a question could outlive the app: the next start ends the relay instead (or resumes it if the
+account is still waiting). `--end-relay` does the same from Terminal, and **Remove Sessionmux's
+changes** in Settings gives the links back as well.
+
+**Safety.** The Info.plist declares `claude` with `LSHandlerRank` `Alternate`, so installing
+Sessionmux never makes it the handler by itself. Smoke runs and tests never change the real
+handler; the round-trip test uses a throw-away scheme and stand-in apps.
 
 User-facing details are in [PRIVACY.md](../PRIVACY.md#sign-in-routing).

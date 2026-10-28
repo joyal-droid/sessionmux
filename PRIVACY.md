@@ -1,7 +1,8 @@
 # Sessionmux privacy notice
 
 Short version: **Sessionmux collects nothing.** It has no telemetry, no analytics, no crash
-reporting and no user accounts. Everything it knows stays on your PC.
+reporting and no user accounts. Everything it knows stays on your computer. This is the same on
+Windows and on macOS.
 
 ## Network
 
@@ -14,6 +15,12 @@ Sessionmux's panel is drawn by the Microsoft Edge WebView2 Runtime, a part of Wi
 Microsoft keeps up to date. The panel's pages are built into Sessionmux.exe and load from
 the app itself, not from the internet. Microsoft's own services for Windows and WebView2
 (for example updates) follow Microsoft's privacy statement.
+
+On macOS the panel is drawn by WebKit, which is part of macOS. The pages are built into the app
+in the same way, the panel keeps no website data on disk (it uses a private, in-memory data
+store), and its check for fraudulent websites is turned off, so it never asks a server about the
+panel's pages. Sessionmux on macOS has no network code either: its only connection is the local
+socket described under [Local hooks](#local-hooks-optional).
 
 ## What Sessionmux stores, and where
 
@@ -28,9 +35,26 @@ the app itself, not from the internet. Microsoft's own services for Windows and 
 | Only while you have approval from the panel turned on: three hook entries that run `Sessionmux.exe` (see [Local hooks](#local-hooks-optional)) | `%USERPROFILE%\.claude\settings.json` |
 | A copy of that file as it was before Sessionmux changed it | `%USERPROFILE%\.claude\settings.json.sessionmux-bak` |
 
+On macOS:
+
+| What | Where |
+| --- | --- |
+| Your account list and settings | `~/Library/Application Support/Sessionmux/sessionmux.json` |
+| The log (same contents and limit as on Windows) | `~/Library/Application Support/Sessionmux/sessionmux.log` |
+| A lock file that keeps one Sessionmux running per user, and the socket the hook helpers use while the app runs | `~/Library/Application Support/Sessionmux/instance.lock` and `hook.sock` (the folder is readable only by you; with a very long home folder path the socket is in your private temporary folder instead) |
+| The panel's web data | nothing on disk: the panel uses an in-memory data store |
+| Open at login, when you turn it on | the system's Login Items (`SMAppService`); if that is not available, `~/Library/LaunchAgents/io.github.joyal-droid.sessionmux.plist` |
+| A separate Claude data folder for each extra account you add | `~/Library/Application Support/Claude-<name>/` |
+| While an account signs in: the same sign-in record as on Windows | `~/Library/Application Support/Sessionmux/relay.json` (deleted when the sign-in ends) |
+| Only while you have approval from the panel turned on: three hook entries that run the program inside `Sessionmux.app` | `~/.claude/settings.json` |
+| A copy of that file as it was before Sessionmux changed it | `~/.claude/settings.json.sessionmux-bak` |
+
 Uninstalling Sessionmux removes its hook entries from `settings.json` and keeps everything else,
 so a reinstall picks up where you left off. To remove the rest, delete the `%APPDATA%\Sessionmux`
-folder and, if present, `settings.json.sessionmux-bak` after uninstalling. If a file named
+folder and, if present, `settings.json.sessionmux-bak` after uninstalling. On macOS, **Remove
+Sessionmux's changes** in Settings removes the hook entries, gives `claude://` links back to Claude
+and turns off Open at login; after moving the app to the Trash, delete
+`~/Library/Application Support/Sessionmux` and the backup yourself if you want them gone. If a file named
 `license.json` is present in that folder, Sessionmux deletes it; nothing else in that folder is removed.
 
 ## Sign-in routing
@@ -60,6 +84,23 @@ You can turn this off in Settings (**Route sign-in links to the account being si
 Sessionmux then never takes over the handler (it only puts Claude's value back if an earlier
 crash left Sessionmux registered).
 
+**On macOS** the same thing happens through the system's own setting for which app opens
+`claude://` links, which Sessionmux changes through Launch Services:
+
+- **What changes:** the app that opens `claude://` links for your macOS user. Sessionmux remembers
+  the app that had them (Claude) in `relay.json`, makes itself that app while the sign-in runs, and
+  gives the links back to Claude afterwards.
+- **When:** as on Windows, except that quitting Sessionmux never changes the handler (macOS may ask
+  about the change, and the question would outlive the app); the links go back to Claude at the
+  next start instead. A link that reaches Sessionmux while no sign-in is running goes to the Main
+  account and puts Claude back.
+- **How the link reaches the account:** as an Apple Event sent to that account's running Claude
+  process. macOS asks once whether Sessionmux may control Claude (Automation); the link itself is
+  not stored or sent anywhere, and the log records only its address without the sign-in code.
+- **macOS 26.4 and later** ask "Use / Keep" for every change of the handler, so routing is off by
+  default there and you turn it on yourself if you want it. If you answer **Keep** when Sessionmux
+  gives the links back, Settings offers **Give sign-in links back to Claude**.
+
 ## Local hooks (optional)
 
 Off by default. When you turn on **Show waiting sessions and approve from Sessionmux** in
@@ -82,13 +123,16 @@ confirm:
   input (for example the command, the file path or the address; at most 4 KB) to the running
   Sessionmux, which shows it in the panel so you can decide; notifications carry Claude's message
   text, at most 2 KB. This travels over a named pipe that only your Windows user can open and is
-  kept in memory only until it is answered or expires. The log records the session, the tool name
-  and your decision, never the tool's input.
+  kept in memory only until it is answered or expires. On macOS the same messages travel over a
+  Unix socket in Sessionmux's own folder, which only your macOS user can open; both ends check that
+  the other end runs as your user. The log records the session, the tool name and your decision,
+  never the tool's input.
 - **Nothing leaves the PC.** The helpers make no network connections either. The app never
   reads, uses or copies sign-in tokens, and the hook events carry none.
-- **Removal:** turning the option off, or uninstalling Sessionmux, removes exactly the entries it
-  added (recognised by the path of `Sessionmux.exe` and its arguments) and leaves the rest of the
-  file as it was.
+- **Removal:** turning the option off, uninstalling Sessionmux, or **Remove Sessionmux's changes**
+  on macOS removes exactly the entries it added (recognised by the path of `Sessionmux.exe`, or of
+  the program inside `Sessionmux.app`, and its arguments) and leaves the rest of the file as it
+  was.
 
 ## What Sessionmux reads
 
@@ -99,13 +143,15 @@ to do what you ask**:
   account id and checks that a sign-in entry exists; it never uses, copies or sends your
   sign-in tokens), to count and list its Code sessions, and to copy MCP server settings
   when you turn that on;
-- `%USERPROFILE%\.claude\` (Claude Code's session state and transcripts), to show which
+- `%USERPROFILE%\.claude\` (`~/.claude/` on macOS: Claude Code's session state and transcripts), to show which
   sessions are running, to move, copy or hand over a session when you ask, and to look for a
   limit message in the last 64 KB of an open session's transcript;
-- `%USERPROFILE%\.claude\settings.json`, only to add, check or remove its own hook entries
-  while you use approval from the panel;
+- `%USERPROFILE%\.claude\settings.json` (`~/.claude/settings.json`), only to add, check or
+  remove its own hook entries while you use approval from the panel;
 - the list of running programs, to find Claude windows and bring the right one to the
-  front.
+  front. On macOS this means the running Claude processes of your own user and their start
+  arguments (to see which account each one is), and the position and owner of on-screen windows,
+  never their titles or contents. No permission is needed for that.
 
 Sessionmux does not read your conversations except to copy a session's transcript file when
 you move, copy or hand over that session and to check the last lines of an open session's

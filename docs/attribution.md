@@ -29,7 +29,7 @@ A build satisfies section 14 by keeping all three of these, in the form the orig
    URL as a working link (`ATTRIBUTION` and `REPO_URL` in `web/panel.js`, rendered as
    `.about__attribution`).
 3. **Floating bubble.** The Sessionmux mark in the bubble: the violet `#8A7CFF` ring around the
-   active account's avatar and the violet "C" button when no account exists (`src/ui/bubble.rs`).
+   active account's avatar and the violet "C" button when no account exists (`src/ui/bubble/`).
 
 ## Rules for forks and redistributions
 
@@ -73,8 +73,9 @@ to the fork or build.
 
 ## Checking a build
 
-Run the smoke check (`Sessionmux.exe --smoke`, see [CONTRIBUTING.md](../CONTRIBUTING.md#smoke-check))
-and confirm in the captures:
+Run the smoke check (`Sessionmux.exe --smoke`, or
+`Sessionmux.app/Contents/MacOS/Sessionmux --smoke` on macOS, see
+[CONTRIBUTING.md](../CONTRIBUTING.md#smoke-check)) and confirm in the captures:
 
 - `smoke\panel-accounts.png`, `panel-sessions.png`, `panel-settings.png`: mark and name in the header;
 - `smoke\panel-about.png`: the full attribution line in the About card;

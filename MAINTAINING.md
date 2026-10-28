@@ -234,6 +234,73 @@ handle `joyal-droid`.
 To build an installer locally instead: `powershell -ExecutionPolicy Bypass -File installer\build.ps1`
 (output in `dist\`, with size and SHA-256 printed).
 
+## macOS preview release
+
+The macOS app lives on the `macos` branch until it has been checked on a real Mac. It is
+published as a **pre-release** whose tag has the form `vX.Y.Z-preview.N` (the first one is
+`v1.1.0-preview.1`). A pre-release is never marked as the latest release, so
+`https://github.com/joyal-droid/sessionmux/releases/latest/download/Sessionmux-Setup.exe` keeps
+serving the newest stable Windows release from `main`. The pre-release carries the Windows
+installer of the same commit too, built exactly like a normal release.
+
+1. Make sure the `macos` branch is green in CI, including the macOS jobs (`macOS build and test`,
+   the Intel and macOS 26 test jobs and `macOS two users`). Optionally run the `macos-probe`
+   workflow by hand to see how the current Claude Desktop behaves on GitHub's macOS machines.
+2. On the `macos` branch, set `version` in `Cargo.toml` to `X.Y.Z-preview.N` (the only
+   pre-release form the workflows and the installer accept) and run `cargo build --release` so
+   `Cargo.lock` follows.
+3. In `CHANGELOG.md`, give the `## [X.Y.Z-preview.N]` section today's date and add its link at the
+   bottom; the release notes take that section.
+4. If dependencies changed, update `THIRD-PARTY.md` for both targets
+   (`cargo tree -e normal --target x86_64-pc-windows-msvc` and `--target aarch64-apple-darwin`).
+5. If the disk image's size changed noticeably, redraw the macOS download button with
+   `.\scripts\make-download-button.ps1 -Platform macos -SizeMb <size of Sessionmux-macOS.dmg in MB> -Preview -Out docs\download-button-macos.png`
+   (the size is in the CI bundle step's output and in the release notes). Update the version in
+   the README's macOS links and on the website when the tag changes.
+6. Run the privacy scan on the images, as in step 6 of the release checklist.
+7. Commit on the `macos` branch with the [identity above](#committing-without-leaking-identity),
+   push it, wait for CI, then tag that commit and push the tag:
+
+   ```powershell
+   git switch macos
+   git pull --ff-only
+   git tag -a vX.Y.Z-preview.N -m "Sessionmux X.Y.Z-preview.N"
+   git push origin vX.Y.Z-preview.N
+   ```
+
+8. The release workflow checks that the tag matches `Cargo.toml` and that the commit is on the
+   `macos` branch, runs the Windows checks and, on `macos-15`, clippy and the tests of the macOS
+   build. The Windows build job builds the installer as usual. `build-macos` (read-only, no token)
+   runs `scripts/bundle-macos.sh`, scans the app with `check-binary-privacy.ps1`, and writes the
+   macOS part of the notes (labelled preview while `MACOS_PREVIEW` is `'true'` at the top of
+   `release.yml`), `BUILDINFO-macOS.txt` and `SHA256SUMS-macos`. The publish job joins both
+   `SHA256SUMS` files, checks every line, attests the Windows installers, the four macOS files,
+   `SHA256SUMS` and both `BUILDINFO` files, and creates a **draft pre-release** with all of them
+   (`--prerelease --latest=false`).
+9. Review the draft: the Windows download first, then the macOS (preview) section with the "Not
+   yet verified on a Mac" list; `Sessionmux-macOS.dmg`, `Sessionmux-macOS.zip` and the versioned
+   copies are attached. Check the disk image with
+   `gh attestation verify Sessionmux-macOS.dmg --repo joyal-droid/sessionmux --signer-workflow joyal-droid/sessionmux/.github/workflows/release.yml --source-ref refs/tags/vX.Y.Z-preview.N`,
+   then publish it, leaving **Set as a pre-release** ticked and **Set as the latest release**
+   unticked.
+10. Do not update winget for a preview.
+
+**Ending the preview.** After the macOS app has been checked on a real Mac: set `MACOS_PREVIEW`
+to `'false'`, redraw the macOS button without `-Preview`, drop the preview wording and the "Not
+yet verified on a Mac" list from the README and the website, merge `macos` into `main` through a
+pull request, and release the next stable version as usual. Until the release workflow's normal
+path builds the macOS app as well, a stable tag publishes Windows only, so do this only together
+with that workflow change.
+
+**Runner images.** The macOS jobs run on `macos-15` (Apple silicon), `macos-15-intel` and
+`macos-26`. When GitHub retires an image, move the job to the next one and note the change in the
+commit; `BUILDINFO-macOS.txt` records the image each release was built on. The Intel job stays
+while GitHub offers an Intel image.
+
+**Signing on macOS.** The app is signed ad hoc and not notarized. Developer ID signing and
+notarization need a paid Apple Developer account; they would go into a separate signing job with
+the certificate and an App Store Connect key as secrets, and nothing else in the release changes.
+
 ## Launch checklist
 
 Ready-to-paste texts for announcing a release. Keep the non-affiliation line in every text, post

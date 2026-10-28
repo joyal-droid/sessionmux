@@ -1,9 +1,15 @@
 # Architecture
 
-Sessionmux is a single native Win32 process written in Rust (edition 2021, target
-`x86_64-pc-windows-msvc`). The floating bubble is a layered window drawn with Direct2D; the panel
-is a WebView2 page hosted with `wry` and exists only while it is open. There is no PowerShell, no
-WMI and no network code.
+Sessionmux is a single native process written in Rust (edition 2021) for Windows
+(`x86_64-pc-windows-msvc`) and, as a preview, macOS (`aarch64-apple-darwin` and
+`x86_64-apple-darwin`, joined into one universal app). Most of the code is shared; everything that
+talks to the operating system sits behind the [platform layer](#platform-layer). On Windows the
+floating bubble is a layered window drawn with Direct2D and the panel is a WebView2 page hosted
+with `wry`; on macOS they are an AppKit panel drawn with Core Graphics and a WebKit page hosted
+with the same `wry` (see [macOS](#macos)). The panel exists only while it is open. There is no
+PowerShell, no WMI, no shell scripting and no network code.
+
+The process model, data layout and figures below describe Windows unless a line says otherwise.
 
 ## Process model
 
@@ -25,9 +31,9 @@ Sessionmux.exe --notify-hook / --approve-hook (started by Claude Code per hook e
 
 - **UI thread.** All state lives in `AppState` inside a thread-local `Rc<RefCell<>>`. Windows,
   the tray icon, the hotkey and every panel IPC call are handled here.
-- **Marshalling.** Other threads never touch UI state. They call
-  `util::ui_thread::post(hwnd_msg, Box<dyn FnOnce() + Send>)`, which posts `WM_SESSIONMUX_TASK` with
-  the boxed closure to the message-only window; the UI thread runs it.
+- **Marshalling.** Other threads never touch UI state. They hand a boxed closure to the event
+  loop's `post`, which on Windows posts `WM_SESSIONMUX_TASK` to the message-only window (on macOS
+  it goes to the main dispatch queue); the UI thread runs it.
 - **Single instance.** A named mutex `Local\Sessionmux.SingleInstance`. A second launch finds the
   first instance's message window and posts `WM_SESSIONMUX_SHOW_PANEL`, then exits.
 - **Panel lifecycle.** Created on first open, hidden on blur (unless pinned, at most 10 s) and on
@@ -44,10 +50,10 @@ Sessionmux.exe --notify-hook / --approve-hook (started by Claude Code per hook e
 | `--hidden` | start without showing the panel (used by Start with Windows) |
 | `--smoke` | headless self-check (see [CONTRIBUTING.md](../CONTRIBUTING.md#smoke-check)) |
 | `--relay <url>`, `--relay=<url>`, bare `claude://...` | forward one sign-in link and exit; no UI, runs before the single-instance check |
-| `--end-relay` | restore the `claude://` handler and exit (called by the uninstaller) |
+| `--end-relay` | restore the `claude://` handler and exit (called by the uninstaller on Windows; run by hand on macOS) |
 | `--notify-hook` | read one `Notification` or `StopFailure` hook event from stdin, pass it to the running app and exit 0 without output |
 | `--approve-hook` | read one `PermissionRequest` hook event from stdin, wait for the user's decision in the panel and print it, or exit 0 without output |
-| `--remove-hooks` | remove Sessionmux's entries from `%USERPROFILE%\.claude\settings.json` and exit (called by the uninstaller) |
+| `--remove-hooks` | remove Sessionmux's entries from `%USERPROFILE%\.claude\settings.json` (`~/.claude/settings.json`) and exit (called by the uninstaller on Windows) |
 
 The hook words are matched exactly, like `--relay`, and run before the single-instance check,
 COM and DPI setup; any other argument shape with a hook word exits 0 at once.
@@ -56,7 +62,8 @@ COM and DPI setup; any other argument shape with a hook word exits 0 at once.
 
 | Module | Responsibility |
 | --- | --- |
-| `main.rs` | argument parsing, relay and hook fast paths, single instance, COM and DPI setup, message loop |
+| `main.rs` | argument parsing, relay and hook fast paths, single instance, platform setup, event loop |
+| `platform` | the operating-system layer: shared types, one trait per concern in `traits/`, the Windows backend in `windows/` and the macOS backend in `macos/` (see [Platform layer](#platform-layer)) |
 | `hookhelper.rs` | the `--notify-hook`, `--approve-hook` and `--remove-hooks` helpers |
 | `app.rs` | `AppState` and all orchestration: IPC handlers and their validation, polling and diffing, active-account logic, bubble/tray/hotkey events, panel timers, sign-in routing, quit |
 | `brand.rs` | every product identifier: names, file names, window classes, mutex, registry keys, links, license name, disclaimer, build date |
@@ -74,7 +81,7 @@ COM and DPI setup; any other argument shape with a hook word exits 0 at once.
 | `ui::ipc` | IPC request parsing (size limit 64 KB, strict shape) |
 | `ui::tray` | notification-area icon and its menu |
 | `ui::hotkey` | parsing and registering the global hotkey |
-| `util::*` | logging (1 MB rotation), well-known paths, atomic JSON I/O, HKCU registry helpers, Win32 helpers, date helpers, UI-thread marshalling |
+| `util::*` | logging (1 MB rotation), well-known paths, atomic JSON I/O, date helpers (the registry and Win32 helpers live in `platform::windows`) |
 | `web/` | `panel.html`, `panel.css`, `panel.js`, the design tokens in `shared.css`, and `shim.js` (the `window.sessionmux` API) |
 
 ### Claude Desktop discovery
@@ -228,6 +235,65 @@ session (the one named in the signal, when known): at most one session per signa
 account and reset time (30 minutes when the reset time is unknown), and never while the panel
 holds an approval request for that session.
 
+## Platform layer
+
+`src/platform/mod.rs` holds the types both systems share (`Pid`, `Rect`, `WindowId`, the events
+the app receives) and re-exports the backend of the target system, so shared code writes
+`platform::process::...` or calls a trait method on `platform::Os` without `cfg` attributes. Any
+other target stops the build with `compile_error!`.
+
+| Traits | Concern | Windows | macOS |
+| --- | --- | --- | --- |
+| `traits/core.rs` | paths, processes, Claude discovery and launch, windows and focus, autostart, the link handler, shell and misc | registry, Toolhelp32, PEB command lines, `CreateProcessW`, `HKCU\...\Run` | Launch Services, `proc_listallpids` + `KERN_PROCARGS2`, `NSWorkspace`, `CGWindowListCopyWindowInfo`, `SMAppService` |
+| `traits/ipc.rs` | the hook channel and the single-instance rule | named pipe, named mutex | Unix socket, `flock` on `instance.lock` |
+| `traits/event.rs` | the UI event loop: timers, tray, hotkey, bubble, second launches, links, quit, posting work to the UI thread | Win32 message loop | `NSApplication` run loop, main dispatch queue |
+| `traits/ui.rs` | bubble, tray, hotkey, gesture, panel window, smoke captures | layered window + Direct2D, notification-area icon, `RegisterHotKey`, WebView2 | `NSPanel` + Core Graphics, `NSStatusItem`, Carbon `RegisterEventHotKey`, WKWebView |
+
+The bubble's scene (layout, colours, hit-testing) is built once in `ui::bubble` and drawn by each
+backend, so both systems draw the same picture. The panel page, the IPC protocol, the account
+store, session transfer, limits, hooks and the relay state machine are shared code.
+
+## macOS
+
+The macOS backend in `src/platform/macos/` uses AppKit and the system frameworks through the
+`objc2` crates; nothing else is bundled.
+
+- **App.** An accessory app (`LSUIElement`: no Dock icon, no visible menu bar) with a hidden main
+  menu that carries the Edit commands, so the panel's text fields answer ⌘C, ⌘V and the rest. The
+  bubble is a borderless, non-activating `NSPanel` at the status-window level that joins every
+  Space; the menu bar icon is an `NSStatusItem` (click: panel, Control-click or right-click: menu).
+  The hotkey (`⌃⇧Space` by default) is registered with Carbon's `RegisterEventHotKey`, which needs
+  no permission.
+- **Claude.** Claude Desktop is found by its bundle id `com.anthropic.claudefordesktop` (then
+  `/Applications` and `~/Applications`); Main's data is `~/Library/Application Support/Claude`,
+  extra accounts are `~/Library/Application Support/Claude-<name>`. Processes are listed with
+  `proc_listallpids` and mapped to accounts by the `--user-data-dir` in their arguments
+  (`sysctl` `KERN_PROCARGS2`). Accounts are started through `NSWorkspace openApplicationAtURL:`
+  with a new instance and `--user-data-dir=<dir>`. A second start on a folder that already runs
+  does not hand over to the running instance on macOS, so Sessionmux never starts an account that
+  is running; it activates it instead, and with the opt-in Accessibility switch un-minimises and
+  raises its window. Closing asks the app to quit (`NSRunningApplication terminate`), then ends
+  what is left after 3 s.
+- **IPC and single instance.** The hook helpers connect to
+  `~/Library/Application Support/Sessionmux/hook.sock` (folder `0700`, socket `0600`, peer user
+  checked with `getpeereid`; `sessionmux.sock` in the per-user temporary folder when the path is
+  too long for a socket address) and send
+  the same newline-delimited JSON as on Windows. `instance.lock` is held with `flock`; a second
+  start sends `{"kind":"show"}` over the socket and exits, and a re-open from Finder or the Dock
+  shows the panel. Both are per user, so two logged-in macOS users each run their own Sessionmux;
+  the bundle deliberately does not set `LSMultipleInstancesProhibited`, which macOS would apply
+  across users.
+- **Sign-in routing.** See [sign-in-routing.md](sign-in-routing.md#macos).
+- **Open at login.** `SMAppService.mainApp`; if registration fails, a LaunchAgent in
+  `~/Library/LaunchAgents` that starts the app with `--hidden`. A launch as a login item starts
+  hidden.
+- **Panel.** wry hosts WKWebView with a non-persistent data store, the fraudulent-website check
+  off and no developer tools. The asset origin is `sessionmux://app/`. The panel reads
+  `getAppInfo().platform` to show macOS wording, key symbols and settings.
+- **Running from the disk image.** A copy that runs translocated or from the disk image reports
+  it (`getAppInfo().translocated`); the panel then asks the user to move the app to Applications
+  and does not offer hooks, Open at login or sign-in routing.
+
 ## Data layout
 
 | Data | Location |
@@ -242,6 +308,14 @@ holds an approval request for that session.
 | Code-tab transcripts (shared by all accounts) | `%USERPROFILE%\.claude\projects\` |
 | Claude Code user settings with Sessionmux's hook entries (only while approval is on) | `%USERPROFILE%\.claude\settings.json` |
 | Backup of those settings before a change | `%USERPROFILE%\.claude\settings.json.sessionmux-bak` |
+
+On macOS the same files live in `~/Library/Application Support/Sessionmux/` (`sessionmux.json`,
+`sessionmux.log`, `relay.json`, plus `instance.lock` and `hook.sock`); the panel keeps no web data
+on disk; Open at login is the app's login item (or
+`~/Library/LaunchAgents/io.github.joyal-droid.sessionmux.plist`); Claude data folders are in
+`~/Library/Application Support/`; Claude Code's files are in `~/.claude/`. The store's format
+and keys are the same on both systems; `startWithWindows` holds the Open at login setting on
+macOS.
 
 The store is written atomically (temporary file and rename), as 2-space pretty JSON with a stable
 key order:
@@ -338,7 +412,8 @@ the user (there is no setting).
 
 ## Footprint
 
-Measured on Windows 11 at 125 % scaling:
+Measured on Windows 11 at 125 % scaling (the macOS app has not been measured on a real Mac yet;
+its smoke run reports the same fields in CI):
 
 | Measure | Value |
 | --- | --- |
@@ -353,9 +428,12 @@ The smoke run reports the same figures (`rssIdleMb`, `privateIdleMb`, `privatePa
 
 ## Build
 
-`build.rs` embeds `assets/icon.ico` (resource 1), `assets/tray.ico` (resource 2), the manifest
+On macOS `build.rs` only sets the build date; the app bundle (Info.plist, icon, ad-hoc signature,
+universal binary) is assembled by `scripts/bundle-macos.sh` (see
+[CONTRIBUTING.md](../CONTRIBUTING.md#building-on-a-mac)). On Windows, `build.rs` embeds `assets/icon.ico` (resource 1), `assets/tray.ico` (resource 2), the manifest
 `assets/sessionmux.manifest` (PerMonitorV2 DPI awareness, Common Controls v6, `asInvoker`) and the
 version resource, and sets `SESSIONMUX_BUILD_DATE` for `brand::build_date()`. The release profile
-uses LTO, one codegen unit, `panic = "abort"` and stripped symbols. Dependencies: `windows`, `wry`,
-`raw-window-handle`, `serde`, `serde_json`, `uuid`; `tempfile` for tests; `winresource` for the
-build script.
+uses LTO, one codegen unit, `panic = "abort"` and stripped symbols. Dependencies: `wry`,
+`raw-window-handle`, `serde`, `serde_json`, `uuid` on both systems; `windows` on Windows; the
+`objc2` family, `block2`, `dispatch2` and `libc` on macOS; `tempfile` for tests; `winresource` for
+the Windows build script.

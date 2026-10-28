@@ -2,7 +2,7 @@
 
 Sessionmux is licensed under the Common Public Attribution License 1.0 (CPAL-1.0, see
 `LICENSE`). It is built with the open-source components listed below, each under its own
-license. Versions are taken from `Cargo.lock` of Sessionmux 1.0.0. The MIT and Apache
+license. Versions are taken from `Cargo.lock` of Sessionmux 1.1.0-preview.1. The MIT and Apache
 licenses require that their copyright and license notices accompany copies of the software,
 which is what this file is for.
 
@@ -12,19 +12,35 @@ which is what this file is for.
 | --- | --- |
 | Microsoft Edge WebView2 Runtime (not bundled; installed by Windows or by the user) | Microsoft Software License Terms for the WebView2 Runtime |
 
+## System frameworks on macOS
+
+The macOS app uses frameworks that are part of macOS and are not bundled with it: AppKit,
+Foundation, Core Foundation, Core Graphics, Core Text, Quartz Core, WebKit (the panel), Service
+Management (Open at login), Carbon (the global hotkey), Launch Services and Apple Events (sign-in
+routing) and Application Services (the optional Accessibility switch). They are covered by the
+license of macOS itself.
+
 ## Rust crates used directly
 
 | Crate | Version | License | Used for |
 | --- | --- | --- | --- |
-| `windows` | 0.58.0 | MIT OR Apache-2.0 | Win32 API bindings |
-| `wry` | 0.57.0 | Apache-2.0 OR MIT | WebView2 host for the panel |
-| `webview2-com` (+ `webview2-com-sys`) | 0.39.1 | MIT | WebView2 COM bindings (used by `wry`) |
+| `wry` | 0.57.0 | Apache-2.0 OR MIT | the panel's web view host (WebView2 on Windows, WebKit on macOS) |
 | `raw-window-handle` | 0.6.2 | MIT OR Apache-2.0 OR Zlib | window handle interop |
 | `serde` | 1.0.229 | MIT OR Apache-2.0 | serialisation |
 | `serde_json` | 1.0.154 | MIT OR Apache-2.0 | JSON store and IPC |
 | `uuid` | 1.29.0 | Apache-2.0 OR MIT | account and session ids |
+| `windows` (Windows only) | 0.58.0 | MIT OR Apache-2.0 | Win32 API bindings |
+| `webview2-com` (+ `webview2-com-sys`) (Windows only) | 0.39.1 | MIT | WebView2 COM bindings (used by `wry`) |
+| `objc2` (macOS only) | 0.6.5 | MIT | Objective-C runtime bindings |
+| `objc2-foundation` (macOS only) | 0.3.2 | MIT | Foundation bindings |
+| `objc2-app-kit`, `objc2-core-foundation`, `objc2-core-graphics`, `objc2-core-text`, `objc2-quartz-core`, `objc2-service-management`, `objc2-web-kit` (macOS only) | 0.3.2 | Zlib OR Apache-2.0 OR MIT | AppKit, Core Foundation, Core Graphics, Core Text, Quartz Core, Service Management and WebKit bindings |
+| `block2` (macOS only) | 0.6.2 | MIT | Objective-C blocks (completion handlers) |
+| `dispatch2` (macOS only) | 0.3.1 | Zlib OR Apache-2.0 OR MIT | running work on the main queue |
+| `libc` (macOS only) | 0.2.191 | MIT OR Apache-2.0 | system calls (processes, sockets, file locks) |
 
-## Other crates compiled into Sessionmux.exe
+## Other crates compiled into Sessionmux
+
+### Windows (`Sessionmux.exe`)
 
 Listed by `cargo tree -e normal --target x86_64-pc-windows-msvc`:
 
@@ -64,8 +80,33 @@ Listed by `cargo tree -e normal --target x86_64-pc-windows-msvc`:
 Two versions of the `windows` crate family ship side by side: Sessionmux's own Win32 code uses
 `windows` 0.58, and `wry` reaches WebView2 through `webview2-com`, which uses `windows` 0.62.
 
-`Cargo.lock` also lists crates that `wry` uses on macOS and Linux only (for example
-`base64` and `sha2`); they are not compiled into the Windows build.
+### macOS (`Sessionmux.app`)
+
+Listed by `cargo tree -e normal --target aarch64-apple-darwin` (the `x86_64-apple-darwin` list is
+the same). The macOS app contains the crates of the Windows table above that are not Windows
+specific (everything except `dunce`, `webview2-com*` and the `windows*` crates), plus:
+
+| Crate | Version | License |
+| --- | --- | --- |
+| `bitflags` | 2.13.2 | MIT OR Apache-2.0 |
+| `dirs`, `dirs-sys` | 7.0.0 / 0.5.0 | MIT OR Apache-2.0 |
+| `displaydoc` | 0.2.7 | MIT OR Apache-2.0 |
+| `form_urlencoded`, `percent-encoding`, `url` | 1.2.2 / 2.3.2 / 2.5.8 | MIT OR Apache-2.0 |
+| `idna`, `idna_adapter` | 1.1.0 / 1.2.2 | MIT OR Apache-2.0 |
+| `icu_collections`, `icu_locale_core`, `icu_normalizer`, `icu_normalizer_data`, `icu_properties`, `icu_properties_data`, `icu_provider` | 2.4.0 | Unicode-3.0 |
+| `litemap`, `potential_utf`, `tinystr`, `writeable` | 0.8.3 / 0.1.6 / 0.8.5 / 0.6.4 | Unicode-3.0 |
+| `yoke`, `yoke-derive`, `zerofrom`, `zerofrom-derive`, `zerotrie`, `zerovec`, `zerovec-derive` | 0.8.4 / 0.8.4 / 0.1.8 / 0.1.8 / 0.2.5 / 0.11.9 / 0.11.7 | Unicode-3.0 |
+| `objc2-encode`, `objc2-exception-helper` | 4.1.0 / 0.1.1 | MIT / Zlib OR Apache-2.0 OR MIT |
+| `option-ext` | 0.2.0 | MPL-2.0 |
+| `smallvec` | 1.16.4 | MIT OR Apache-2.0 |
+| `stable_deref_trait` | 1.2.1 | MIT OR Apache-2.0 |
+| `synstructure` | 0.14.0 | MIT (build-time macros only) |
+| `utf8_iter` | 1.0.4 | Apache-2.0 OR MIT |
+
+The `url`, `dirs` and `icu_*` crates come in through `wry`'s macOS code.
+
+`Cargo.lock` also lists crates that `wry` uses on Linux only (for example `base64` and `sha2`);
+they are not compiled into either build.
 
 Build tools that are not part of the shipped files: `winresource` (MIT) for the exe resources,
 `tempfile` (MIT OR Apache-2.0) for tests, and NSIS (zlib/libpng license) for the installer.
@@ -122,6 +163,21 @@ from the authors named in its `Cargo.toml`.
 | `memchr` | Copyright (c) 2015 Andrew Gallant |
 | `once_cell` | Copyright (c) Aleksey Kladov |
 | `unicode-ident` (Unicode data) | Copyright (c) 1991-2023 Unicode, Inc. |
+| `objc2`, `objc2-encode`, `objc2-exception-helper`, `objc2-foundation`, `objc2-app-kit`, `objc2-core-foundation`, `objc2-core-graphics`, `objc2-core-text`, `objc2-quartz-core`, `objc2-service-management`, `objc2-web-kit`, `block2` | Copyright (c) Mads Marquart and the objc2 contributors |
+| `dispatch2` | Copyright (c) Mads Marquart, Mary and the objc2 contributors |
+| `libc` | Copyright (c) The Rust Project Developers |
+| `bitflags` | Copyright (c) 2014 The Rust Project Developers |
+| `dirs`, `dirs-sys` | Copyright (c) 2018-2019 dirs-rs contributors |
+| `displaydoc` | Copyright (c) Jane Lusby |
+| `url`, `idna`, `percent-encoding` | Copyright (c) 2013-2025 The rust-url developers |
+| `form_urlencoded` | Copyright (c) 2013-2016 The rust-url developers |
+| `idna_adapter` | Copyright (c) The rust-url developers |
+| `icu_*`, `litemap`, `potential_utf`, `tinystr`, `writeable`, `yoke`, `yoke-derive`, `zerofrom`, `zerofrom-derive`, `zerotrie`, `zerovec`, `zerovec-derive` | Copyright © 2020-2024 Unicode, Inc. (portions adapted from ICU4C and/or ICU4J: © 1995-2016 International Business Machines Corporation and others) |
+| `option-ext` | Simon Ochsenreither |
+| `smallvec` | Copyright (c) 2018 The Servo Project Developers |
+| `stable_deref_trait` | Copyright (c) 2017 Robert Grosse |
+| `synstructure` | Copyright 2016 Nika Layzell |
+| `utf8_iter` | Copyright Mozilla Foundation |
 
 ### Others
 
@@ -129,6 +185,61 @@ from the authors named in its `Cargo.toml`.
 `unicode-ident` additionally includes Unicode data under the Unicode License v3
 (<https://www.unicode.org/license.txt>). `dpi` is licensed under Apache-2.0 AND MIT, so the
 Apache License 2.0 below applies to it.
+
+The `objc2` crates and `dispatch2` that offer Zlib, Apache-2.0 or MIT are used under MIT.
+
+`option-ext` (macOS only, used by `dirs-sys`) is under the Mozilla Public License 2.0
+(<https://mozilla.org/MPL/2.0/>). Sessionmux uses it unmodified; its source is available at
+<https://github.com/soc/option-ext> and on crates.io.
+
+### Unicode License v3
+
+Applies to the `icu_*`, `litemap`, `potential_utf`, `tinystr`, `writeable`, `yoke*`, `zerofrom*`,
+`zerotrie` and `zerovec*` crates in the macOS app and to the Unicode data in `unicode-ident`.
+
+```
+UNICODE LICENSE V3
+
+COPYRIGHT AND PERMISSION NOTICE
+
+Copyright © 2020-2024 Unicode, Inc.
+
+NOTICE TO USER: Carefully read the following legal agreement. BY
+DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
+SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
+DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of data files and any associated documentation (the "Data Files") or
+software and any associated documentation (the "Software") to deal in the
+Data Files or Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, and/or sell
+copies of the Data Files or Software, and to permit persons to whom the
+Data Files or Software are furnished to do so, provided that either (a)
+this copyright and permission notice appear with all copies of the Data
+Files or Software, or (b) this copyright and permission notice appear in
+associated Documentation.
+
+THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+THIRD PARTY RIGHTS.
+
+IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
+BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
+OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
+FILES OR SOFTWARE.
+
+Except as contained in this notice, the name of a copyright holder shall
+not be used in advertising or otherwise to promote the sale, use or other
+dealings in these Data Files or Software without prior written
+authorization of the copyright holder.
+
+SPDX-License-Identifier: Unicode-3.0
+```
 
 ### Apache License 2.0
 
@@ -313,9 +424,10 @@ END OF TERMS AND CONDITIONS
 
 ## Keeping this file current
 
-Versions above match `Cargo.lock` for Sessionmux 1.0.0. After any dependency change,
+Versions above match `Cargo.lock` for Sessionmux 1.1.0-preview.1. After any dependency change,
 regenerate the crate list and compare:
 
 ```powershell
 cargo tree -e normal --target x86_64-pc-windows-msvc --prefix none -f "{p} | {l}" | Sort-Object -Unique
+cargo tree -e normal --target aarch64-apple-darwin --prefix none -f "{p} | {l}" | Sort-Object -Unique
 ```

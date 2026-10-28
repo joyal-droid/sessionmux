@@ -11,6 +11,9 @@ By contributing you agree that your contribution is licensed under the
 
 ## Setup
 
+Sessionmux builds for Windows and macOS from the same code. The sections below describe Windows;
+building, testing and packaging on a Mac is in [Building on a Mac](#building-on-a-mac).
+
 - Windows 10 or 11 x64.
 - Rust stable with the MSVC toolchain (`x86_64-pc-windows-msvc`), installed with
   [rustup](https://rustup.rs), plus the `rustfmt` and `clippy` components.
@@ -140,6 +143,74 @@ git-ignored `scripts\private-terms.txt` (one per line) or `$env:SESSIONMUX_PRIVA
 (package the existing exe), `-Makensis <path>`, and `-Sign` / `-TimestampUrl <url>` for optional
 code signing (see [MAINTAINING.md](MAINTAINING.md)). `makensis` is found through `-Makensis`,
 `$env:MAKENSIS`, `PATH`, or a standard NSIS install in Program Files.
+
+## Building on a Mac
+
+The macOS app is a preview built from the `macos` branch. Platform code lives behind the platform
+layer in `src/platform/` (one trait per concern in `traits/`, implemented in `windows/` and
+`macos/`); everything else is shared. A change to shared code must keep both builds compiling.
+
+**Setup**
+
+- macOS 13 or later (Apple silicon or Intel).
+- The Xcode Command Line Tools (`xcode-select --install`), which provide the linker, `lipo`,
+  `codesign` and the macOS SDK.
+- Rust stable from [rustup](https://rustup.rs) with `rustfmt` and `clippy`, and both Apple targets
+  for the universal app: `rustup target add aarch64-apple-darwin x86_64-apple-darwin`.
+
+**Build and test**
+
+```sh
+cargo build --release          # target/release/Sessionmux (a bare program, for development)
+cargo test
+SESSIONMUX_SMOKE_FIXTURE=1 cargo run --release -- --smoke
+```
+
+The smoke check works as on Windows: demo data in `smoke/userData`, captures in `smoke/*.png`,
+one JSON line and exit code 0 or 1. It never touches the real link handler, login items or your
+Claude data.
+
+A bare `target/release/Sessionmux` runs the floating button, the menu bar icon and the panel, but
+the parts that need an app bundle (sign-in routing, Open at login, a stable identity for the
+Automation and Accessibility permissions) are only available in `Sessionmux.app`. Hooks installed
+from a development build record that build's path; remove them again with **Settings** or
+`--remove-hooks` before you delete the build.
+
+**The app bundle**
+
+```sh
+sh scripts/bundle-macos.sh <version> dist-macos
+```
+
+builds both architectures with the release settings (remapped paths, build date from the commit,
+`MACOSX_DEPLOYMENT_TARGET=13.0`), joins them into one universal program, writes
+`Sessionmux.app` with the Info.plist from `packaging/macos/Info.plist.in` and the icon from
+`assets/macos/Sessionmux.iconset`, signs it ad hoc, and writes
+`Sessionmux-<version>-macOS.dmg`, `Sessionmux-<version>-macOS.zip`, the fixed-name copies
+`Sessionmux-macOS.dmg` and `Sessionmux-macOS.zip`, `BUILDINFO-macOS.txt` and `SHA256SUMS-macos`
+into `dist-macos/`. It then runs the bundled program's smoke check and checks the disk image and
+the zip. The script header lists every step. Run the privacy scan on the result with
+`pwsh ./scripts/check-binary-privacy.ps1 dist-macos/Sessionmux.app/Contents/MacOS` (PowerShell 7
+for macOS).
+
+The icon set and the menu bar template images in `assets/macos/` are drawn on Windows by
+`scripts/make-icons.ps1` and committed, so the Mac build needs no image tools.
+
+**Other macOS checks**
+
+- Tests that need a real Claude or a real handler change are ignored by default, as on Windows.
+- `scripts/macos-two-user.sh` checks that two macOS users each get their own instance lock and
+  socket. It creates and deletes a temporary user account with `sudo`, so it runs only in GitHub
+  Actions unless you set `SESSIONMUX_TWO_USER_ALLOW=1` on a Mac where that is acceptable.
+- `scripts/macos-probe.sh` (the manual `macos-probe` workflow) records how Claude Desktop behaves on
+  GitHub's macOS machines: two data folders at once, a second start on a running folder, and the
+  `claude://` handler.
+
+Without a Mac you can still check that macOS code compiles: `rustup target add
+aarch64-apple-darwin` and `cargo check --target aarch64-apple-darwin` work as long as no build
+script needs Apple's C compiler. CI on the `macos` branch, and on pull requests against it, also
+runs the macOS jobs (clippy, tests, the bundle, the smoke check on Apple silicon and Intel, and the
+two-user check).
 
 ## Style
 
