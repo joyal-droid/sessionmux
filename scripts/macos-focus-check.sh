@@ -87,7 +87,8 @@ SECOND_ID="second-account"
 RUNNER_LABEL="${FOCUS_RUNNER:-macOS $(sw_vers -productVersion 2>/dev/null)}"
 SCRIPT_LOG="$OUT/script.log"
 SUMMARY="$OUT/summary.txt"
-STEPS="S1 S2 S3 S4 S5 S6"
+# S5 leaves Second's window closed and its Claude stopped until the step ends, so it runs last.
+STEPS="S1 S2 S3 S4 S6 S5"
 STOPPED_PID=""
 
 rm -rf "$WORK"
@@ -136,6 +137,18 @@ open_window() {
 
 has_open_window() { [ "$(open_window "$1")" = "yes" ]; }
 
+# Each window's minimised state as System Events reads it, for the notes.
+window_info() {
+    sysevents -e "set p to first process whose unix id is $1" -e 'set out to ""' \
+        -e 'repeat with w in windows of p' \
+        -e 'try' -e 'set m to (value of attribute "AXMinimized" of w) as text' \
+        -e 'on error e' -e 'set m to "unreadable: " & e' -e 'end try' \
+        -e 'set out to out & "[" & m & "]"' -e 'end repeat' -e 'return out'
+}
+
+# "yes" when System Events lists at least one window for a process.
+any_window() { [ "$(window_count "$1")" -ge 1 ] 2>/dev/null; }
+
 wait_for() { # seconds command...
     local end=$((SECONDS + $1))
     shift
@@ -176,7 +189,11 @@ minimise_window() {
     out="$(sysevents -e "set p to first process whose unix id is $1" \
         -e 'set value of attribute "AXMinimized" of window 1 of p to true')"
     sleep 2
-    if has_open_window "$1"; then echo "error: the window is still open ($out)"; else echo "minimised"; fi
+    if has_open_window "$1"; then
+        echo "error: the window is still open ($out)"
+    else
+        echo "minimised (windows: $(window_info "$1"))"
+    fi
 }
 
 restore_windows() {
@@ -208,6 +225,9 @@ setup_step() {
             if has_open_window "$second"; then
                 textedit_front
                 echo "note: window open, TextEdit in front"
+            elif any_window "$second"; then
+                textedit_front
+                echo "note: window listed but its state is unclear ($(window_info "$second")), TextEdit in front"
             else
                 echo "error: Second's Claude has no open window ($(open_window "$second"); windows: $(window_count "$second"))"
             fi
@@ -220,7 +240,7 @@ setup_step() {
             ;;
         S3)
             restore_windows "$second"
-            if ! has_open_window "$second"; then
+            if ! has_open_window "$second" && ! any_window "$second"; then
                 echo "error: Second's Claude has no window to minimise ($(open_window "$second"); windows: $(window_count "$second"))"
                 return
             fi
@@ -408,8 +428,8 @@ cat >"$WORK/plan.json" <<JSON
     { "name": "S2", "account": "$SECOND_ID", "via": "panel", "expect": "front", "windowBefore": false },
     { "name": "S3", "account": "$SECOND_ID", "via": "panel", "expect": "record", "windowBefore": false },
     { "name": "S4", "account": "$SECOND_ID", "via": "bubble", "expect": "front", "windowBefore": false },
-    { "name": "S5", "account": "$SECOND_ID", "via": "panel", "expect": "visible-failure" },
-    { "name": "S6", "account": "$SECOND_ID", "via": "posted", "expect": "record", "windowBefore": true }
+    { "name": "S6", "account": "$SECOND_ID", "via": "posted", "expect": "record", "windowBefore": true },
+    { "name": "S5", "account": "$SECOND_ID", "via": "panel", "expect": "visible-failure" }
   ]
 }
 JSON
