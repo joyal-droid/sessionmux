@@ -356,8 +356,8 @@ jobs:
   # Previews only. Builds the universal Sessionmux.app (arm64 + x86_64), the disk image and the
   # zip with read-only access, like the Windows build job: no token that could publish, attest
   # or write to the repository. scripts/bundle-macos.sh also checks what it made (signature,
-  # architectures, Info.plist, disk image and zip contents) and runs the bundled binary's
-  # self-check.
+  # architectures, Info.plist, disk image and zip contents, the disk image window's layout) and
+  # runs the bundled binary's self-check.
   build-macos:
     name: Build macOS app
     needs: [checks, checks-macos, audit]
@@ -379,7 +379,17 @@ jobs:
           rustup default "$RUST_TOOLCHAIN"
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
+      # Python for dmgbuild, which writes the disk image window (scripts/bundle-macos.sh).
+      - name: Set up Python
+        id: python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13'
+          update-environment: false
+
       - name: Build and package
+        env:
+          SESSIONMUX_PYTHON: ${{ steps.python.outputs.python-path }}
         run: sh scripts/bundle-macos.sh "$VERSION" dist-macos
 
       # Everything in the app except the icon, which is compressed image data packed from the PNG
@@ -414,7 +424,7 @@ jobs:
             echo
             echo '**First start**'
             echo
-            echo '1. Open the disk image and drag **Sessionmux** onto **Applications**.'
+            echo '1. Open the disk image. In the window that opens, drag **Sessionmux** onto the **Applications** folder next to it (the arrow shows the way), then eject the disk image.'
             echo '2. Open Sessionmux from Applications. macOS says it cannot check the app for malicious software; choose **Done** (or **Cancel**).'
             echo '3. Open **System Settings > Privacy & Security**, scroll down to **Security** and choose **Open Anyway** next to the line about Sessionmux, then confirm with **Open Anyway** and your password.'
             echo

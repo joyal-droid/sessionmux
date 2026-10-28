@@ -278,13 +278,25 @@ jobs:
             exit 1
           fi
 
+      # Python for dmgbuild, which writes the disk image window (scripts/bundle-macos.sh).
+      - name: Set up Python
+        id: python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13'
+          update-environment: false
+
       # The universal Sessionmux.app (arm64 + x86_64) exactly as a release builds it, with the
       # disk image and the zip. The script also checks what it made: plutil -lint, codesign
       # --verify --strict --all-architectures, lipo -verify_arch, the disk image mounts and holds
-      # the app and the Applications link, the zip extracts to an app with a valid signature, and
-      # the bundled binary passes --smoke and --notify-hook. Gatekeeper (spctl) is expected to
-      # reject an ad-hoc signed app; its answer is printed and does not fail the step.
+      # the app and the Applications link, the disk image window matches
+      # packaging/macos/dmg-settings.py (background picture, volume icon, .DS_Store layout), the
+      # zip extracts to an app with a valid signature, and the bundled binary passes --smoke and
+      # --notify-hook. Gatekeeper (spctl) is expected to reject an ad-hoc signed app; its answer is
+      # printed and does not fail the step.
       - name: Bundle
+        env:
+          SESSIONMUX_PYTHON: ${{ steps.python.outputs.python-path }}
         run: |
           mkdir -p ci-logs
           sh scripts/bundle-macos.sh 0.0.0-ci dist-macos 2>&1 | tee ci-logs/bundle.log \
@@ -629,9 +641,18 @@ jobs:
           rustup default "$RUST_TOOLCHAIN"
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
+      # Python for dmgbuild, which writes the disk image window (scripts/bundle-macos.sh).
+      - name: Set up Python
+        id: python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13'
+          update-environment: false
+
       - name: Build twice and compare
         env:
           SESSIONMUX_BUNDLE_SKIP_RUN: '1'
+          SESSIONMUX_PYTHON: ${{ steps.python.outputs.python-path }}
         run: |
           mkdir -p ci-logs
           {

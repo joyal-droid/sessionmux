@@ -189,7 +189,9 @@ builds both architectures with the release settings (remapped paths, build date 
 `Sessionmux-<version>-macOS.dmg`, `Sessionmux-<version>-macOS.zip`, the fixed-name copies
 `Sessionmux-macOS.dmg` and `Sessionmux-macOS.zip`, `BUILDINFO-macOS.txt` and `SHA256SUMS-macos`
 into `dist-macos/`. It then runs the bundled program's smoke check and checks the disk image and
-the zip. The script header lists every step. Run the privacy scan on the result with
+the zip. It needs Python 3.10 or later (`python3`, or the interpreter named in
+`SESSIONMUX_PYTHON`) to install `dmgbuild`, which lays out the disk image window. The script
+header lists every step. Run the privacy scan on the result with
 `pwsh ./scripts/check-binary-privacy.ps1 dist-macos/Sessionmux.app/Contents/MacOS` (PowerShell 7
 for macOS).
 

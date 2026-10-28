@@ -36,13 +36,24 @@
 #   5. Contents/Resources/Sessionmux.icns from assets/macos/Sessionmux.iconset (iconutil)
 #   6. signs the app ad hoc (no certificate, no timestamp) and verifies the signature
 #   7. Sessionmux-<version>-macOS.zip (ditto, keeps the signature) and
-#      Sessionmux-<version>-macOS.dmg (the app next to a link to /Applications), plus
-#      byte-identical copies named Sessionmux-macOS.zip and Sessionmux-macOS.dmg
+#      Sessionmux-<version>-macOS.dmg, plus byte-identical copies named Sessionmux-macOS.zip and
+#      Sessionmux-macOS.dmg. The disk image opens as a styled window: the app on the left, a link
+#      to /Applications on the right and an arrow between them, drawn by
+#      packaging/macos/dmg-background.png (and @2x) with the layout in
+#      packaging/macos/dmg-settings.py. dmgbuild writes the window settings (.DS_Store), the
+#      background picture and the volume icon without opening Finder; it is installed with pip
+#      --require-hashes from packaging/macos/dmg-requirements.txt into a throwaway virtual
+#      environment under the target folder. It needs Python 3.10 or later: python3, or the
+#      interpreter named in SESSIONMUX_PYTHON
 #   8. runs the bundled binary once: the self-check with the demo data (--smoke) and a hook
 #      helper call with no app running (set SESSIONMUX_BUNDLE_SKIP_RUN=1 to leave this out)
-#   9. checks the outputs: the disk image mounts and holds the app and the Applications link, the
-#      zip extracts to an app with a valid signature, and Gatekeeper's assessment is printed (an
-#      ad-hoc signed app is expected to be rejected there until it is opened once with Open Anyway)
+#   9. checks the outputs: the disk image is UDZO with an HFS+ volume named Sessionmux, mounts
+#      and holds the app and the Applications link; packaging/macos/check-dmg.py then checks the
+#      window: background picture (1x and 2x), volume icon, and in .DS_Store the window bounds,
+#      hidden bars, icon view, icon and text size, background picture and both icon positions.
+#      The zip extracts to an app with a valid signature, and Gatekeeper's assessment is printed
+#      (an ad-hoc signed app is expected to be rejected there until it is opened once with Open
+#      Anyway)
 #  10. writes BUILDINFO-macOS.txt (versions of the tools used) and SHA256SUMS-macos
 #
 # Everything is written to <out-dir>; Sessionmux.app stays there as well. The binary is the file
@@ -78,12 +89,14 @@ ZIP="$NAME-$VERSION-macOS.zip"
 DMG="$NAME-$VERSION-macOS.dmg"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/sessionmux-bundle.XXXXXX")
 MOUNTED=""
+VENV=""
 
 cleanup() {
     status=$?
     trap - EXIT
     if [ -n "$MOUNTED" ]; then hdiutil detach "$MOUNTED" -force >/dev/null 2>&1 || true; fi
     rm -rf "$WORK"
+    if [ -n "${VENV:-}" ]; then rm -rf "$VENV"; fi
     exit "$status"
 }
 trap cleanup EXIT
@@ -130,12 +143,21 @@ export RUSTFLAGS
 echo "RUSTFLAGS: $RUSTFLAGS"
 echo "SOURCE_DATE_EPOCH: ${SOURCE_DATE_EPOCH:-unset}, SESSIONMUX_BUILD_DATE: $SESSIONMUX_BUILD_DATE"
 
-# ---------------------------------------------------------------- 2. build both slices
 TARGET_DIR=${CARGO_TARGET_DIR:-$ROOT/target}
 case "$TARGET_DIR" in
     /*) ;;
     *) TARGET_DIR="$ROOT/$TARGET_DIR" ;;
 esac
+
+# The disk image tools need Python 3.10 or later; checked here so a missing one stops the build
+# before the long compile.
+PYTHON=${SESSIONMUX_PYTHON:-python3}
+command -v "$PYTHON" >/dev/null 2>&1 || fail "$PYTHON not found (Python 3.10 or later writes the disk image window; set SESSIONMUX_PYTHON)"
+"$PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 10))' \
+    || fail "$PYTHON is $("$PYTHON" -V 2>&1); the disk image window needs Python 3.10 or later (set SESSIONMUX_PYTHON)"
+echo "Python for the disk image: $("$PYTHON" -V 2>&1)"
+
+# ---------------------------------------------------------------- 2. build both slices
 for target in aarch64-apple-darwin x86_64-apple-darwin; do
     step "cargo build --release --locked --target $target"
     (cd "$ROOT" && cargo build --release --locked --target "$target")
@@ -180,16 +202,27 @@ rm -f "$OUT/$ZIP" "$OUT/$NAME-macOS.zip" "$OUT/$DMG" "$OUT/$NAME-macOS.dmg"
 (cd "$OUT" && ditto -c -k --sequesterRsrc --keepParent "$NAME.app" "$ZIP")
 
 step "$DMG"
-STAGE="$WORK/dmg"
-mkdir -p "$STAGE"
-ditto "$APP" "$STAGE/$NAME.app"
-ln -s /Applications "$STAGE/Applications"
+# dmgbuild and the two libraries it uses, pinned by version and SHA-256, in a fresh virtual
+# environment (pip ignores any user configuration and installs wheels only).
+VENV="$TARGET_DIR/dmgbuild-venv"
+rm -rf "$VENV"
+"$PYTHON" -m venv "$VENV"
+"$VENV/bin/python" -m pip install --isolated --disable-pip-version-check --no-input --quiet \
+    --require-hashes --only-binary=:all: -r "$ROOT/packaging/macos/dmg-requirements.txt" \
+    || fail "could not install the disk image tools from packaging/macos/dmg-requirements.txt"
+DMGBUILD_VERSION=$("$VENV/bin/python" -m pip list --isolated --disable-pip-version-check --format=freeze \
+    | grep -E '^(dmgbuild|ds[-_]store|mac[-_]alias)==' | tr '\n' ' ' | sed 's/ *$//')
+echo "disk image tools: $DMGBUILD_VERSION"
+# The layout is written straight into .DS_Store, so Finder is never asked to arrange the window.
 # hdiutil sometimes reports "Resource busy" on a busy machine; a second try usually works.
 tries=0
-until hdiutil create -volname "$NAME" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$OUT/$DMG"; do
+until "$VENV/bin/python" -m dmgbuild -s "$ROOT/packaging/macos/dmg-settings.py" \
+    -D "app=$APP" -D "icon=$APP/Contents/Resources/$NAME.icns" \
+    -D "background=$ROOT/packaging/macos/dmg-background.png" \
+    "$NAME" "$OUT/$DMG"; do
     tries=$((tries + 1))
-    [ "$tries" -lt 4 ] || fail "hdiutil create failed"
-    echo "hdiutil create failed, trying again in 5 s"
+    [ "$tries" -lt 4 ] || fail "dmgbuild failed"
+    echo "dmgbuild failed, trying again in 5 s"
     sleep 5
 done
 cp "$OUT/$ZIP" "$OUT/$NAME-macOS.zip"
@@ -213,18 +246,29 @@ fi
 
 # ---------------------------------------------------------------- 9. check the outputs
 step "check the disk image"
+hdiutil imageinfo "$OUT/$DMG" >"$WORK/imageinfo.txt" || fail "hdiutil imageinfo failed"
+grep -Eq '^Format: UDZO$' "$WORK/imageinfo.txt" || fail "the disk image is not UDZO"
 MNT="$WORK/mnt"
 mkdir -p "$MNT"
 hdiutil attach "$OUT/$DMG" -readonly -nobrowse -noverify -mountpoint "$MNT" >/dev/null
 MOUNTED=$MNT
+volname=$(diskutil info "$MNT" | sed -n 's/^ *Volume Name: *//p')
+[ "$volname" = "$NAME" ] || fail "the volume is named '$volname', expected $NAME"
+fstype=$(diskutil info "$MNT" | sed -n 's/^ *Type (Bundle): *//p')
+[ "$fstype" = "hfs" ] || fail "the volume is '$fstype', expected HFS+ (hfs)"
 [ -x "$MNT/$NAME.app/Contents/MacOS/$NAME" ] || fail "the disk image holds no $NAME.app"
 [ -L "$MNT/Applications" ] && [ "$(readlink "$MNT/Applications")" = "/Applications" ] \
     || fail "the disk image holds no link to /Applications"
 codesign --verify --strict --all-architectures "$MNT/$NAME.app" || fail "the app in the disk image has no valid signature"
 cmp -s "$MNT/$NAME.app/Contents/MacOS/$NAME" "$BIN" || fail "the binary in the disk image differs from the built one"
+for f in .background.tiff .VolumeIcon.icns .DS_Store; do
+    [ -f "$MNT/$f" ] || fail "the disk image holds no $f"
+done
+"$VENV/bin/python" "$ROOT/packaging/macos/check-dmg.py" "$MNT" "$ROOT/packaging/macos/dmg-settings.py" \
+    "$APP/Contents/Resources/$NAME.icns" || fail "the disk image window does not match packaging/macos/dmg-settings.py"
 hdiutil detach "$MNT" >/dev/null
 MOUNTED=""
-echo "disk image: $NAME.app and Applications -> /Applications, signature valid"
+echo "disk image: $NAME.app and Applications -> /Applications, signature valid, window as laid out"
 
 step "check the zip"
 UNZIP="$WORK/unzip"
@@ -257,6 +301,7 @@ commit=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
     xcodebuild -version 2>/dev/null | tr '\n' ' ' | sed 's/ *$//'
     echo
     echo "macOS SDK: $(xcrun --show-sdk-version 2>/dev/null || echo unknown)"
+    echo "disk image: $("$PYTHON" -V 2>&1), $DMGBUILD_VERSION"
     echo "$(sw_vers -productName) $(sw_vers -productVersion) ($(sw_vers -buildVersion)), $(uname -m)"
     if [ -n "${ImageOS:-}" ]; then echo "runner image: $ImageOS ${ImageVersion:-}"; fi
 } >"$OUT/BUILDINFO-macOS.txt"
