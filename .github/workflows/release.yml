@@ -458,7 +458,7 @@ jobs:
             cat dist-macos/BUILDINFO-macOS.txt
             echo '```'
             echo
-            echo "To rebuild: check out this tag on a Mac with the toolchain above, run \`sh scripts/bundle-macos.sh $VERSION dist-macos\` and compare the SHA-256 of \`dist-macos/Sessionmux.app/Contents/MacOS/Sessionmux\` with its line in \`SHA256SUMS\`."
+            echo "To rebuild: check out this tag on a Mac with the toolchain above and Python 3.10 or later with access to PyPI, run \`sh scripts/bundle-macos.sh $VERSION dist-macos\` and compare the SHA-256 of \`dist-macos/Sessionmux.app/Contents/MacOS/Sessionmux\` with its line in \`SHA256SUMS\`."
             echo '</details>'
           } > dist-macos/notes-macos.md
           cat dist-macos/notes-macos.md

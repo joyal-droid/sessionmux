@@ -298,7 +298,9 @@ hashes below are what tie the download to this repository.
    codesign --verify --strict --verbose=2 /Applications/Sessionmux.app
    ```
 
-4. **Rebuild from source** on a Mac with the toolchain named in `BUILDINFO-macOS.txt`:
+4. **Rebuild from source** on a Mac with the toolchain named in `BUILDINFO-macOS.txt`. The script
+   also needs Python 3.10 or later (`python3`, or the interpreter set in `SESSIONMUX_PYTHON`) and
+   network access to PyPI, because it installs the hash-pinned disk image tools:
 
    ```sh
    git clone https://github.com/joyal-droid/sessionmux
