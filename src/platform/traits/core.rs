@@ -66,6 +66,8 @@ pub enum FocusFailure {
     AccessibilityOff,
     /// Raising through Accessibility was needed, but the system does not trust Sessionmux.
     AccessibilityUntrusted,
+    /// Claude did not answer the request to show its window (stopped, hung or busy).
+    NotResponding,
     /// The process ended before its window could be raised.
     Gone,
     /// Any other failure.
@@ -81,6 +83,7 @@ impl FocusFailure {
             FocusFailure::AutomationDenied => "focus-automation-denied",
             FocusFailure::AccessibilityOff => "focus-accessibility-off",
             FocusFailure::AccessibilityUntrusted => "focus-accessibility-untrusted",
+            FocusFailure::NotResponding => "focus-not-responding",
             FocusFailure::Gone => "focus-gone",
             FocusFailure::Other => "focus-failed",
         }

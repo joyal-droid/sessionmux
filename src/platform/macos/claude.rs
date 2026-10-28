@@ -337,6 +337,8 @@ pub(crate) enum Reopen {
     Sent,
     /// The user did not allow Sessionmux to control Claude (Automation).
     Denied,
+    /// The process did not answer in time (stopped, hung or busy).
+    NoAnswer,
     Failed,
 }
 
@@ -379,9 +381,7 @@ pub(crate) fn focus_with(s: &mut impl FocusSteps, pid: Pid, handoff: bool) -> Fo
         return FocusResult::NeedsHandOff;
     }
     let ax = s.accessibility();
-    let mut raised = false;
     if ax == AxState::Allowed && s.raise_with_accessibility(pid) {
-        raised = true;
         s.pass_activation(pid);
         s.settle();
         if s.in_front(pid) {
@@ -389,7 +389,7 @@ pub(crate) fn focus_with(s: &mut impl FocusSteps, pid: Pid, handoff: bool) -> Fo
         }
     }
     let mut reopen = None;
-    if !raised && s.window_state(pid) != WinState::OnScreen {
+    if s.window_state(pid) != WinState::OnScreen {
         let r = s.reopen(pid);
         reopen = Some(r);
         if r == Reopen::Sent && s.wait_for_window(pid) {
@@ -410,14 +410,17 @@ pub(crate) fn focus_with(s: &mut impl FocusSteps, pid: Pid, handoff: bool) -> Fo
 }
 
 /// Why a window did not come forward, from what was tried and where its windows are now.
+/// A refused or unanswered reopen request explains a window that is still not on screen before
+/// any setting does: neither Accessibility setting can open a closed window.
 fn failure(ax: AxState, reopen: Option<Reopen>, win: WinState) -> FocusFailure {
-    match (win, ax) {
-        (WinState::OnScreen | WinState::OffScreen, AxState::Untrusted) => FocusFailure::AccessibilityUntrusted,
-        (WinState::OnScreen, _) => FocusFailure::Refused,
-        (WinState::OffScreen, AxState::Off) => FocusFailure::AccessibilityOff,
-        _ if reopen == Some(Reopen::Denied) => FocusFailure::AutomationDenied,
-        (WinState::OffScreen, _) => FocusFailure::Refused,
-        (WinState::None, _) => FocusFailure::NoWindow,
+    match (win, ax, reopen) {
+        (WinState::OffScreen | WinState::None, _, Some(Reopen::Denied)) => FocusFailure::AutomationDenied,
+        (WinState::OffScreen | WinState::None, _, Some(Reopen::NoAnswer)) => FocusFailure::NotResponding,
+        (WinState::OnScreen | WinState::OffScreen, AxState::Untrusted, _) => FocusFailure::AccessibilityUntrusted,
+        (WinState::OnScreen, _, _) => FocusFailure::Refused,
+        (WinState::OffScreen, AxState::Off, _) => FocusFailure::AccessibilityOff,
+        (WinState::OffScreen, _, _) => FocusFailure::Refused,
+        (WinState::None, _, _) => FocusFailure::NoWindow,
     }
 }
 
@@ -621,6 +624,7 @@ fn reopen_instance(pid: Pid) -> (Reopen, String) {
     let r = match &sent {
         Ok(()) => Reopen::Sent,
         Err(AeSendError::NotPermitted(_)) => Reopen::Denied,
+        Err(AeSendError::NoAnswer(_)) => Reopen::NoAnswer,
         Err(_) => Reopen::Failed,
     };
     tried.push(match &sent {
@@ -635,7 +639,7 @@ fn ae_error(e: &AeSendError) -> String {
         AeSendError::NotPermitted(code) if *code == ERR_NOT_PERMITTED => format!("not permitted ({code})"),
         AeSendError::NotPermitted(code) => format!("not asked yet ({code})"),
         AeSendError::Gone => "process gone".into(),
-        AeSendError::Failed(s) => s.clone(),
+        AeSendError::NoAnswer(s) | AeSendError::Failed(s) => s.clone(),
     }
 }
 
@@ -1356,6 +1360,37 @@ mod tests {
     }
 
     #[test]
+    fn an_accepted_raise_that_leaves_the_window_off_screen_still_reopens() {
+        let mut s = Script {
+            front: VecDeque::from([false, false, true]),
+            ax: AxState::Allowed,
+            ax_raised: true,
+            windows: VecDeque::from([WinState::OffScreen, WinState::OnScreen]),
+            window_after_reopen: true,
+            ..Script::default()
+        };
+        assert_eq!(focus_with(&mut s, 7, false), FocusResult::Focused);
+        assert_eq!(
+            s.steps,
+            [
+                "activate-self",
+                "pass-7",
+                "settle",
+                "front?-7",
+                "ax?",
+                "ax-raise-7",
+                "pass-7",
+                "settle",
+                "front?-7",
+                "windows?-7",
+                "reopen-7",
+                "wait-window-7",
+                "front?-7"
+            ]
+        );
+    }
+
+    #[test]
     fn reopen_failures_have_their_own_reasons() {
         let closed = |reopen: Reopen| Script {
             windows: VecDeque::from([WinState::None]),
@@ -1375,6 +1410,15 @@ mod tests {
         let mut s = closed(Reopen::Failed);
         assert_eq!(focus_with(&mut s, 7, false), failed(FocusFailure::NoWindow));
 
+        let mut s = closed(Reopen::NoAnswer);
+        assert_eq!(focus_with(&mut s, 7, false), failed(FocusFailure::NotResponding));
+
+        // A closed window counted as off screen, the user refused Automation: the advice is
+        // Automation, not the Accessibility setting.
+        let mut s =
+            Script { windows: VecDeque::from([WinState::OffScreen]), reopen: Reopen::Denied, ..Script::default() };
+        assert_eq!(focus_with(&mut s, 7, false), failed(FocusFailure::AutomationDenied));
+
         // A minimised window with the setting off: reopen tried, then the setting is the advice.
         let mut s = Script { windows: VecDeque::from([WinState::OffScreen]), ..Script::default() };
         assert_eq!(focus_with(&mut s, 7, false), failed(FocusFailure::AccessibilityOff));
@@ -1389,11 +1433,18 @@ mod tests {
         assert_eq!(failure(Allowed, None, OnScreen), FocusFailure::Refused);
         assert_eq!(failure(Untrusted, None, OnScreen), FocusFailure::AccessibilityUntrusted);
         assert_eq!(failure(Off, Some(Reopen::Sent), OffScreen), FocusFailure::AccessibilityOff);
-        assert_eq!(failure(Untrusted, Some(Reopen::Denied), OffScreen), FocusFailure::AccessibilityUntrusted);
-        assert_eq!(failure(Allowed, Some(Reopen::Denied), OffScreen), FocusFailure::AutomationDenied);
+        assert_eq!(failure(Off, None, OffScreen), FocusFailure::AccessibilityOff);
+        assert_eq!(failure(Untrusted, Some(Reopen::Sent), OffScreen), FocusFailure::AccessibilityUntrusted);
         assert_eq!(failure(Allowed, Some(Reopen::Sent), OffScreen), FocusFailure::Refused);
-        assert_eq!(failure(Untrusted, Some(Reopen::Denied), WinState::None), FocusFailure::AutomationDenied);
         assert_eq!(failure(Off, Some(Reopen::Sent), WinState::None), FocusFailure::NoWindow);
+        assert_eq!(failure(Off, Some(Reopen::Failed), WinState::None), FocusFailure::NoWindow);
+        // A refused or unanswered reopen wins over any Accessibility advice.
+        for ax in [Off, Allowed, Untrusted] {
+            for win in [OffScreen, WinState::None] {
+                assert_eq!(failure(ax, Some(Reopen::Denied), win), FocusFailure::AutomationDenied);
+                assert_eq!(failure(ax, Some(Reopen::NoAnswer), win), FocusFailure::NotResponding);
+            }
+        }
     }
 
     #[test]

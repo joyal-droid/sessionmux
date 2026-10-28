@@ -4786,6 +4786,7 @@ mod tests {
             (F::AutomationDenied, "focus-automation-denied"),
             (F::AccessibilityOff, "focus-accessibility-off"),
             (F::AccessibilityUntrusted, "focus-accessibility-untrusted"),
+            (F::NotResponding, "focus-not-responding"),
             (F::Gone, "focus-gone"),
             (F::Other, "focus-failed"),
         ];

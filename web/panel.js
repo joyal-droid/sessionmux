@@ -1315,6 +1315,8 @@ function initPanel() {
       toast('warn', title, name + "'s Claude window is minimised or hidden. Turn on 'Bring minimised Claude windows to the front' in Settings, or click its Claude icon in the Dock.", 12000, settings);
     } else if (reason === 'focus-refused') {
       toast('warn', title, 'macOS did not let Sessionmux bring ' + name + "'s Claude forward. Click its Claude icon in the Dock.", 12000);
+    } else if (reason === 'focus-not-responding') {
+      toast('warn', title, name + "'s Claude is not responding. Wait a moment and try again, or quit and reopen it.", 12000);
     } else if (reason === 'focus-gone') {
       toast('warn', title, name + "'s Claude quit before its window came forward. Click the account again to start it.", 12000);
     } else {

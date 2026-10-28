@@ -104,6 +104,8 @@ pub(crate) const ERR_NOT_PERMITTED: i32 = -1743;
 pub(crate) const ERR_NEEDS_CONSENT: i32 = -1744;
 /// `procNotFound`: the target process is gone.
 const ERR_PROC_NOT_FOUND: i32 = -600;
+/// `errAETimeout`: the target did not answer in time.
+const ERR_AE_TIMEOUT: i32 = -1712;
 /// `userCanceledErr`.
 const ERR_USER_CANCELED: isize = -128;
 /// `NSUserCancelledError`.
@@ -398,6 +400,8 @@ pub(crate) enum AeSendError {
     NotPermitted(i32),
     /// The target process is gone.
     Gone,
+    /// The target did not answer in time, with what timed out.
+    NoAnswer(String),
     /// Any other failure, with the API name and code.
     Failed(String),
 }
@@ -425,7 +429,7 @@ pub(crate) fn send_event_to_pid(
         .map_err(|e| AeSendError::Failed(format!("apple event thread: {e}")))?;
     let wait = if ask { ASK_WAIT } else { SEND_WAIT };
     rx.recv_timeout(wait)
-        .unwrap_or_else(|_| Err(AeSendError::Failed(format!("pid {pid} did not answer within {} s", wait.as_secs()))))
+        .unwrap_or_else(|_| Err(AeSendError::NoAnswer(format!("pid {pid} did not answer within {} s", wait.as_secs()))))
 }
 
 fn send_event_now(pid: Pid, class: u32, id: u32, text: Option<&str>, ask: bool) -> Result<(), AeSendError> {
@@ -470,6 +474,7 @@ fn send_event_now(pid: Pid, class: u32, id: u32, text: Option<&str>, ask: bool) 
         0 => Ok(()),
         ERR_NOT_PERMITTED | ERR_NEEDS_CONSENT => Err(AeSendError::NotPermitted(status)),
         ERR_PROC_NOT_FOUND => Err(AeSendError::Gone),
+        ERR_AE_TIMEOUT => Err(AeSendError::NoAnswer(format!("AESendMessage to pid {pid}: code {status}"))),
         other => Err(AeSendError::Failed(format!("AESendMessage to pid {pid}: code {other}"))),
     }
 }
@@ -481,7 +486,7 @@ fn send_get_url(pid: Pid, url: &str) -> Result<(), ForwardError> {
         AeSendError::NotPermitted(_) => ForwardError::NotPermitted,
         AeSendError::Gone => ForwardError::Failed(format!("Claude (pid {pid}) is no longer running")),
         AeSendError::Failed(e) if e == "text too long" => ForwardError::Failed("link too long".into()),
-        AeSendError::Failed(e) => ForwardError::Failed(e),
+        AeSendError::NoAnswer(e) | AeSendError::Failed(e) => ForwardError::Failed(e),
     })
 }
 
