@@ -655,6 +655,17 @@ mod tests {
         }
     }
 
+    /// Removes the apps from Launch Services when dropped, before their folder goes.
+    struct Unregister(Vec<PathBuf>);
+
+    impl Drop for Unregister {
+        fn drop(&mut self) {
+            for app in &self.0 {
+                let _ = std::process::Command::new(LSREGISTER).arg("-u").arg(app).status();
+            }
+        }
+    }
+
     /// Copy the stand-in Claude.app to `dir/<name>.app` under a bundle id no other copy has.
     /// Launch Services keeps a scheme's handler by bundle id, so copies that share one (other
     /// tests build their own stand-ins) could be read back in place of this one.
@@ -730,11 +741,14 @@ mod tests {
                 return;
             }
         };
-        // A plain folder under the temporary folder as the system names it (not a hidden one,
-        // and not the resolved /private path), so Launch Services treats the apps like others.
-        let d = tempfile::Builder::new().prefix("sessionmux-test-").tempdir().unwrap();
+        // Launch Services offers no handler from apps under the temporary folder, so the copies
+        // go in a folder of their own under ~/Applications, removed (and unregistered) at the end.
+        let apps = PathBuf::from(std::env::var_os("HOME").expect("HOME")).join("Applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        let d = tempfile::Builder::new().prefix("sessionmux-test-").tempdir_in(&apps).unwrap();
         let first = app_copy(&f, d.path(), "First");
         let second = app_copy(&f, d.path(), "Second");
+        let _unregister = Unregister(vec![first.clone(), second.clone()]);
         register(&first);
         register(&second);
         // Taking the scheme does not need a handler to exist yet; when Launch Services offers
