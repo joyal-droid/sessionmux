@@ -36,6 +36,7 @@
     - debug-symbol references               .pdb
     - extended-length device paths          \\?\C:\...  \\?\UNC\...
     - the build machine's identity          $env:USERNAME, $env:COMPUTERNAME, $env:USERDOMAIN
+                                            (on macOS and Linux: $env:USER and the host name)
                                             (generic values such as "user" or "runneradmin" are
                                             skipped; the path pattern above still catches them)
     - e-mail domains                        (set privately, see below)
@@ -124,15 +125,25 @@ foreach ($t in $PrivateTerms) {
 $Generic = @('user', 'users', 'admin', 'administrator', 'owner', 'guest', 'default', 'public', 'pc',
   'runner', 'runneradmin', 'builder', 'build', 'workgroup', 'localhost', 'system')
 $Skipped = New-Object System.Collections.Generic.List[string]
+# Each entry: the name shown when the value is skipped, the pattern's name and the value.
+$Identity = @()
 foreach ($var in @('USERNAME', 'COMPUTERNAME', 'USERDOMAIN')) {
-  $value = [Environment]::GetEnvironmentVariable($var)
+  $Identity += , @($var, "`$env:$var", [Environment]::GetEnvironmentVariable($var))
+}
+# macOS and Linux keep the account name in $USER and have no COMPUTERNAME.
+if ([System.IO.Path]::DirectorySeparatorChar -ne '\') {
+  $Identity += , @('USER', '$env:USER', $env:USER)
+  $Identity += , @('host name', 'host name', ([Environment]::MachineName -replace '\.local$', ''))
+}
+foreach ($entry in $Identity) {
+  $value = $entry[2]
   if (-not $value) { continue }
   $value = $value.Trim()
   if ($value.Length -lt 3 -or ($Generic -contains $value.ToLowerInvariant())) {
-    $Skipped.Add("$var (generic value)")
+    $Skipped.Add("$($entry[0]) (generic value)")
     continue
   }
-  Add-Pattern "`$env:$var" ([regex]::Escape($value))
+  Add-Pattern $entry[1] ([regex]::Escape($value))
 }
 
 $PngTextChunks = @('tEXt', 'iTXt', 'zTXt', 'eXIf')

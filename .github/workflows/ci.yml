@@ -175,7 +175,7 @@ jobs:
 
       - name: Upload smoke captures
         if: always()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: smoke-captures
           path: smoke/*.png
@@ -220,8 +220,20 @@ jobs:
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
           rustup default "$RUST_TOOLCHAIN"
-          rustup target add x86_64-apple-darwin
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      # Every part of the macOS app is implemented: no placeholder that only reports
+      # "unsupported" may remain.
+      - name: No placeholders left
+        run: |
+          mkdir -p ci-logs
+          if grep -rn 'unsupported(' src/platform/macos > ci-logs/stubs.log; then
+            cat ci-logs/stubs.log
+            echo 'No placeholders left' > ci-logs/stubs.failed
+            exit 1
+          fi
+          echo 'none found'
 
       - name: Clippy
         run: |
@@ -229,18 +241,12 @@ jobs:
           cargo clippy --all-targets --locked -- -D warnings 2>&1 | tee ci-logs/clippy.log \
             || { echo 'Clippy' > ci-logs/clippy.failed; exit 1; }
 
-      - name: Build (release)
+      # The hook helper tests run this build of the app.
+      - name: Build
         run: |
           mkdir -p ci-logs
-          cargo build --release --locked 2>&1 | tee ci-logs/build.log \
-            || { echo 'Build (release)' > ci-logs/build.failed; exit 1; }
-
-      # The Intel slice of the universal binary, built on this Apple silicon runner.
-      - name: Build Intel (release)
-        run: |
-          mkdir -p ci-logs
-          cargo build --release --locked --target x86_64-apple-darwin 2>&1 | tee ci-logs/build-intel.log \
-            || { echo 'Build Intel (release)' > ci-logs/build-intel.failed; exit 1; }
+          cargo build --locked 2>&1 | tee ci-logs/build.log \
+            || { echo 'Build' > ci-logs/build.failed; exit 1; }
 
       # Every test's output is kept, so the tests that could not check something on this runner
       # are reported by the next step.
@@ -272,6 +278,30 @@ jobs:
             exit 1
           fi
 
+      # The universal Sessionmux.app (arm64 + x86_64) exactly as a release builds it, with the
+      # disk image and the zip. The script also checks what it made: plutil -lint, codesign
+      # --verify --strict --all-architectures, lipo -verify_arch, the disk image mounts and holds
+      # the app and the Applications link, the zip extracts to an app with a valid signature, and
+      # the bundled binary passes --smoke and --notify-hook. Gatekeeper (spctl) is expected to
+      # reject an ad-hoc signed app; its answer is printed and does not fail the step.
+      - name: Bundle
+        run: |
+          mkdir -p ci-logs
+          sh scripts/bundle-macos.sh 0.0.0-ci dist-macos 2>&1 | tee ci-logs/bundle.log \
+            || { echo 'Bundle' > ci-logs/bundle.failed; exit 1; }
+
+      - name: Privacy scan
+        shell: pwsh
+        env:
+          # Extra words for the privacy scan that are kept out of the repository (optional secret).
+          SESSIONMUX_PRIVACY_TERMS: ${{ secrets.SESSIONMUX_PRIVACY_TERMS }}
+        run: |
+          & ./scripts/check-binary-privacy.ps1 dist-macos/Sessionmux.app dist-macos/BUILDINFO-macOS.txt
+          exit $LASTEXITCODE
+
+      - name: SHA-256 of the macOS files
+        run: cat dist-macos/SHA256SUMS-macos
+
       # The hook helpers exit 0 with no app running, whatever they are given.
       - name: Hook helper CLI
         run: |
@@ -279,7 +309,7 @@ jobs:
           run() {
             input=$1
             shift
-            printf '%s' "$input" | target/release/Sessionmux "$@" || {
+            printf '%s' "$input" | dist-macos/Sessionmux.app/Contents/MacOS/Sessionmux "$@" || {
               echo "Sessionmux $* with input '$input' exited with $?" | tee -a ci-logs/hooks.log
               echo 'Hook helper CLI' > ci-logs/hooks.failed
               exit 1
@@ -293,9 +323,9 @@ jobs:
           run 'not json' --approve-hook
           run '' --approve-hook
 
-      # The self-check with the demo data: floating button and panel captures, the panel's
-      # requests answered, memory figures. A crash, a hang or a result other than {"ok":true}
-      # fails the step; the captures are uploaded below.
+      # The self-check of the bundled app with the demo data: floating button and panel
+      # captures, the panel's requests answered, memory figures. A crash, a hang or a result
+      # other than {"ok":true} fails the step; the captures are uploaded below.
       - name: Smoke
         env:
           SESSIONMUX_SMOKE_FIXTURE: '1'
@@ -303,7 +333,7 @@ jobs:
         run: |
           mkdir -p ci-logs
           set +e
-          perl -e 'alarm shift; exec @ARGV or die' 90 target/release/Sessionmux --smoke > ci-logs/smoke.log 2>&1
+          perl -e 'alarm shift; exec @ARGV or die' 90 dist-macos/Sessionmux.app/Contents/MacOS/Sessionmux --smoke > ci-logs/smoke.log 2>&1
           code=$?
           set -e
           # The app's own log goes into the step log, so a failure report shows it too.
@@ -331,7 +361,7 @@ jobs:
 
       - name: Upload smoke output
         if: always()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: smoke-macos
           path: |
@@ -339,6 +369,18 @@ jobs:
             smoke/userData/*.log
             smoke/*.png
           if-no-files-found: warn
+
+      - name: Upload the app
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sessionmux-macos
+          path: |
+            dist-macos/Sessionmux-macOS.dmg
+            dist-macos/Sessionmux-macOS.zip
+            dist-macos/SHA256SUMS-macos
+            dist-macos/BUILDINFO-macOS.txt
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Report failed steps
         if: failure()
@@ -355,7 +397,261 @@ jobs:
             perl -i -ne 'print unless /^successes:$/ .. /^(failures:|test result:.*)$/' "$plain"
             # The failing tests and compiler errors first, then the end of the output, in pieces
             # small enough for one annotation each.
+            { grep -E -A8 '^---- |panicked at|^error(\[|:)|^bundle-macos: ' "$plain" | head -n 400; echo '[...]'; tail -n 25 "$plain"; } \
+              > "$f.txt"
+            split -b 3500 "$f.txt" "$f.part."
+            for p in $(ls "$f".part.* | head -n 8); do
+              body=$(perl -pe 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g' "$p")
+              echo "::error title=$title log::$body"
+            done
+          done
+
+  # The same tests and self-check on an Intel Mac and on the newest macOS. On macOS 26.4 and
+  # later every change of the link handler waits for a person to answer a system question, so
+  # the tests check that the app knows this and skip the round trip with a printed reason.
+  macos-more:
+    name: macOS test (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Intel
+            runner: macos-15-intel
+          - label: macOS 26
+            runner: macos-26
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.runner }}
+
+      - name: Build (release)
+        run: |
+          mkdir -p ci-logs
+          uname -m
+          sw_vers
+          cargo build --release --locked 2>&1 | tee ci-logs/build.log \
+            || { echo 'Build (release)' > ci-logs/build.failed; exit 1; }
+
+      - name: Test
+        run: |
+          mkdir -p ci-logs
+          cargo test --locked -- --show-output 2>&1 | tee ci-logs/test.log \
+            || { echo 'Test' > ci-logs/test.failed; exit 1; }
+
+      # As in the macOS job: every skipped check becomes a warning and a line in the summary.
+      - name: Skipped checks
+        run: |
+          perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g' ci-logs/test.log \
+            | awk '/^---- .* (stdout|stderr) ----$/ { name = $2; next }
+                   /^(successes|failures):$/ { name = "" }
+                   name != "" && /skipped|not checked/ { print name ": " $0 }' > ci-logs/skips.txt
+          {
+            echo "### Checks the tests could not make on this runner ($(sw_vers -productVersion), $(uname -m))"
+            if [ -s ci-logs/skips.txt ]; then sed 's/^/- /' ci-logs/skips.txt; else echo 'None.'; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r line; do
+            echo "::warning title=Skipped check::$(printf '%s' "$line" | sed 's/%/%25/g')"
+          done < ci-logs/skips.txt
+          if grep -E 'skipped: (no C compiler|no built)' ci-logs/skips.txt; then
+            echo 'A test that must run on this runner was skipped.'
+            exit 1
+          fi
+
+      - name: Hook helper CLI
+        run: |
+          mkdir -p ci-logs
+          run() {
+            input=$1
+            shift
+            printf '%s' "$input" | target/release/Sessionmux "$@" || {
+              echo "Sessionmux $* with input '$input' exited with $?" | tee -a ci-logs/hooks.log
+              echo 'Hook helper CLI' > ci-logs/hooks.failed
+              exit 1
+            }
+            echo "Sessionmux $* with input '$input': exit 0" | tee -a ci-logs/hooks.log
+          }
+          run '{}' --notify-hook
+          run 'not json' --notify-hook
+          run '' --notify-hook
+          run '{}' --approve-hook
+          run 'not json' --approve-hook
+          run '' --approve-hook
+
+      - name: Smoke
+        env:
+          SESSIONMUX_SMOKE_FIXTURE: '1'
+          SESSIONMUX_SMOKE_GESTURE: '1'
+        run: |
+          mkdir -p ci-logs
+          set +e
+          perl -e 'alarm shift; exec @ARGV or die' 90 target/release/Sessionmux --smoke > ci-logs/smoke.log 2>&1
+          code=$?
+          set -e
+          for f in smoke/userData/*.log; do [ -e "$f" ] && cat "$f" >> ci-logs/smoke.log; done
+          echo "smoke exit code: $code" >> ci-logs/smoke.log
+          cat ci-logs/smoke.log
+          ls -l smoke/*.png || true
+          if [ "$code" -ne 0 ] || ! grep -q '"ok":true' ci-logs/smoke.log; then
+            echo 'Smoke' > ci-logs/smoke.failed
+            exit 1
+          fi
+          for want in '"gesture":true' '"menuBar":{' 'smoke: tray shown' 'smoke: hotkey .* registered'; do
+            if ! grep -q "$want" ci-logs/smoke.log; then
+              echo "smoke: '$want' is missing from the output" | tee -a ci-logs/smoke.log
+              echo 'Smoke' > ci-logs/smoke.failed
+              exit 1
+            fi
+          done
+
+      - name: Upload smoke output
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smoke-macos-${{ matrix.runner }}
+          path: |
+            ci-logs/smoke.log
+            smoke/userData/*.log
+            smoke/*.png
+          if-no-files-found: warn
+
+      - name: Report failed steps
+        if: failure()
+        shell: bash
+        run: |
+          for f in ci-logs/*.failed; do
+            [ -e "$f" ] || continue
+            title=$(tr -d '\r\n' < "$f" | sed 's/%/%25/g; s/:/%3A/g; s/,/%2C/g')
+            log="${f%.failed}.log"
+            plain="$f.plain"
+            perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g' "$log" > "$plain"
+            perl -i -ne 'print unless /^successes:$/ .. /^(failures:|test result:.*)$/' "$plain"
             { grep -E -A8 '^---- |panicked at|^error(\[|:)' "$plain" | head -n 400; echo '[...]'; tail -n 25 "$plain"; } \
+              > "$f.txt"
+            split -b 3500 "$f.txt" "$f.part."
+            for p in $(ls "$f".part.* | head -n 8); do
+              body=$(perl -pe 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g' "$p")
+              echo "::error title=$title log::$body"
+            done
+          done
+
+  # Two macOS users on one Mac at the same time: each gets its own instance lock and socket,
+  # neither reaches the other's socket, and a "show" request stays with its own user. The script
+  # creates a throwaway second user and deletes it again.
+  macos-two-user:
+    name: macOS two users
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Two users
+        run: |
+          mkdir -p ci-logs
+          sh scripts/macos-two-user.sh 2>&1 | tee ci-logs/two-user.log \
+            || { echo 'Two users' > ci-logs/two-user.failed; exit 1; }
+
+      - name: Report failed steps
+        if: failure()
+        shell: bash
+        run: |
+          for f in ci-logs/*.failed; do
+            [ -e "$f" ] || continue
+            title=$(tr -d '\r\n' < "$f" | sed 's/%/%25/g; s/:/%3A/g; s/,/%2C/g')
+            log="${f%.failed}.log"
+            plain="$f.plain"
+            perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g' "$log" > "$plain"
+            { grep -E -A8 '^---- |panicked at|^error(\[|:)|^macos-two-user: ' "$plain" | head -n 400; echo '[...]'; tail -n 25 "$plain"; } \
+              > "$f.txt"
+            split -b 3500 "$f.txt" "$f.part."
+            for p in $(ls "$f".part.* | head -n 8); do
+              body=$(perl -pe 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g' "$p")
+              echo "::error title=$title log::$body"
+            done
+          done
+
+  # Weekly: the same commit built twice, the second time from another folder, must give the same
+  # universal binary bit for bit.
+  macos-repro:
+    name: macOS reproducible build
+    if: github.event_name == 'schedule'
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build twice and compare
+        env:
+          SESSIONMUX_BUNDLE_SKIP_RUN: '1'
+        run: |
+          mkdir -p ci-logs
+          {
+            sh scripts/bundle-macos.sh 0.0.0-ci "$RUNNER_TEMP/first"
+            second="$RUNNER_TEMP/second-checkout"
+            rsync -a --exclude /target --exclude /ci-logs ./ "$second/"
+            (cd "$second" && sh scripts/bundle-macos.sh 0.0.0-ci "$RUNNER_TEMP/second")
+          } > ci-logs/repro.log 2>&1 || { tail -n 60 ci-logs/repro.log; echo 'Build twice' > ci-logs/repro.failed; exit 1; }
+          line='  Sessionmux.app/Contents/MacOS/Sessionmux$'
+          a=$(grep "$line" "$RUNNER_TEMP/first/SHA256SUMS-macos")
+          b=$(grep "$line" "$RUNNER_TEMP/second/SHA256SUMS-macos")
+          echo "first:  $a"
+          echo "second: $b"
+          {
+            echo '### Reproducible macOS build'
+            echo "- first build: \`$a\`"
+            echo "- second build, other folder: \`$b\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$a" ] || [ "$a" != "$b" ]; then
+            echo 'The two builds of the same commit differ.' | tee -a ci-logs/repro.log
+            echo 'Build twice' > ci-logs/repro.failed
+            exit 1
+          fi
+
+      - name: Report failed steps
+        if: failure()
+        shell: bash
+        run: |
+          for f in ci-logs/*.failed; do
+            [ -e "$f" ] || continue
+            title=$(tr -d '\r\n' < "$f" | sed 's/%/%25/g; s/:/%3A/g; s/,/%2C/g')
+            log="${f%.failed}.log"
+            plain="$f.plain"
+            perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g' "$log" > "$plain"
+            { grep -E -A8 '^error(\[|:)|^bundle-macos: ' "$plain" | head -n 400; echo '[...]'; tail -n 25 "$plain"; } \
               > "$f.txt"
             split -b 3500 "$f.txt" "$f.part."
             for p in $(ls "$f".part.* | head -n 8); do
