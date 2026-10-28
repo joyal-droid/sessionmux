@@ -45,7 +45,9 @@
 //! background #101114, navigation restricted to the embedded origin ([`origin_prefix`]), new
 //! windows denied (http/https ones are forwarded as `openExternal`). The window host adds what
 //! only its system has (on Windows: browser accelerator keys off, the https mapping, the browser
-//! arguments, no default context menu). Web data lives in `<user_data>\WebView2`.
+//! arguments, no default context menu). Web data lives in `<user_data>\WebView2` on Windows; on
+//! macOS the page keeps nothing (a non-persistent data store) and the fraudulent-website warning,
+//! which would look the page's address up, is off.
 //!
 //! Behaviour notes for the app:
 //! - `create` blocks ~100–500 ms while the web view starts and **pumps the thread's message queue**
@@ -337,10 +339,15 @@ impl Panel {
             // No clipboard-read auto-grant (wry's clipboard flag only grants reads); the page
             // only writes (navigator.clipboard.writeText), which needs no permission.
             .with_clipboard(false);
+        // Nothing the page does is kept between openings.
+        #[cfg(target_os = "macos")]
+        let builder = builder.with_incognito(true);
         let webview = PanelWindow::configure(builder)
             .build(host)
             .map_err(|e| format!("{}: {e}", <PanelWindow as PanelHost>::ENGINE))?;
         host.after_build(&webview);
+        #[cfg(target_os = "macos")]
+        no_fraud_lookups(&webview);
         let webview = Rc::new(webview);
         *shared.webview.borrow_mut() = Rc::downgrade(&webview);
         Ok((webview, shared, context))
@@ -441,6 +448,23 @@ impl Drop for Panel {
         if let Some(h) = self.host.take() {
             h.destroy();
         }
+    }
+}
+
+/// Turn off the fraudulent-website warning, which would send the page's address to a lookup
+/// service; the panel only ever shows its own embedded page.
+#[cfg(target_os = "macos")]
+fn no_fraud_lookups(webview: &WebView) {
+    use wry::WebViewExtMacOS;
+    let wk = webview.webview();
+    // SAFETY: `configuration` and `preferences` return the live configuration objects of the web
+    // view just built, on the main thread that owns it.
+    let still_on = unsafe {
+        wk.configuration().preferences().setFraudulentWebsiteWarningEnabled(false);
+        wk.configuration().preferences().isFraudulentWebsiteWarningEnabled()
+    };
+    if still_on {
+        log::warn("panel: the fraudulent-website warning could not be turned off");
     }
 }
 

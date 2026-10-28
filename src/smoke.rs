@@ -51,6 +51,11 @@
 //! first of them waiting for a permission, and Client has hit its session limit. Two approve
 //! requests (with no hook helper behind them) are added before the approvals capture. The
 //! sign-in notice is always captured in this mode.
+//!
+//! On macOS the run is the same (`Sessionmux --smoke`, folders with `/`): AppKit finishes
+//! launching without the app's run loop, the pump runs AppKit events, posted work and timers,
+//! the panel is captured with the web view's own snapshot, memory figures count the WebKit
+//! processes working for Sessionmux, and the demo installation is a `Claude.app` bundle.
 
 use crate::app;
 use crate::brand;
@@ -114,6 +119,8 @@ pub fn run() -> i32 {
 fn steps(out_dir: &Path) -> Result<serde_json::Value, String> {
     let t0 = Instant::now();
     app::init(true)?;
+    #[cfg(target_os = "macos")]
+    crate::platform::capture::begin_self_check();
     if fixture_enabled() {
         app::smoke_seed_feature_fixture(&demo_sessions(), DEMO_LIMITED_ACCOUNT);
     }
@@ -382,10 +389,19 @@ fn seed_fixture(user_data: &Path) -> Result<(), String> {
     // From here on the well-known folders resolve inside the fixture. The environment is left
     // alone, so the WebView2 processes keep the real profile folders for their own caches.
     paths::set_folders(Some((home, roaming, local.clone())));
-    let install_dir = local.join("AnthropicClaude");
+    #[cfg(windows)]
+    let (kind, install_dir, exe) = {
+        let dir = local.join("AnthropicClaude");
+        ("installer", dir.clone(), dir.join("claude.exe"))
+    };
+    #[cfg(target_os = "macos")]
+    let (kind, install_dir, exe) = {
+        let bundle = local.join("Applications").join("Claude.app");
+        ("bundle", bundle.clone(), bundle.join("Contents").join("MacOS").join("Claude"))
+    };
     crate::core::claude_app::set_fixture(Some(crate::core::claude_app::Located {
-        kind: "installer",
-        exe: s(&install_dir.join("claude.exe")),
+        kind,
+        exe: s(&exe),
         install_dir: s(&install_dir),
         aumid: None,
         family: None,
