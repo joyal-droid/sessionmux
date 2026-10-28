@@ -55,7 +55,9 @@
 //! On macOS the run is the same (`Sessionmux --smoke`, folders with `/`): AppKit finishes
 //! launching without the app's run loop, the pump runs AppKit events, posted work and timers,
 //! the panel is captured with the web view's own snapshot, memory figures count the WebKit
-//! processes working for Sessionmux, and the demo installation is a `Claude.app` bundle.
+//! processes working for Sessionmux, and the demo installation is a `Claude.app` bundle. After
+//! the idle figures, the menu bar icon is created and the shortcut registered, then both are
+//! removed again; a failure of either fails the run, and the result carries `"menuBar"`.
 
 use crate::app;
 use crate::brand;
@@ -221,9 +223,13 @@ fn steps(out_dir: &Path) -> Result<serde_json::Value, String> {
     if !page_errors.is_empty() {
         log::warn(&format!("smoke: page errors: {page_errors:?}"));
     }
+    // The menu bar icon and the shortcut, which the app itself does not create in smoke mode.
+    #[cfg(target_os = "macos")]
+    let menu_bar = app::smoke_menu_bar_and_shortcut()?;
 
     let mb = |b: u64| ((b as f64 / (1024.0 * 1024.0)) * 10.0).round() / 10.0;
-    Ok(json!({
+    #[allow(unused_mut)]
+    let mut result = json!({
         "ok": true,
         "accounts": accounts,
         "discovered": discovered,
@@ -246,7 +252,12 @@ fn steps(out_dir: &Path) -> Result<serde_json::Value, String> {
         "privateIdleMb": mb(private_idle),
         "webviewProcsAfterDestroy": webview_after,
         "elapsedMs": t0.elapsed().as_millis() as u64,
-    }))
+    });
+    #[cfg(target_os = "macos")]
+    {
+        result["menuBar"] = menu_bar;
+    }
+    Ok(result)
 }
 
 /// True when `SESSIONMUX_SMOKE_FIXTURE` is set to anything but "" or "0".

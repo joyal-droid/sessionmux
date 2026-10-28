@@ -3800,6 +3800,29 @@ pub fn smoke_bubble_rect() -> Option<(Rect, f32)> {
     Some((r, <Os as Desktop>::units_per_dip(&r)))
 }
 
+/// Create the menu bar icon with the current menu and register the shortcut, then remove both
+/// again (the self-check keeps neither). Main thread only. What was checked, or why it failed.
+#[cfg(target_os = "macos")]
+pub fn smoke_menu_bar_and_shortcut() -> Result<Value, String> {
+    let (items, mode, hotkey) = with_state(|st| {
+        let items: Vec<(String, String, bool)> =
+            st.last_accounts.iter().map(|a| (a.id.clone(), a.name.clone(), a.running)).collect();
+        (items, bubble_mode_str(st).to_string(), st.settings.hotkey.clone())
+    })
+    .ok_or("app state busy")?;
+    let mut tray = <Tray as TrayHost>::create().map_err(|e| format!("tray: {e}"))?;
+    tray.set_menu(&TrayMenu::new(&items, true, &mode));
+    tray.set_waiting(1);
+    tray.set_waiting(0);
+    let anchored = tray.anchor().is_some();
+    drop(tray);
+    log::info(&format!("smoke: tray shown ({} accounts, anchored {anchored})", items.len()));
+    <Os as HotkeyHost>::register(HOTKEY_ID, &hotkey).map_err(|e| format!("hotkey {hotkey}: {e}"))?;
+    <Os as HotkeyHost>::unregister(HOTKEY_ID);
+    log::info(&format!("smoke: hotkey {hotkey} registered"));
+    Ok(json!({ "tray": true, "trayAnchored": anchored, "hotkey": hotkey }))
+}
+
 /// Number of accounts the mini tray shows.
 pub fn smoke_tray_accounts() -> usize {
     with_state(|st| st.last_accounts.len().clamp(1, TRAY_MAX_ACCOUNTS)).unwrap_or(1)
