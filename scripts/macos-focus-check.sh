@@ -366,7 +366,8 @@ log "startup log: $startup_note"
 # ---------------------------------------------------------------- 4. Automation permission
 
 tcc="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
-req_of() { codesign -d -r- "$1" 2>&1 | sed -n 's/^designated => //p' | head -n 1; }
+# An ad hoc signature has an implicit requirement, printed as "# designated => cdhash ...".
+req_of() { codesign -d -r- "$1" 2>&1 | sed -n "s/^[# ]*designated => //p" | head -n 1; }
 blob_of() { # requirement text -> hex of its compiled form
     printf '%s' "$1" | csreq -r- -b "$WORK/req.bin" >/dev/null 2>&1 && xxd -p "$WORK/req.bin" | tr -d '\n'
 }
