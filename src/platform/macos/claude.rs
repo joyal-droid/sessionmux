@@ -98,7 +98,7 @@ const ACTIVE_WAIT: Duration = Duration::from_millis(500);
 /// How often that is checked, and how long one check may wait for the main thread.
 const ACTIVE_POLL: Duration = Duration::from_millis(25);
 const ACTIVE_ASK_WAIT: Duration = Duration::from_millis(250);
-/// How long a minimised or hidden window may take to leave the screen.
+/// How long a minimised window may take to leave the screen.
 const MINIMISE_WAIT: Duration = Duration::from_millis(1000);
 /// How long an instance asked to show itself may take to put a window on screen.
 const REOPEN_WAIT: Duration = Duration::from_millis(1500);
@@ -349,8 +349,8 @@ pub(crate) trait FocusSteps {
     /// Activate Sessionmux on the main thread, so it holds activation it may pass on. Nothing on
     /// other threads: the click, menu choice or shortcut took the activation already.
     fn activate_self(&mut self);
-    /// Show `pid` again when it is hidden (as a click on Sessionmux may have left it). True when
-    /// it was hidden.
+    /// Show `pid` again when it is hidden (as Hide in its menu leaves it). True when it was
+    /// hidden.
     fn unhide(&mut self, pid: Pid) -> bool;
     /// Pass activation to `pid` and ask it to come forward with all its windows.
     fn pass_activation(&mut self, pid: Pid);
@@ -421,22 +421,16 @@ pub(crate) trait MinimiseSteps {
     fn accessibility(&mut self) -> AxState;
     /// Minimise `pid`'s window in front through Accessibility. True when that was accepted.
     fn minimise_with_accessibility(&mut self, pid: Pid) -> bool;
-    /// Hide the app `pid` with all its windows, as Hide in its menu does. True when the request
-    /// was accepted.
-    fn hide(&mut self, pid: Pid) -> bool;
     /// Wait a little for `pid` to have no window on screen. True when it has none.
     fn wait_until_gone(&mut self, pid: Pid) -> bool;
 }
 
-/// Put away `pid`'s window that is in front: minimised to the Dock through Accessibility when
-/// raising through it is allowed (so the next click can un-minimise it), else the app hidden,
-/// which needs no permission (each account is its own app instance). Activation shows a hidden
-/// app again.
+/// Put away `pid`'s window that is in front: minimised to the Dock through Accessibility, only
+/// when raising through it is allowed (so the next click can un-minimise it). Without that,
+/// nothing is tried: macOS refuses to hide another app for Sessionmux, and the attempt can move
+/// the activation to a third app, so the click then brings the window forward as before.
 pub(crate) fn minimise_with(s: &mut impl MinimiseSteps, pid: Pid) -> FocusResult {
     if s.accessibility() == AxState::Allowed && s.minimise_with_accessibility(pid) && s.wait_until_gone(pid) {
-        return FocusResult::Minimised;
-    }
-    if s.hide(pid) && s.wait_until_gone(pid) {
         return FocusResult::Minimised;
     }
     FocusResult::Failed(FocusFailure::Refused)
@@ -525,7 +519,7 @@ impl FocusSteps for SystemFocus {
     }
 
     fn unhide(&mut self, pid: Pid) -> bool {
-        let shown = set_hidden(pid, false);
+        let shown = unhide_app(pid);
         if let Some(sent) = shown {
             log::debug(&format!("claude_app: pid {pid} was hidden; shown again: {sent}"));
             self.report.activation.push(format!("unhide={sent}"));
@@ -619,16 +613,16 @@ impl FocusSteps for SystemFocus {
     }
 }
 
-/// Hide or show the app `pid`, on the main thread, when it is not already so. None when nothing
-/// had to change (or the app is unknown); else whether the request was accepted.
-fn set_hidden(pid: Pid, hide: bool) -> Option<bool> {
+/// Show the app `pid` again, on the main thread, when it is hidden. None when it was not hidden
+/// (or the app is unknown); else whether the request was accepted.
+fn unhide_app(pid: Pid) -> Option<bool> {
     let p = ns_pid(pid)?;
     on_main_wait(MAIN_WAIT, move |_| {
         let app = NSRunningApplication::runningApplicationWithProcessIdentifier(p)?;
-        if app.isHidden() == hide {
+        if !app.isHidden() {
             return None;
         }
-        Some(if hide { app.hide() } else { app.unhide() })
+        Some(app.unhide())
     })
     .flatten()
 }
@@ -656,12 +650,6 @@ impl MinimiseSteps for SystemMinimise {
         let (ok, note) = ax_minimise(pid);
         self.notes.push(format!("ax-minimise [{note}]"));
         ok
-    }
-
-    fn hide(&mut self, pid: Pid) -> bool {
-        let sent = set_hidden(pid, true);
-        self.notes.push(format!("hide={}", sent.map_or_else(|| "not needed".to_string(), |b| b.to_string())));
-        sent.unwrap_or(true)
     }
 
     fn wait_until_gone(&mut self, pid: Pid) -> bool {
@@ -1452,7 +1440,6 @@ mod tests {
         steps: Vec<String>,
         ax: AxState,
         ax_ok: bool,
-        hide_ok: bool,
         /// `wait_until_gone` answers, in order; false once used up.
         gone: VecDeque<bool>,
     }
@@ -1466,50 +1453,40 @@ mod tests {
             self.steps.push(format!("ax-minimise-{pid}"));
             self.ax_ok
         }
-        fn hide(&mut self, pid: Pid) -> bool {
-            self.steps.push(format!("hide-{pid}"));
-            self.hide_ok
-        }
         fn wait_until_gone(&mut self, pid: Pid) -> bool {
             self.steps.push(format!("gone?-{pid}"));
             self.gone.pop_front().unwrap_or(false)
         }
     }
 
-    fn put(ax: AxState, ax_ok: bool, hide_ok: bool, gone: &[bool]) -> Put {
-        Put { steps: Vec::new(), ax, ax_ok, hide_ok, gone: gone.iter().copied().collect() }
+    fn put(ax: AxState, ax_ok: bool, gone: &[bool]) -> Put {
+        Put { steps: Vec::new(), ax, ax_ok, gone: gone.iter().copied().collect() }
     }
 
     #[test]
     fn minimise_uses_accessibility_when_allowed() {
-        let mut s = put(AxState::Allowed, true, true, &[true]);
+        let mut s = put(AxState::Allowed, true, &[true]);
         assert_eq!(minimise_with(&mut s, 7), FocusResult::Minimised);
         assert_eq!(s.steps, ["ax?", "ax-minimise-7", "gone?-7"]);
     }
 
     #[test]
-    fn minimise_hides_the_app_without_accessibility() {
+    fn minimise_tries_nothing_without_accessibility() {
         for ax in [AxState::Off, AxState::Untrusted] {
-            let mut s = put(ax, true, true, &[true]);
-            assert_eq!(minimise_with(&mut s, 7), FocusResult::Minimised);
-            assert_eq!(s.steps, ["ax?", "hide-7", "gone?-7"]);
+            let mut s = put(ax, true, &[true]);
+            assert_eq!(minimise_with(&mut s, 7), failed(FocusFailure::Refused));
+            assert_eq!(s.steps, ["ax?"]);
         }
-        // Accessibility refused the request, or the window stayed: the app is hidden instead.
-        let mut s = put(AxState::Allowed, false, true, &[true]);
-        assert_eq!(minimise_with(&mut s, 7), FocusResult::Minimised);
-        assert_eq!(s.steps, ["ax?", "ax-minimise-7", "hide-7", "gone?-7"]);
-        let mut s = put(AxState::Allowed, true, true, &[false, true]);
-        assert_eq!(minimise_with(&mut s, 7), FocusResult::Minimised);
-        assert_eq!(s.steps, ["ax?", "ax-minimise-7", "gone?-7", "hide-7", "gone?-7"]);
     }
 
     #[test]
     fn a_window_that_stays_on_screen_is_reported() {
-        let mut s = put(AxState::Off, true, false, &[]);
+        let mut s = put(AxState::Allowed, false, &[]);
         assert_eq!(minimise_with(&mut s, 7), failed(FocusFailure::Refused));
-        assert_eq!(s.steps, ["ax?", "hide-7"]);
-        let mut s = put(AxState::Off, true, true, &[false]);
+        assert_eq!(s.steps, ["ax?", "ax-minimise-7"]);
+        let mut s = put(AxState::Allowed, true, &[false]);
         assert_eq!(minimise_with(&mut s, 7), failed(FocusFailure::Refused));
+        assert_eq!(s.steps, ["ax?", "ax-minimise-7", "gone?-7"]);
     }
 
     #[test]

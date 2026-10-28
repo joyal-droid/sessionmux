@@ -51,8 +51,8 @@ pub enum FocusResult {
     NeedsHandOff,
     /// The window did not come forward, for the given reason.
     Failed(FocusFailure),
-    /// The window was in front, and a click on its account put it away (minimised, or the app
-    /// hidden), as a click on a taskbar button does.
+    /// The window was in front, and a click on its account minimised it, as a click on a taskbar
+    /// button does.
     Minimised,
 }
 
