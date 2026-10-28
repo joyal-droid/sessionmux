@@ -25,11 +25,17 @@
 //! Run with:
 //!   PowerShell: $env:SESSIONMUX_LIVE = '1'; cargo test livetest -- --ignored --nocapture
 //!   cmd:        set "SESSIONMUX_LIVE=1" && cargo test livetest -- --ignored --nocapture
+//!   macOS:      SESSIONMUX_LIVE=1 cargo test livetest -- --ignored --nocapture
 //!
 //! It locates Claude Desktop, lists its processes, lists the accounts from a temp copy of the
 //! real store, focuses each running account's window (or relaunches a tray-hidden one, which is
 //! what the app does), then copies one quiet session from Main into the first extra account and
 //! removes the copy again. Set SESSIONMUX_LIVE_KEEP=1 to keep the copied session.
+//!
+//! On macOS a running account without a window is left as it is: starting Claude again on a data
+//! folder that already runs would open a second instance instead of showing the first. Focusing
+//! from the test thread cannot pass activation on (no event loop runs), so the printed focus
+//! result there only shows whether the window was already in front.
 #![cfg(test)]
 
 use crate::core::accounts::AccountsStore;
@@ -72,6 +78,11 @@ fn switch_to(loc: &claude_app::Located, procs: &[Proc], name: &str, dir: Option<
         std::thread::sleep(Duration::from_millis(500));
         let fg = <Os as Windows>::foreground_pid();
         println!("   focus pid {} -> {ok}; foreground pid now {:?} (match={})", p.pid, fg, fg == Some(p.pid));
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    if !mine.is_empty() {
+        println!("   running without a window: not started again (show it from its Dock icon)");
         return;
     }
     // Tray-hidden (hwnd 0) or not running: launching again hands off to Claude's single instance.
