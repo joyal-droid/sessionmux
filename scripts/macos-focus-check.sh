@@ -213,10 +213,18 @@ restore_windows() {
     sleep 1
 }
 
-# Show a hidden process again and put it in front.
+# Show a process again when it is hidden; a visible one is left as it is.
+show_process() {
+    sysevents -e "set p to first process whose unix id is $1" \
+        -e 'if not (visible of p) then set visible of p to true' >/dev/null
+}
+
+# Put a process in front by its own pid (System Events may pick another instance of the same app).
 bring_front() {
-    sysevents -e "set p to first process whose unix id is $1" -e 'set visible of p to true' \
-        -e 'set frontmost of p to true'
+    show_process "$1"
+    osascript -l JavaScript -e "ObjC.import('AppKit');
+        var a = \$.NSRunningApplication.runningApplicationWithProcessIdentifier($1);
+        a.isNil() ? 'no such app' : (a.activateWithOptions(1) ? 'activated' : 'refused')" 2>&1
     sleep 2
 }
 
@@ -269,9 +277,11 @@ setup_step() {
             case "$r" in error*) echo "$r" ;; *) echo "note: $r, TextEdit in front" ;; esac
             ;;
         S8)
-            restore_windows "$second"
-            r="$(bring_front "$second")"
-            if ! has_open_window "$second"; then
+            # S7 leaves Second's window open and in front; it is brought forward only if not.
+            has_open_window "$second" || restore_windows "$second"
+            r=""
+            [ "$(front_pid)" = "$second" ] || r="$(bring_front "$second")"
+            if ! has_open_window "$second" && ! any_window "$second"; then
                 echo "error: Second's Claude has no open window ($(open_window "$second"); windows: $(window_count "$second"))"
             elif [ "$(front_pid)" != "$second" ]; then
                 echo "error: Second's Claude did not come to the front (front pid $(front_pid)${r:+, $r})"
@@ -284,7 +294,7 @@ setup_step() {
             ;;
         S5)
             # Second may still be hidden when S9 failed; it is shown again before its window is closed.
-            sysevents -e "set visible of (first process whose unix id is $second) to true" >/dev/null
+            show_process "$second"
             # A stopped app's visible window is still brought forward by the window server, so
             # the window is closed first: a stopped Claude cannot show it again.
             restore_windows "$second"
