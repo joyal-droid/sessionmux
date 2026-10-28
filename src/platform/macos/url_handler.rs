@@ -636,6 +636,7 @@ mod tests {
     #[link(name = "CoreServices", kind = "framework")]
     extern "C" {
         fn LSRegisterURL(url: *const c_void, update: u8) -> i32;
+        fn LSCopyDefaultHandlerForURLScheme(scheme: &CFString) -> *const CFString;
     }
 
     const LSREGISTER: &str = concat!(
@@ -676,6 +677,33 @@ mod tests {
         other.canonicalize().unwrap()
     }
 
+    /// What Launch Services knows about the test scheme, for a failure message.
+    fn scheme_report(apps: &[&Path]) -> String {
+        // SAFETY: the scheme string lives for the call; the result follows the create rule and
+        // is only read here (and left to the end of the test process).
+        let default = unsafe { LSCopyDefaultHandlerForURLScheme(&CFString::from_str(fake::SCHEME)).as_ref() }
+            .map(|id| id.to_string());
+        let dump = std::process::Command::new(LSREGISTER).arg("-dump").output();
+        let claims = match dump {
+            Ok(o) => {
+                let text = String::from_utf8_lossy(&o.stdout);
+                let lines: Vec<&str> = text.lines().filter(|l| l.contains(fake::SCHEME)).take(8).collect();
+                let mut found = Vec::new();
+                for app in apps {
+                    let name = app.to_string_lossy();
+                    found.push(format!("{}: {}", name, text.contains(name.as_ref())));
+                }
+                format!("{} lines name the scheme {lines:?}; apps listed: {found:?}", lines.len())
+            }
+            Err(e) => format!("lsregister -dump: {e}"),
+        };
+        format!(
+            "current {:?}; https handler {:?}; default bundle id {default:?}; {claims}",
+            Os::current(fake::SCHEME),
+            Os::current("https"),
+        )
+    }
+
     /// Wait for a change result: done now, or pending and then reading as asked.
     fn settles(r: HandlerChange, app: &Path) -> bool {
         match r {
@@ -711,7 +739,8 @@ mod tests {
         register(&second);
         assert!(
             wait_for(10, || Os::current(fake::SCHEME).is_some()),
-            "Launch Services lists no app for the test scheme after registering two"
+            "Launch Services lists no app for the test scheme after registering two: {}",
+            scheme_report(&[&first, &second])
         );
 
         let (a, b) = (first.clone(), second.clone());
