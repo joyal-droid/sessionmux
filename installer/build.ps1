@@ -136,9 +136,16 @@ function Get-ReleaseRustflags {
 
 # ---------------------------------------------------------------- version (Cargo.toml)
 $Version = $null
+$FileVersion = $null
 foreach ($line in Get-Content -LiteralPath (Join-Path $Root 'Cargo.toml')) {
-  # first `version = "x.y.z"` line = [package] version (dependencies are inline tables)
-  if ($line -match '^\s*version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"') { $Version = $Matches[1]; break }
+  # first `version = "x.y.z"` or `version = "x.y.z-pre"` line = [package] version (dependencies
+  # are inline tables)
+  if ($line -match '^\s*version\s*=\s*"(([0-9]+\.[0-9]+\.[0-9]+)(-[0-9A-Za-z.-]+)?)"') {
+    $Version = $Matches[1]
+    # Windows file versions are four numbers: 1.0.0 -> 1.0.0.0, 1.1.0-preview.1 -> 1.1.0.0.
+    $FileVersion = "$($Matches[2]).0"
+    break
+  }
 }
 if (-not $Version) { Fail 'could not read the package version from Cargo.toml' }
 
@@ -346,7 +353,7 @@ if (Test-Path -LiteralPath $Out) { Remove-Item -LiteralPath $Out -Force }
 
 function Invoke-Makensis([string]$outFile, [string[]]$extra) {
   $ErrorActionPreference = 'Continue'
-  & $MakensisExe /V2 /INPUTCHARSET UTF8 @extra "/DVERSION=$Version" "/DSTAGE_DIR=$Stage" "/DOUT_FILE=$outFile" "/DICON_FILE=$Icon" $Nsi
+  & $MakensisExe /V2 /INPUTCHARSET UTF8 @extra "/DVERSION=$Version" "/DFILE_VERSION=$FileVersion" "/DSTAGE_DIR=$Stage" "/DOUT_FILE=$outFile" "/DICON_FILE=$Icon" $Nsi
   $code = $LASTEXITCODE
   $ErrorActionPreference = 'Stop'
   if ($code -ne 0) { Fail "makensis failed (exit $code)" }

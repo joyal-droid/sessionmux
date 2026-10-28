@@ -25,6 +25,8 @@
 ; Build with installer\build.ps1, which stages Sessionmux.exe + README.md + LICENSE.txt +
 ; THIRD-PARTY.md and passes:
 ;   /DVERSION=1.0.0  /DSTAGE_DIR=<dir with those four files>  /DOUT_FILE=<setup exe>  /DICON_FILE=<icon>
+;   /DFILE_VERSION=1.0.0.0 (the numeric x.y.z.w file version; a pre-release such as
+;   1.1.0-preview.1 is given as 1.1.0.0)
 ; The defaults below let "makensis installer\sessionmux.nsi" work after a staging run too.
 ;
 ; Behaviour:
@@ -64,6 +66,9 @@ ${UnStrStr}
 !ifndef VERSION
   !define VERSION     "1.0.0"
 !endif
+!ifndef FILE_VERSION
+  !define FILE_VERSION "${VERSION}.0"
+!endif
 !ifndef STAGE_DIR
   !define STAGE_DIR   "${__FILEDIR__}\..\dist\stage"
 !endif
@@ -89,7 +94,7 @@ ShowUninstDetails nevershow
 AutoCloseWindow true
 BrandingText "${APP_NAME} ${VERSION}"
 
-VIProductVersion "${VERSION}.0"
+VIProductVersion "${FILE_VERSION}"
 VIAddVersionKey "ProductName"     "${APP_NAME}"
 VIAddVersionKey "ProductVersion"  "${VERSION}"
 VIAddVersionKey "FileVersion"     "${VERSION}"

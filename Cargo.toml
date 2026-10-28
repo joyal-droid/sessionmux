@@ -1,6 +1,6 @@
 [package]
 name = "sessionmux"
-version = "1.0.0"
+version = "1.1.0-preview.1"
 edition = "2021"
 description = "Switch between multiple Claude Desktop accounts and move your Code sessions with you"
 rust-version = "1.88"
@@ -39,21 +39,18 @@ windows = { version = "0.58", features = [
 objc2 = "0.6.4"
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
   "std", "block2", "libc", "objc2-core-foundation", "NSAppleEventDescriptor", "NSAppleEventManager",
-  "NSArray", "NSBundle", "NSData", "NSDate", "NSDictionary", "NSEnumerator", "NSError", "NSGeometry",
-  "NSNotification", "NSObjCRuntime", "NSObject", "NSPathUtilities", "NSProcessInfo", "NSRange", "NSRunLoop",
-  "NSString", "NSThread", "NSURL", "NSValue",
+  "NSArray", "NSBundle", "NSData", "NSDate", "NSError", "NSGeometry", "NSNotification", "NSObjCRuntime",
+  "NSObject", "NSProcessInfo", "NSRunLoop", "NSString", "NSURL", "NSValue",
 ] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
   "std", "bitflags", "block2", "libc", "objc2-core-foundation", "objc2-core-graphics", "objc2-quartz-core",
-  "NSAccessibilityProtocols", "NSAppearance", "NSApplication", "NSButton", "NSButtonCell", "NSCell",
-  "NSColor", "NSControl", "NSCursor", "NSEvent", "NSGraphics", "NSGraphicsContext", "NSImage", "NSMenu",
-  "NSMenuItem", "NSPanel", "NSResponder", "NSRunningApplication", "NSScreen", "NSStatusBar",
-  "NSStatusBarButton", "NSStatusItem", "NSTrackingArea", "NSUserInterfaceItemIdentification", "NSView",
-  "NSWindow", "NSWorkspace",
+  "NSApplication", "NSButton", "NSCell", "NSColor", "NSControl", "NSCursor", "NSEvent", "NSGraphics",
+  "NSGraphicsContext", "NSImage", "NSMenu", "NSMenuItem", "NSPanel", "NSResponder", "NSRunningApplication",
+  "NSScreen", "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSTrackingArea", "NSView", "NSWindow",
+  "NSWorkspace",
 ] }
 objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
-  "std", "bitflags", "objc2-core-foundation", "objc2-core-graphics", "CABase", "CALayer", "CAMediaTiming",
-  "CATransaction",
+  "std", "bitflags", "objc2-core-foundation", "objc2-core-graphics", "CALayer", "CATransaction",
 ] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
   "std", "bitflags", "block2", "objc2", "CFArray", "CFCGTypes", "CFData", "CFDate", "CFDictionary",
@@ -61,19 +58,17 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
 ] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
   "std", "bitflags", "libc", "objc2", "CGAffineTransform", "CGBase", "CGBitmapContext", "CGColor",
-  "CGColorSpace", "CGContext", "CGDataProvider", "CGDirectDisplay", "CGError", "CGGeometry", "CGImage",
-  "CGPath", "CGWindow", "CGWindowLevel",
+  "CGColorSpace", "CGContext", "CGGeometry", "CGImage", "CGPath", "CGWindow",
 ] }
 objc2-core-text = { version = "0.3.2", default-features = false, features = [
-  "std", "bitflags", "objc2", "objc2-core-graphics", "CTFont", "CTFontDescriptor", "CTFontTraits", "CTLine",
-  "CTStringAttributes",
+  "std", "bitflags", "objc2", "objc2-core-graphics", "CTFont", "CTFontDescriptor",
 ] }
 objc2-service-management = { version = "0.3.2", default-features = false, features = [
-  "std", "block2", "objc2", "objc2-foundation", "SMAppService", "SMErrors",
+  "std", "block2", "objc2", "objc2-foundation", "SMAppService",
 ] }
 objc2-web-kit = { version = "0.3.2", default-features = false, features = [
-  "std", "bitflags", "block2", "objc2-app-kit", "objc2-core-foundation", "WKFoundation", "WKPreferences",
-  "WKSnapshotConfiguration", "WKWebView", "WKWebViewConfiguration", "WKWebsiteDataStore",
+  "std", "bitflags", "block2", "objc2-app-kit", "objc2-core-foundation", "WKPreferences",
+  "WKSnapshotConfiguration", "WKWebView", "WKWebViewConfiguration",
 ] }
 block2 = "0.6.2"
 dispatch2 = "0.3.1"
