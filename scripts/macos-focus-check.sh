@@ -39,7 +39,8 @@
 #   - starts Sessionmux once as a user would (`open -a`), checks that its log file gets the
 #     startup line, then stops it;
 #   - records "Sessionmux may control Claude" in the user's Automation permissions, as a user
-#     answering the system's question once would (best effort; the outcome is reported);
+#     answering the system's question once would, and Sessionmux in the Accessibility list
+#     (best effort; the outcomes are reported);
 #   - runs `Sessionmux --focus-check` (see src/focuscheck.rs) through Launch Services and, for
 #     each step, arranges the windows with System Events, posts a real mouse click with
 #     tests/fixtures/macos/postclick.c at the point Sessionmux names, and takes a screenshot:
@@ -50,11 +51,14 @@
 #       S4  floating button avatar, Second's window closed with Cmd-W  must reopen and come forward
 #       S5  panel row, Second's window closed and Claude stopped      must fail visibly in the panel
 #       S6  opened from posted work, with no input event               recorded
+#       S7  panel row, Second's window closed with Cmd-W, raise setting   recorded
+#           on (Accessibility recorded for Sessionmux when the runner lets it)
 #
 # Leaves in <out-dir>: focus-check.json, sessionmux.log, startup.txt, script.log, summary.txt
 # and one screenshot per step. Prints one GitHub notice per step. Exits 0 when the startup log
-# check and the steps S1, S2, S4 and S5 passed (a step whose click never reached Sessionmux is
-# reported as unproven, with a warning, and does not fail the run), 1 otherwise.
+# check and the steps S1, S2, S4 and S5 passed, 1 otherwise. A step that could not prove anything
+# (its click never reached Sessionmux, or the windows could not be arranged) is reported as
+# unproven and fails the run too, unless SESSIONMUX_FOCUS_ALLOW_UNPROVEN=1 is set.
 
 set -uo pipefail
 
@@ -87,8 +91,9 @@ SECOND_ID="second-account"
 RUNNER_LABEL="${FOCUS_RUNNER:-macOS $(sw_vers -productVersion 2>/dev/null)}"
 SCRIPT_LOG="$OUT/script.log"
 SUMMARY="$OUT/summary.txt"
-# S5 leaves Second's window closed and its Claude stopped until the step ends, so it runs last.
-STEPS="S1 S2 S3 S4 S6 S5"
+# S5 leaves Second's window closed and its Claude stopped until the step ends, so only S7, which
+# turns the raise setting on for the rest of the run, comes after it.
+STEPS="S1 S2 S3 S4 S6 S5 S7"
 STOPPED_PID=""
 
 rm -rf "$WORK"
@@ -232,7 +237,7 @@ setup_step() {
                 echo "error: Second's Claude has no open window ($(open_window "$second"); windows: $(window_count "$second"))"
             fi
             ;;
-        S2 | S4)
+        S2 | S4 | S7)
             restore_windows "$second"
             r="$(close_window "$second")"
             textedit_front
@@ -416,6 +421,24 @@ else
 fi
 log "Automation permission: $grant_note"
 
+# Accessibility lives in the system's own list; runners whose list can be written get the entry
+# a user turning Sessionmux on in Privacy & Security would make.
+systcc="/Library/Application Support/com.apple.TCC/TCC.db"
+if [ -n "$client_blob" ]; then
+    sql="INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version,
+        csreq, indirect_object_identifier_type, indirect_object_identifier, flags, last_modified)
+        VALUES ('kTCCServiceAccessibility', '$BUNDLE_ID', 0, 2, 4, 1, X'$client_blob', 0, 'UNUSED', 0,
+        CAST(strftime('%s','now') AS INTEGER));"
+    if out="$(sudo -n sqlite3 "$systcc" "$sql" 2>&1)"; then
+        ax_note="recorded"
+    else
+        ax_note="could not be recorded: $out"
+    fi
+else
+    ax_note="could not be recorded: no requirement for Sessionmux"
+fi
+log "Accessibility permission: $ax_note"
+
 # ---------------------------------------------------------------- 5. the focus check
 
 cat >"$WORK/plan.json" <<JSON
@@ -429,7 +452,9 @@ cat >"$WORK/plan.json" <<JSON
     { "name": "S3", "account": "$SECOND_ID", "via": "panel", "expect": "record", "windowBefore": false },
     { "name": "S4", "account": "$SECOND_ID", "via": "bubble", "expect": "front", "windowBefore": false },
     { "name": "S6", "account": "$SECOND_ID", "via": "posted", "expect": "record", "windowBefore": true },
-    { "name": "S5", "account": "$SECOND_ID", "via": "panel", "expect": "visible-failure" }
+    { "name": "S5", "account": "$SECOND_ID", "via": "panel", "expect": "visible-failure" },
+    { "name": "S7", "account": "$SECOND_ID", "via": "panel", "expect": "record", "windowBefore": false,
+      "settings": { "raiseWindowsWithAccessibility": true } }
   ]
 }
 JSON
@@ -461,12 +486,14 @@ cp "$LOG_FILE" "$OUT/sessionmux.log" 2>/dev/null || log "no log file"
 
 # ---------------------------------------------------------------- 6. verdicts
 
-python3 - "$OUT/focus-check.json" "$RUNNER_LABEL" "$startup_note" "$grant_note" "$launch_note" "$SUMMARY" <<'PY'
+python3 - "$OUT/focus-check.json" "$RUNNER_LABEL" "$startup_note" "$grant_note" "$launch_note" "$SUMMARY" "$ax_note" <<'PY'
 import json
+import os
 import sys
 
-path, runner, startup, grant, launch, summary = sys.argv[1:7]
+path, runner, startup, grant, launch, summary, ax_grant = sys.argv[1:8]
 ASSERTED = {"S1", "S2", "S4", "S5"}
+ALLOW_UNPROVEN = os.environ.get("SESSIONMUX_FOCUS_ALLOW_UNPROVEN") == "1"
 KEY = ("open ", "claude_app: focus", "claude_app: reopen", "claude_app: activation", "claude_app: Accessibility",
        "focus check: step", "ipc: openAccount", "bubble event", "panel: hidden")
 
@@ -480,7 +507,8 @@ def annotate(kind, title, body):
     print(f"::{kind} title={title}::{esc(body)}")
 
 
-lines = [f"{runner}", f"startup log: {startup}", f"Automation permission: {grant}", f"focus check: {launch}"]
+lines = [f"{runner}", f"startup log: {startup}", f"Automation permission: {grant}",
+         f"Accessibility permission: {ax_grant}", f"focus check: {launch}"]
 failed = [] if startup.startswith("ok") else ["startup log"]
 try:
     with open(path) as f:
@@ -490,7 +518,7 @@ except Exception as e:  # the check never wrote its result
 if not doc.get("finished"):
     failed.append("the focus check did not finish")
 seen = {s.get("name"): s for s in doc.get("steps", [])}
-for name in ["S1", "S2", "S3", "S4", "S5", "S6"]:
+for name in ["S1", "S2", "S3", "S4", "S5", "S6", "S7"]:
     s = seen.get(name)
     if s is None:
         verdict, why, body = "missing", "the step did not run", ""
@@ -512,14 +540,14 @@ for name in ["S1", "S2", "S3", "S4", "S5", "S6"]:
             *key[:25],
         ])
     asserted = name in ASSERTED
-    if asserted and verdict in ("fail", "missing"):
+    if asserted and verdict != "pass" and not (verdict == "unproven" and ALLOW_UNPROVEN):
         failed.append(name)
     tag = "asserted" if asserted else "recorded"
     annotate("notice", f"focus {name} ({runner}): {verdict}", f"{tag}: {why}\n{body}")
     if asserted and verdict == "unproven":
         annotate("warning", f"focus {name} ({runner}) unproven", why)
     lines.append(f"{name} [{tag}] {verdict}: {why}")
-annotate("notice", f"focus check ({runner})", "\n".join(lines[:4]))
+annotate("notice", f"focus check ({runner})", "\n".join(lines[:5]))
 lines.append("result: " + ("FAILED: " + ", ".join(failed) if failed else "passed"))
 with open(summary, "w") as f:
     f.write("\n".join(lines) + "\n")

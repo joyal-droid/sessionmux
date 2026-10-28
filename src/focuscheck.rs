@@ -183,6 +183,17 @@ enum Via {
     Posted,
 }
 
+impl Via {
+    /// The surface an open of this step is reported from.
+    fn surface(self) -> &'static str {
+        match self {
+            Via::Panel => "panel",
+            Via::Bubble => "bubble",
+            Via::Posted => "check",
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 enum Expect {
@@ -251,6 +262,9 @@ fn judge(o: &Outcome) -> (&'static str, String) {
             return ("unproven", format!("the account's Claude should have had {what} on screen before the click"));
         }
     }
+    if o.step.expect == Expect::Front && o.before.target_in_front() {
+        return ("unproven", "the account's Claude window was already in front before the click".into());
+    }
     if let Some(e) = o.target {
         return ("fail", format!("the click target could not be found: {e}"));
     }
@@ -267,6 +281,9 @@ fn judge(o: &Outcome) -> (&'static str, String) {
     let Some(open) = o.open else {
         return ("fail", format!("Sessionmux received {} click(s) but did not open the account", o.clicks));
     };
+    if open["via"] != o.step.via.surface() {
+        return ("fail", format!("the account was opened via {}, not via {}", open["via"], o.step.via.surface()));
+    }
     let reply = &open["reply"];
     let ok = reply["ok"].as_bool().unwrap_or(false);
     let reason = reply["reason"].as_str().unwrap_or("");
@@ -617,7 +634,10 @@ fn run_step(sync: &Path, step: &Step) -> Value {
 
     let waiting = Instant::now();
     let open = loop {
-        let found = with_record(|r| r.opens.iter().find(|o| o["account"] == step.account.as_str()).cloned()).flatten();
+        let found = with_record(|r| {
+            r.opens.iter().find(|o| o["account"] == step.account.as_str() && o["via"] == step.via.surface()).cloned()
+        })
+        .flatten();
         if found.is_some() || setup.is_some() || target_error.is_some() || waiting.elapsed() >= OPEN_WAIT {
             break found;
         }
@@ -681,8 +701,8 @@ mod tests {
         }
     }
 
-    fn open(ok: bool, reason: &str, visible: bool) -> Value {
-        json!({ "account": "a", "note": "", "panelVisibleAtReply": visible,
+    fn open(via: Via, ok: bool, reason: &str, visible: bool) -> Value {
+        json!({ "account": "a", "via": via.surface(), "note": "", "panelVisibleAtReply": visible,
                 "reply": if ok { json!({ "ok": true }) } else { json!({ "ok": false, "error": "e", "reason": reason }) } })
     }
 
@@ -715,13 +735,30 @@ mod tests {
     fn front_needs_an_ok_reply_and_the_window_in_front() {
         let s = step(Via::Bubble, Expect::Front);
         let c = Clicked { posted: true, detail: String::new() };
-        let ok = open(true, "", false);
+        let ok = open(Via::Bubble, true, "", false);
         assert_eq!(verdict(&s, Some(&c), 1, Some(&ok), &front(&[7], true), &[]), "pass");
         assert_eq!(verdict(&s, Some(&c), 1, Some(&ok), &front(&[7], false), &[]), "fail");
         let other = Seen { front_app_pid: Some(9), ..front(&[7], true) };
         assert_eq!(verdict(&s, Some(&c), 1, Some(&ok), &other, &[]), "fail");
-        let failed = open(false, "focus-no-window", true);
+        let failed = open(Via::Bubble, false, "focus-no-window", true);
         assert_eq!(verdict(&s, Some(&c), 1, Some(&failed), &front(&[7], true), &[]), "fail");
+        // An open of the account from another surface does not count for the click.
+        let elsewhere = open(Via::Panel, true, "", false);
+        assert_eq!(verdict(&s, Some(&c), 1, Some(&elsewhere), &front(&[7], true), &[]), "fail");
+        // Already in front before the click: the click proves nothing.
+        let before = front(&[7], true);
+        let out = Outcome {
+            step: &s,
+            setup: None,
+            target: None,
+            before: &before,
+            clicked: Some(&c),
+            clicks: 1,
+            open: Some(&ok),
+            after: &before,
+            toasts: &[],
+        };
+        assert_eq!(judge(&out).0, "unproven");
     }
 
     #[test]
@@ -730,27 +767,30 @@ mod tests {
         let c = Clicked { posted: true, detail: String::new() };
         let shown = Seen { panel_visible: true, ..Seen::default() };
         let msg = vec!["Couldn't switch to B".to_string()];
-        let failed = open(false, "focus-refused", true);
+        let failed = open(Via::Panel, false, "focus-refused", true);
         assert_eq!(verdict(&s, Some(&c), 1, Some(&failed), &shown, &msg), "pass");
         assert_eq!(verdict(&s, Some(&c), 1, Some(&failed), &shown, &[]), "fail");
         assert_eq!(verdict(&s, Some(&c), 1, Some(&failed), &Seen::default(), &msg), "fail");
-        assert_eq!(verdict(&s, Some(&c), 1, Some(&open(false, "focus-refused", false)), &shown, &msg), "fail");
-        assert_eq!(verdict(&s, Some(&c), 1, Some(&open(false, "", true)), &shown, &msg), "fail");
-        assert_eq!(verdict(&s, Some(&c), 1, Some(&open(true, "", true)), &shown, &msg), "fail");
+        assert_eq!(
+            verdict(&s, Some(&c), 1, Some(&open(Via::Panel, false, "focus-refused", false)), &shown, &msg),
+            "fail"
+        );
+        assert_eq!(verdict(&s, Some(&c), 1, Some(&open(Via::Panel, false, "", true)), &shown, &msg), "fail");
+        assert_eq!(verdict(&s, Some(&c), 1, Some(&open(Via::Panel, true, "", true)), &shown, &msg), "fail");
     }
 
     #[test]
     fn posted_steps_and_recordings() {
         let posted = step(Via::Posted, Expect::Record);
         assert_eq!(
-            verdict(&posted, None, 0, Some(&open(false, "focus-refused", false)), &Seen::default(), &[]),
+            verdict(&posted, None, 0, Some(&open(Via::Posted, false, "focus-refused", false)), &Seen::default(), &[]),
             "recorded"
         );
         assert_eq!(verdict(&posted, None, 0, None, &Seen::default(), &[]), "fail");
         let mut s = step(Via::Posted, Expect::Front);
         s.window_before = Some(false);
         let before = front(&[7], true);
-        let o = open(true, "", false);
+        let o = open(Via::Posted, true, "", false);
         let out = Outcome {
             step: &s,
             setup: None,
