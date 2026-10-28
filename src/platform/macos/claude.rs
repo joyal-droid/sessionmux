@@ -1684,6 +1684,17 @@ mod tests {
         let _ = Os::close(&[pid_a, pid_b]);
     }
 
+    /// What the system lists for `pid`, for a failed assertion.
+    fn running_app_note(pid: Pid) -> String {
+        let Some(app) = ns_pid(pid).and_then(NSRunningApplication::runningApplicationWithProcessIdentifier) else {
+            return format!("pid {pid} is not a running app");
+        };
+        let id = app.bundleIdentifier();
+        let same = id.as_ref().map_or(0, |id| NSRunningApplication::runningApplicationsWithBundleIdentifier(id).len());
+        let url = app.bundleURL().and_then(|u| u.path()).map(|p| p.to_string());
+        format!("pid {pid}: bundle id {id:?}, {same} running with it, at {url:?}")
+    }
+
     #[test]
     fn focus_reopens_an_instance_without_a_window() {
         let f = match fake::build() {
@@ -1708,7 +1719,10 @@ mod tests {
         assert!(wait_for(10, || f.recorded_args(pid).is_some()));
         std::thread::sleep(Duration::from_millis(500));
         assert_eq!(window_state(pid), WinState::None, "the stand-in starts without a window");
-        assert_eq!(sole_instance_bundle(pid).as_deref(), Some(real_path(&f.bundle.to_string_lossy()).as_str()));
+        // Launch Services may list a new app a moment after its process starts.
+        let want = real_path(&f.bundle.to_string_lossy());
+        wait_for(5, || sole_instance_bundle(pid).is_some());
+        assert_eq!(sole_instance_bundle(pid), Some(want), "{}", running_app_note(pid));
 
         let r = in_time(move || Os::focus(pid)).expect("focus returned in time");
         let front = front_window_owner();
