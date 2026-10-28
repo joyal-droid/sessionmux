@@ -16,7 +16,7 @@ installer of the same code.
 - **macOS (preview):** the disk image now opens on a window that shows Sessionmux next to the
   Applications folder with an arrow between them, so installing is one drag.
 
-## [1.1.0-preview.1] - Unreleased
+## [1.1.0-preview.1] - 2026-10-28
 
 A preview of Sessionmux for macOS, published as a GitHub pre-release built from the `macos` branch.
 The stable Windows release stays 1.0.0; this pre-release carries a Windows installer of the same
