@@ -311,8 +311,8 @@ hashes below are what tie the download to this repository.
    Compare the result with the `Sessionmux.app/Contents/MacOS/Sessionmux` line in `SHA256SUMS`.
    The script takes the build date from the commit, removes build-machine paths, sets
    `ZERO_AR_DATE` and signs without a timestamp, so that the same commit built with the same
-   toolchain should give the same program. A weekly CI job builds the app twice from one commit
-   and compares the two; matching a release build on your own Mac has not been confirmed yet, so a
+   toolchain should give the same program. A CI job builds the app twice from one commit, the
+   second time from another folder, and compares the two; matching a release build on your own Mac has not been confirmed yet, so a
    different hash from a different Xcode or macOS SDK is expected and is not by itself a sign of
    tampering. Compare the program, not the disk image or zip, whose bytes change with every build.
 

@@ -608,11 +608,11 @@ jobs:
             done
           done
 
-  # Weekly: the same commit built twice, the second time from another folder, must give the same
-  # universal binary bit for bit.
+  # Weekly, and on every push to the macos branch: the same commit built twice, the second time
+  # from another folder, must give the same universal binary bit for bit.
   macos-repro:
     name: macOS reproducible build
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/macos')
     runs-on: macos-15
     env:
       MACOSX_DEPLOYMENT_TARGET: '13.0'
