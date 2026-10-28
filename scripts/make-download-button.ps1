@@ -23,7 +23,8 @@
 
 <#
 .SYNOPSIS
-  Draws docs\download-button.png, the download button shown near the top of the README.
+  Draws docs\download-button.png (Windows) or docs\download-button-macos.png (macOS), the
+  download buttons shown near the top of the README.
 
 .DESCRIPTION
   A 360x72 dark card (#0a0a0a, 1 px #333333 border, 12 px radius) with a 4 px white bar along
@@ -35,19 +36,39 @@
   the product name or the installer size changes, from the repository root:
 
     .\scripts\make-download-button.ps1 -SizeMb 0.55
+
+  -Platform macos draws the macOS button in the same style: the caption names the disk image,
+  the minimum macOS version and its size, the label reads "Download for macOS", and -Preview adds
+  a small outlined "PREVIEW" tag after the label. It uses no operating-system logo, only the same
+  download glyph. -SizeMb is required for it:
+
+    .\scripts\make-download-button.ps1 -Platform macos -SizeMb 5.2 -Preview
 #>
 [CmdletBinding()]
 param(
     [string]$Name = 'Sessionmux',
     [string]$Repo = 'joyal-droid/sessionmux',
     [double]$SizeMb = 0.55,
-    [string]$Out = (Join-Path $PSScriptRoot '..\docs\download-button.png'),
+    [string]$Out,
     [int]$Scale = 2,
-    [int]$MaxKB = 60
+    [int]$MaxKB = 60,
+    [ValidateSet('windows', 'macos')]
+    [string]$Platform = 'windows',
+    # The button's text; the default depends on -Platform.
+    [string]$Label,
+    # macOS only: adds a "PREVIEW" tag after the label.
+    [switch]$Preview
 )
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
+
+$mac = $Platform -eq 'macos'
+if ($mac -and -not $PSBoundParameters.ContainsKey('SizeMb')) { throw '-Platform macos needs -SizeMb (the size of the disk image)' }
+if ($Preview -and -not $mac) { throw '-Preview is for -Platform macos only' }
+if (-not $Out) {
+    $Out = if ($mac) { Join-Path $PSScriptRoot '..\docs\download-button-macos.png' } else { Join-Path $PSScriptRoot '..\docs\download-button.png' }
+}
 
 # Logical size; the bitmap is $Scale times larger.
 $LW = 360; $LH = 72
@@ -110,8 +131,13 @@ function Draw-Tracked($g, [string]$text, $font, $brush, [float]$x, [float]$y, [f
 
 $dot = ' ' + [char]0x00B7 + ' '   # middle dot, kept out of the source so the script stays ASCII
 $size = $SizeMb.ToString('0.0#', [System.Globalization.CultureInfo]::InvariantCulture)
-$captionText = ($Name + '-setup.exe' + $dot + 'windows' + $dot + $size + ' mb').ToLowerInvariant()
-$labelText = 'Download Latest'
+if ($mac) {
+    $captionText = ($Name + '-macos.dmg' + $dot + 'macos 13+' + $dot + $size + ' mb').ToLowerInvariant()
+    $labelText = if ($Label) { $Label } else { 'Download for macOS' }
+} else {
+    $captionText = ($Name + '-setup.exe' + $dot + 'windows' + $dot + $size + ' mb').ToLowerInvariant()
+    $labelText = if ($Label) { $Label } else { 'Download Latest' }
+}
 
 $W = $LW * $Scale; $H = $LH * $Scale
 $bmp = New-Object System.Drawing.Bitmap($W, $H, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
@@ -155,7 +181,27 @@ try {
     # Caption and label, as one block centred on the card's height.
     $left = $tx + 48 + 14
     [void](Draw-Tracked $g $captionText $fCaption $bCaption $left 16 (0.06 * 11))
-    [void](Draw-Tracked $g $labelText $fLabel $bWhite ($left - 1) 32 (-0.01 * 20))
+    $labelEnd = Draw-Tracked $g $labelText $fLabel $bWhite ($left - 1) 32 (-0.01 * 20)
+
+    # The preview tag: letter-spaced caption type in a 1 px outlined pill, centred on the label's
+    # line, in the caption's grey so the label stays the strongest text on the card.
+    if ($Preview) {
+        $fTag = New-Object System.Drawing.Font('Consolas', 10, [System.Drawing.FontStyle]::Bold, $px)
+        $fmt = [System.Drawing.StringFormat]::GenericTypographic
+        $tagText = 'PREVIEW'
+        $tagW = 0
+        foreach ($ch in $tagText.ToCharArray()) { $tagW += $g.MeasureString([string]$ch, $fTag, 1000, $fmt).Width + (0.08 * 10) }
+        $tagW = [math]::Ceiling($tagW - (0.08 * 10) + 12)
+        $tagH = 18
+        $tagX = [math]::Round($labelEnd + 8)
+        $tagY = 37
+        if ($tagX + $tagW -gt $LW - 12) { throw "the label is too long for the PREVIEW tag ($labelText)" }
+        $penTag = New-Object System.Drawing.Pen($caption, 1)
+        $tagPath = New-RoundRect ($tagX + 0.5) ($tagY + 0.5) ($tagW - 1) ($tagH - 1) 9
+        $g.DrawPath($penTag, $tagPath)
+        [void](Draw-Tracked $g $tagText $fTag $bCaption ($tagX + 6) ($tagY + 3.5) (0.08 * 10))
+        $tagPath.Dispose(); $penTag.Dispose(); $fTag.Dispose()
+    }
 
     foreach ($o in @($fCaption, $fLabel, $bCard, $bTile, $bCaption, $bWhite, $penBorder)) { $o.Dispose() }
 
@@ -175,4 +221,5 @@ $dir = [System.IO.Path]::GetDirectoryName($outPath)
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
 $kb = [math]::Round((Get-Item $outPath).Length / 1KB, 1)
-Write-Host ("{0} {1}x{2} {3} KB, links to https://github.com/{4}/releases/latest" -f "$leaf.png", $W, $H, $kb, $Repo)
+$target = if ($mac) { 'the macOS download of the release' } else { "https://github.com/$Repo/releases/latest" }
+Write-Host ("{0} {1}x{2} {3} KB, links to {4}" -f "$leaf.png", $W, $H, $kb, $target)
