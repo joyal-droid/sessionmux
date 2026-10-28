@@ -216,7 +216,7 @@ fn dispatch(ev: PlatformEvent) {
 }
 
 /// Deliver `ev` from the top of the loop, after the current callback returned.
-fn post_event(ev: PlatformEvent) {
+pub(crate) fn post_event(ev: PlatformEvent) {
     <Os as EventLoop>::post(Box::new(move || dispatch(ev)));
 }
 
