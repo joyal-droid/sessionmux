@@ -657,6 +657,14 @@ mod tests {
         let id = format!("test.sessionmux.{}.{}", name.to_ascii_lowercase(), std::process::id());
         let text = std::fs::read_to_string(&plist).unwrap().replace(fake::BUNDLE_ID, &id);
         std::fs::write(&plist, text).unwrap();
+        // Sign the whole bundle again so its signature covers the changed Info.plist; Launch
+        // Services does not hand a scheme to a bundle whose signature does not match.
+        let signed = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&other)
+            .output()
+            .unwrap();
+        assert!(signed.status.success(), "codesign: {}", String::from_utf8_lossy(&signed.stderr));
         other.canonicalize().unwrap()
     }
 
@@ -665,7 +673,11 @@ mod tests {
         match r {
             HandlerChange::Done => reads_as(fake::SCHEME, app),
             HandlerChange::Pending => wait_for(10, || reads_as(fake::SCHEME, app)),
-            other => panic!("handler change to {}: {other:?}", app.display()),
+            other => panic!(
+                "handler change to {}: {other:?}; the handler reads as {:?}",
+                app.display(),
+                Os::current(fake::SCHEME)
+            ),
         }
     }
 
