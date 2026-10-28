@@ -42,11 +42,6 @@ pub mod tray;
 pub mod url_handler;
 pub mod window;
 
-/// The message for a feature this build does not offer on macOS yet.
-pub(crate) fn unsupported(what: &str) -> String {
-    format!("{what} is not available on macOS in this version")
-}
-
 /// Platform-neutral helpers the macOS build does not call yet: the bubble's pixel size, the
 /// gesture's trigger reasons, panel scaling and the per-user local data root. Referenced here so
 /// they stay checked on macOS.
@@ -57,12 +52,4 @@ fn shared_ui() {
 
     let _ = (model::px_size, panel::scaled, crate::util::paths::local_app_data);
     let _ = [gesture::Reason::ForgedMessage, gesture::Reason::BadLink];
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn unsupported_names_the_feature() {
-        assert_eq!(super::unsupported("X"), "X is not available on macOS in this version");
-    }
 }

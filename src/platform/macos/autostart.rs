@@ -41,10 +41,6 @@ use crate::brand;
 use crate::platform::{Autostart, AutostartStatus, Misc, Os, Paths};
 use crate::util::log;
 
-// The shared "not available on macOS" message has no user in the app build any more; this keeps
-// it compiled and checked until it is removed.
-const _: fn(&str) -> String = super::unsupported;
-
 /// Escape text for a property list string.
 fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
