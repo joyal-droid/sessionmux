@@ -242,10 +242,35 @@ jobs:
           cargo build --release --locked --target x86_64-apple-darwin 2>&1 | tee ci-logs/build-intel.log \
             || { echo 'Build Intel (release)' > ci-logs/build-intel.failed; exit 1; }
 
+      # Every test's output is kept, so the tests that could not check something on this runner
+      # are reported by the next step.
       - name: Test
         run: |
           mkdir -p ci-logs
-          cargo test --locked 2>&1 | tee ci-logs/test.log || { echo 'Test' > ci-logs/test.failed; exit 1; }
+          cargo test --locked -- --show-output 2>&1 | tee ci-logs/test.log \
+            || { echo 'Test' > ci-logs/test.failed; exit 1; }
+
+      # Each test that skipped a check says so in its output; every such line becomes a warning
+      # on the run page and a line in the job summary. The stand-in Claude (built with cc), the
+      # link-handler round trip and the hook helper tests always run on this runner, so a skip
+      # of one of them fails the step.
+      - name: Skipped checks
+        run: |
+          perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g' ci-logs/test.log \
+            | awk '/^---- .* (stdout|stderr) ----$/ { name = $2; next }
+                   /^(successes|failures):$/ { name = "" }
+                   name != "" && /skipped|not checked/ { print name ": " $0 }' > ci-logs/skips.txt
+          {
+            echo '### Checks the tests could not make on this runner'
+            if [ -s ci-logs/skips.txt ]; then sed 's/^/- /' ci-logs/skips.txt; else echo 'None.'; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r line; do
+            echo "::warning title=Skipped check::$(printf '%s' "$line" | sed 's/%/%25/g')"
+          done < ci-logs/skips.txt
+          if grep -E 'skipped: (no C compiler|no built)' ci-logs/skips.txt; then
+            echo 'A test that must run on this runner was skipped.'
+            exit 1
+          fi
 
       # The hook helpers exit 0 with no app running, whatever they are given.
       - name: Hook helper CLI
@@ -274,6 +299,7 @@ jobs:
       - name: Smoke
         env:
           SESSIONMUX_SMOKE_FIXTURE: '1'
+          SESSIONMUX_SMOKE_GESTURE: '1'
         run: |
           mkdir -p ci-logs
           set +e
@@ -286,6 +312,19 @@ jobs:
           cat ci-logs/smoke.log
           ls -l smoke/*.png || true
           if [ "$code" -ne 0 ] || ! grep -q '"ok":true' ci-logs/smoke.log; then
+            echo 'Smoke' > ci-logs/smoke.failed
+            exit 1
+          fi
+          # The gesture frame, the menu bar icon and the shortcut were each checked.
+          for want in '"gesture":true' '"menuBar":{' 'smoke: tray shown' 'smoke: hotkey .* registered'; do
+            if ! grep -q "$want" ci-logs/smoke.log; then
+              echo "smoke: '$want' is missing from the output" | tee -a ci-logs/smoke.log
+              echo 'Smoke' > ci-logs/smoke.failed
+              exit 1
+            fi
+          done
+          if [ ! -s smoke/gesture.png ]; then
+            echo 'smoke: smoke/gesture.png was not written' | tee -a ci-logs/smoke.log
             echo 'Smoke' > ci-logs/smoke.failed
             exit 1
           fi
@@ -312,6 +351,8 @@ jobs:
             # Colour codes go first, so compiler errors match at the start of a line.
             plain="$f.plain"
             perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g' "$log" > "$plain"
+            # The test output also holds every passing test's output; only the failures are reported.
+            perl -i -ne 'print unless /^successes:$/ .. /^(failures:|test result:.*)$/' "$plain"
             # The failing tests and compiler errors first, then the end of the output, in pieces
             # small enough for one annotation each.
             { grep -E -A8 '^---- |panicked at|^error(\[|:)' "$plain" | head -n 400; echo '[...]'; tail -n 25 "$plain"; } \
