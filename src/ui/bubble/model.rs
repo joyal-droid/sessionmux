@@ -124,6 +124,12 @@ fn tray_layout(n: usize) -> TrayLayout {
     TrayLayout { pill_l, pill_r: pill_l + pill_w, grip_l, slots, more_cx: last_end + 8.0 + MORE_R }
 }
 
+/// The centre of tray avatar slot `i` of `n` (DIP, window coordinates), if the tray shows it.
+#[cfg(any(test, target_os = "macos"))]
+pub fn avatar_centre(n: usize, i: usize) -> Option<(f32, f32)> {
+    tray_layout(n).slots.get(i).map(|&sx| (sx + SLOT / 2.0, TRAY_CY))
+}
+
 /// What a point (DIP, window coordinates) is over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
@@ -454,6 +460,17 @@ mod tests {
         assert_eq!(dip_size(BubbleMode::Tray, 3).0, 230.0);
         assert_eq!(dip_size(BubbleMode::Tray, 9).0, 230.0);
         assert_eq!(px_size(BubbleMode::Tray, 3, 1.5), (345, 108));
+    }
+
+    #[test]
+    fn avatar_centres_hit_their_own_slot() {
+        for n in 1..=3 {
+            for i in 0..n {
+                let (x, y) = avatar_centre(n, i).unwrap();
+                assert_eq!(hit_test(BubbleMode::Tray, n, x, y), Hit::Avatar(i));
+            }
+            assert_eq!(avatar_centre(n, n), None);
+        }
     }
 
     #[test]

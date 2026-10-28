@@ -574,6 +574,116 @@ jobs:
             done
           done
 
+  # Switching accounts on a real Mac desktop: the app installed from the disk image, the real
+  # Claude Desktop with two accounts open, and real mouse clicks on the panel and the floating
+  # button. scripts/macos-focus-check.sh says what each step checks; every step's result is a
+  # notice on the run page, and the result file, the app's log and screenshots are uploaded.
+  macos-focus:
+    name: macOS focus check (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-26]
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+      HOMEBREW_NO_ANALYTICS: '1'
+      HOMEBREW_NO_ENV_HINTS: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Set up Python
+        id: python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13'
+          update-environment: false
+
+      # The same universal app and disk image as the macOS build job.
+      - name: Bundle
+        env:
+          SESSIONMUX_PYTHON: ${{ steps.python.outputs.python-path }}
+        run: |
+          mkdir -p ci-logs
+          sh scripts/bundle-macos.sh 0.0.0-ci dist-macos 2>&1 | tee ci-logs/bundle.log \
+            || { echo 'Bundle' > ci-logs/bundle.failed; exit 1; }
+
+      - name: Install Sessionmux from the disk image
+        run: |
+          mkdir -p ci-logs
+          {
+            mnt=$(mktemp -d)
+            hdiutil attach dist-macos/Sessionmux-macOS.dmg -nobrowse -readonly -mountpoint "$mnt"
+            rm -rf /Applications/Sessionmux.app
+            ditto "$mnt/Sessionmux.app" /Applications/Sessionmux.app
+            hdiutil detach "$mnt"
+            codesign --verify --strict /Applications/Sessionmux.app
+            echo "installed $(defaults read /Applications/Sessionmux.app/Contents/Info.plist CFBundleShortVersionString)"
+          } 2>&1 | tee ci-logs/install.log || { echo 'Install Sessionmux' > ci-logs/install.failed; exit 1; }
+
+      - name: Install Claude Desktop
+        run: |
+          mkdir -p ci-logs
+          {
+            brew install --cask claude
+            # Lets Claude's first start run without the "downloaded from the internet" dialog,
+            # which nobody can answer on a runner.
+            xattr -dr com.apple.quarantine /Applications/Claude.app \
+              || sudo xattr -dr com.apple.quarantine /Applications/Claude.app || true
+          } 2>&1 | tee ci-logs/claude.log || { echo 'Install Claude Desktop' > ci-logs/claude.failed; exit 1; }
+
+      - name: Focus check
+        env:
+          FOCUS_RUNNER: ${{ matrix.runner }}
+        run: |
+          mkdir -p ci-logs
+          bash scripts/macos-focus-check.sh focus-out 2>&1 | tee ci-logs/focus.log \
+            || { echo 'Focus check' > ci-logs/focus.failed; exit 1; }
+
+      - name: Upload focus check output
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: focus-check-${{ matrix.runner }}
+          path: |
+            focus-out/
+            ci-logs/focus.log
+          if-no-files-found: warn
+
+      - name: Report failed steps
+        if: failure()
+        shell: bash
+        run: |
+          for f in ci-logs/*.failed; do
+            [ -e "$f" ] || continue
+            title=$(tr -d '\r\n' < "$f" | sed 's/%/%25/g; s/:/%3A/g; s/,/%2C/g')
+            log="${f%.failed}.log"
+            plain="$f.plain"
+            perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g' "$log" > "$plain"
+            # Workflow commands in the output were already reported as annotations.
+            perl -i -ne 'print unless /^::/' "$plain"
+            { grep -E -A8 '^error(\[|:)|^bundle-macos: |^focus-check: ' "$plain" | head -n 400; echo '[...]'; tail -n 25 "$plain"; } \
+              > "$f.txt"
+            split -b 3500 "$f.txt" "$f.part."
+            for p in $(ls "$f".part.* | head -n 8); do
+              body=$(perl -pe 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g' "$p")
+              echo "::error title=$title log::$body"
+            done
+          done
+
   # Two macOS users on one Mac at the same time: each gets its own instance lock and socket,
   # neither reaches the other's socket, and a "show" request stays with its own user. The script
   # creates a throwaway second user and deletes it again.

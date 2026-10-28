@@ -27,6 +27,9 @@
 //! `--end-relay` (the uninstaller: end an active relay and restore Claude's handler, then exit),
 //! `--notify-hook` / `--approve-hook` (the Claude Code hook helpers, see `hookhelper`) and
 //! `--remove-hooks` (the uninstaller: take our hooks out of the user's Claude Code settings).
+//! `--focus-check <plan.json>` runs the app and checks, step by step, that clicking an account
+//! brings its Claude window forward (macOS; only with `SESSIONMUX_FOCUS_CHECK=1`, see
+//! `focuscheck`).
 //! A hook word is honoured only as the one and only argument; any other shape exits 0 silently.
 //! Single instance through `platform::instance` (on Windows the named mutex `brand::MUTEX`,
 //! `Local\Sessionmux.SingleInstance`); a second launch asks the first instance to show its panel
@@ -42,6 +45,8 @@
 mod app;
 pub mod brand;
 mod core;
+#[cfg(target_os = "macos")]
+mod focuscheck;
 mod hookhelper;
 #[cfg(test)]
 mod livetest;
@@ -286,6 +291,9 @@ fn real_main() -> i32 {
         Some(None) => return 0,
         None => {}
     }
+    if raw.first().is_some_and(|a| a == "--focus-check") {
+        return run_focus_check(&raw[1..]);
+    }
     let args = parse_args(raw.iter().cloned());
 
     let prepared = <Os as Misc>::init_ui_thread();
@@ -301,6 +309,41 @@ fn real_main() -> i32 {
         <Os as Misc>::uninit_ui_thread();
     }
     code
+}
+
+/// True when `SESSIONMUX_FOCUS_CHECK` is exactly `1`.
+fn focus_check_enabled() -> bool {
+    std::env::var("SESSIONMUX_FOCUS_CHECK").is_ok_and(|v| v == "1")
+}
+
+/// `--focus-check <plan.json>`: refused unless `SESSIONMUX_FOCUS_CHECK=1` and exactly one plan
+/// file follows; exit 2 when refused.
+fn run_focus_check(rest: &[String]) -> i32 {
+    if !focus_check_enabled() {
+        eprintln!("--focus-check runs only with SESSIONMUX_FOCUS_CHECK=1");
+        return 2;
+    }
+    let [plan] = rest else {
+        eprintln!("usage: --focus-check <plan.json>");
+        return 2;
+    };
+    focus_check_main(plan)
+}
+
+#[cfg(target_os = "macos")]
+fn focus_check_main(plan: &str) -> i32 {
+    let prepared = <Os as Misc>::init_ui_thread();
+    let code = focuscheck::run(std::path::Path::new(plan));
+    if prepared {
+        <Os as Misc>::uninit_ui_thread();
+    }
+    code
+}
+
+#[cfg(windows)]
+fn focus_check_main(_plan: &str) -> i32 {
+    eprintln!("--focus-check is available on macOS only");
+    2
 }
 
 #[cfg(windows)]
@@ -416,6 +459,15 @@ mod tests {
             argv(&["--remove-hooks", ""]),
         ] {
             assert_eq!(hook_arg(&v), Some(None), "{v:?}");
+        }
+    }
+
+    /// The focus check never starts without its environment switch.
+    #[test]
+    fn focus_check_needs_its_switch() {
+        if std::env::var_os("SESSIONMUX_FOCUS_CHECK").is_none() {
+            assert_eq!(run_focus_check(&argv(&["plan.json"])), 2);
+            assert_eq!(run_focus_check(&argv(&[])), 2);
         }
     }
 

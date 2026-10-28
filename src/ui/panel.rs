@@ -434,6 +434,12 @@ impl Panel {
         }
     }
 
+    /// Run `js` in the page; `done` receives its result as JSON text. False when it could not run.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn eval_with_result(&self, js: &str, done: impl Fn(String) + Send + 'static) -> bool {
+        self.webview.as_ref().is_some_and(|wv| wv.evaluate_script_with_callback(js, done).is_ok())
+    }
+
     pub fn destroy(self) {
         drop(self);
     }
