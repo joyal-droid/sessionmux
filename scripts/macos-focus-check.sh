@@ -51,12 +51,12 @@
 #       S4  floating button avatar, Second's window closed with Cmd-W  must reopen and come forward
 #       S5  panel row, Second's window closed and Claude stopped      must fail visibly in the panel
 #       S6  opened from posted work, with no input event               recorded
-#       S7  panel row, Second's window closed with Cmd-W, raise setting   recorded
+#       S7  panel row, Second's window closed with Cmd-W, raise setting   must reopen and come forward
 #           on (Accessibility recorded for Sessionmux when the runner lets it)
 #
 # Leaves in <out-dir>: focus-check.json, sessionmux.log, startup.txt, script.log, summary.txt
 # and one screenshot per step. Prints one GitHub notice per step. Exits 0 when the startup log
-# check and the steps S1, S2, S4 and S5 passed, 1 otherwise. A step that could not prove anything
+# check and the steps S1, S2, S4, S5 and S7 passed, 1 otherwise. A step that could not prove anything
 # (its click never reached Sessionmux, or the windows could not be arranged) is reported as
 # unproven and fails the run too, unless SESSIONMUX_FOCUS_ALLOW_UNPROVEN=1 is set.
 
@@ -91,9 +91,9 @@ SECOND_ID="second-account"
 RUNNER_LABEL="${FOCUS_RUNNER:-macOS $(sw_vers -productVersion 2>/dev/null)}"
 SCRIPT_LOG="$OUT/script.log"
 SUMMARY="$OUT/summary.txt"
-# S5 leaves Second's window closed and its Claude stopped until the step ends, so only S7, which
-# turns the raise setting on for the rest of the run, comes after it.
-STEPS="S1 S2 S3 S4 S6 S5 S7"
+# S7 turns the raise setting on for the rest of the run and S5 leaves Second's Claude slow to
+# answer after it is resumed, so S7 runs before S5 and S5 runs last.
+STEPS="S1 S2 S3 S4 S6 S7 S5"
 STOPPED_PID=""
 
 rm -rf "$WORK"
@@ -452,9 +452,9 @@ cat >"$WORK/plan.json" <<JSON
     { "name": "S3", "account": "$SECOND_ID", "via": "panel", "expect": "record", "windowBefore": false },
     { "name": "S4", "account": "$SECOND_ID", "via": "bubble", "expect": "front", "windowBefore": false },
     { "name": "S6", "account": "$SECOND_ID", "via": "posted", "expect": "record", "windowBefore": true },
-    { "name": "S5", "account": "$SECOND_ID", "via": "panel", "expect": "visible-failure" },
-    { "name": "S7", "account": "$SECOND_ID", "via": "panel", "expect": "record", "windowBefore": false,
-      "settings": { "raiseWindowsWithAccessibility": true } }
+    { "name": "S7", "account": "$SECOND_ID", "via": "panel", "expect": "front", "windowBefore": false,
+      "settings": { "raiseWindowsWithAccessibility": true } },
+    { "name": "S5", "account": "$SECOND_ID", "via": "panel", "expect": "visible-failure" }
   ]
 }
 JSON
@@ -492,7 +492,7 @@ import os
 import sys
 
 path, runner, startup, grant, launch, summary, ax_grant = sys.argv[1:8]
-ASSERTED = {"S1", "S2", "S4", "S5"}
+ASSERTED = {"S1", "S2", "S4", "S5", "S7"}
 ALLOW_UNPROVEN = os.environ.get("SESSIONMUX_FOCUS_ALLOW_UNPROVEN") == "1"
 KEY = ("open ", "claude_app: focus", "claude_app: reopen", "claude_app: activation", "claude_app: Accessibility",
        "focus check: step", "ipc: openAccount", "bubble event", "panel: hidden")
