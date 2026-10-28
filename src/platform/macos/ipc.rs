@@ -163,8 +163,8 @@ impl IpcTransport for Os {
     }
 
     /// The socket's folder is checked first ([`secure_dir`]). A stale socket of this user that
-    /// nobody serves is replaced; a live one makes this fail. The socket file is created readable
-    /// and writable by the owner only.
+    /// nobody serves is replaced; a live one makes this fail. The socket file is made readable and
+    /// writable by the owner only; the private folder keeps others out before that.
     fn listen(endpoint: &str) -> io::Result<Listener> {
         if endpoint.is_empty() {
             return Err(io::Error::other("the socket has no path"));
@@ -182,12 +182,11 @@ impl IpcTransport for Os {
             }
             fs::remove_file(&path)?;
         }
-        // SAFETY: umask only swaps the process file-creation mask; the old one is put back below.
-        let old = unsafe { libc::umask(0o177) };
-        let bound = UnixListener::bind(&path);
-        // SAFETY: as above.
-        unsafe { libc::umask(old) };
-        Ok(Listener { inner: bound?, path })
+        // The process-wide file-creation mask is left alone, since other threads create files too.
+        let inner = UnixListener::bind(&path)?;
+        let listener = Listener { inner, path };
+        fs::set_permissions(&listener.path, fs::Permissions::from_mode(0o600))?;
+        Ok(listener)
     }
 
     fn accept(l: &mut Listener) -> io::Result<Option<UnixStream>> {
