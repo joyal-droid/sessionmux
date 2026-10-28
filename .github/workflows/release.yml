@@ -15,19 +15,29 @@ env:
   RUST_TOOLCHAIN: '1.99.1'
   # makensis version installed from Chocolatey; the build stops if a different one is found.
   NSIS_VERSION: '3.10'
+  # Labels the macOS section of a release as a preview: built and checked on GitHub's macOS
+  # machines, not yet tried on a real Mac.
+  MACOS_PREVIEW: 'true'
 
 # Every action is pinned to a full commit SHA; the comment names the release it belongs to.
+#
+# Two kinds of tag:
+#   v1.2.3            a release of a commit on main: Windows only, published as the latest release.
+#   v1.2.3-preview.4  a preview of a commit on the macos branch: the same Windows build plus the
+#                     macOS app, published as a pre-release, so releases/latest keeps pointing
+#                     at the newest stable release.
 jobs:
   checks:
     name: Tag, tests and lints
     runs-on: windows-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      preview: ${{ steps.version.outputs.preview }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-          # full history, so the tagged commit can be checked against main
+          # full history, so the tagged commit can be checked against its branch
           fetch-depth: 0
 
       - name: Check the tag against Cargo.toml
@@ -36,23 +46,33 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          $line = Select-String -Path Cargo.toml -Pattern '^\s*version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"' | Select-Object -First 1
+          $line = Select-String -Path Cargo.toml -Pattern '^\s*version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)"' | Select-Object -First 1
           $version = $line.Matches[0].Groups[1].Value
           if ("v$version" -ne $env:TAG) {
             Write-Error "tag $env:TAG does not match Cargo.toml version $version"
             exit 1
           }
+          # The only pre-release form is x.y.z-preview.n.
+          $preview = $version.Contains('-')
+          if ($preview -and $version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+-preview\.[0-9]+$') {
+            Write-Error "version $version is neither x.y.z nor x.y.z-preview.n"
+            exit 1
+          }
           "version=$version" >> $env:GITHUB_OUTPUT
+          "preview=$(if ($preview) { 'true' } else { 'false' })" >> $env:GITHUB_OUTPUT
 
       # A release is built only from a commit that is already on main, that is, one that went
-      # through a pull request and CI.
-      - name: Check that the tagged commit is on main
+      # through a pull request and CI. A preview is built only from a commit on the macos branch.
+      - name: Check that the tagged commit is on its branch
         shell: pwsh
+        env:
+          PREVIEW: ${{ steps.version.outputs.preview }}
         run: |
+          $branch = if ($env:PREVIEW -eq 'true') { 'macos' } else { 'main' }
           $commit = git rev-parse "$env:GITHUB_SHA^{commit}"
-          git merge-base --is-ancestor $commit origin/main
+          git merge-base --is-ancestor $commit "origin/$branch"
           if ($LASTEXITCODE -ne 0) {
-            Write-Error "the tagged commit $commit is not on main"
+            Write-Error "the tagged commit $commit is not on $branch"
             exit 1
           }
 
@@ -95,6 +115,7 @@ jobs:
     runs-on: windows-latest
     env:
       VERSION: ${{ needs.checks.outputs.version }}
+      PREVIEW: ${{ needs.checks.outputs.preview }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -187,21 +208,50 @@ jobs:
           Get-Content dist\SHA256SUMS
           # Release notes: the download link first, then the matching section of CHANGELOG.md,
           # then the hashes, the toolchain and how to verify, folded into a details block. The
-          # publish job replaces @ATTESTATION_URL@ with the attestation link.
+          # publish job replaces @ATTESTATION_URL@ with the attestation link. In a preview the
+          # Windows download comes first, then the macOS section, which the publish job puts in
+          # place of @MACOS_SECTION@; the hashes of both builds replace @SHA256SUMS@ there.
           $text = Get-Content -Raw CHANGELOG.md
           $m = [regex]::Match($text, "(?ms)^## \[$([regex]::Escape($version))\][^\n]*\n(.*?)(?=^## \[|^\[[^\]]+\]:|\z)")
           $notes = if ($m.Success) { $m.Groups[1].Value.Trim() } else { "Sessionmux $version" }
           $dl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v$version/$name"
           $latest = "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download/Sessionmux-Setup.exe"
           $kb = [math]::Round((Get-Item -LiteralPath "dist\$name").Length / 1KB)
-          $verify = @(
-            '## Download',
-            '',
-            "**[$name]($dl)** · $kb KB · Windows 10/11 x64 · installs for your user, no administrator rights",
-            '',
-            'Run the file. If Windows shows "Windows protected your PC", choose **More info**, then **Run anyway**: the build is not code-signed yet, and the section at the end shows how to check it instead.',
-            '',
-            "[Sessionmux-Setup.exe]($latest) is the same file under a name that always points at the newest release.",
+          $runIt = 'Run the file. If Windows shows "Windows protected your PC", choose **More info**, then **Run anyway**: the build is not code-signed yet, and the section at the end shows how to check it instead.'
+          if ($env:PREVIEW -eq 'true') {
+            $fixed = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v$version/Sessionmux-Setup.exe"
+            $stable = "https://github.com/$env:GITHUB_REPOSITORY/releases/latest"
+            $download = @(
+              '## Download',
+              '',
+              '### Windows',
+              '',
+              "**[$name]($dl)** · $kb KB · Windows 10/11 x64 · installs for your user, no administrator rights",
+              '',
+              $runIt,
+              '',
+              "[Sessionmux-Setup.exe]($fixed) is the same file under a fixed name. This is a pre-release; the newest stable release is always the [latest release]($stable).",
+              '',
+              '@MACOS_SECTION@'
+            )
+            $sums = '@SHA256SUMS@'
+            $either = 'any file name of this release'
+            $toolchain = 'Toolchain of the Windows build (also in `BUILDINFO.txt`; the macOS one is in `BUILDINFO-macOS.txt`):'
+          } else {
+            $download = @(
+              '## Download',
+              '',
+              "**[$name]($dl)** · $kb KB · Windows 10/11 x64 · installs for your user, no administrator rights",
+              '',
+              $runIt,
+              '',
+              "[Sessionmux-Setup.exe]($latest) is the same file under a name that always points at the newest release."
+            )
+            $sums = (Get-Content -LiteralPath dist\SHA256SUMS) -join "`n"
+            $either = 'either file name'
+            $toolchain = 'Toolchain (also in `BUILDINFO.txt`):'
+          }
+          $verify = ($download + @(
             '',
             "## What's new in $version",
             '',
@@ -213,16 +263,16 @@ jobs:
             'SHA-256 (also in `SHA256SUMS`):',
             '',
             '```',
-            ((Get-Content -LiteralPath dist\SHA256SUMS) -join "`n"),
+            $sums,
             '```',
             '',
-            'Build provenance (needs the GitHub CLI; the command accepts either file name):',
+            "Build provenance (needs the GitHub CLI; the command accepts $either):",
             '',
             '```',
             "gh attestation verify $name --repo $env:GITHUB_REPOSITORY --signer-workflow $env:GITHUB_REPOSITORY/.github/workflows/release.yml --source-ref refs/tags/v$version",
             '```',
             '',
-            'Toolchain (also in `BUILDINFO.txt`):',
+            $toolchain,
             '',
             '```',
             ((Get-Content -LiteralPath dist\BUILDINFO.txt) -join "`n"),
@@ -232,11 +282,11 @@ jobs:
             '',
             'Build provenance attestation: @ATTESTATION_URL@',
             '</details>'
-          ) -join "`n"
+          )) -join "`n"
           Set-Content -LiteralPath dist\notes.md -Value $verify -Encoding utf8
 
       - name: Keep the release files for the publish job
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-files
           path: |
@@ -248,10 +298,153 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Previews only: lints and tests of the macOS build (formatting is checked by the job above).
+  checks-macos:
+    name: macOS tests and lints
+    needs: [checks]
+    if: needs.checks.outputs.preview == 'true'
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # The hook helper tests run this build of the app.
+      - name: Build
+        run: cargo build --locked
+
+      - name: Test
+        run: cargo test --locked
+
+  # Previews only. Builds the universal Sessionmux.app (arm64 + x86_64), the disk image and the
+  # zip with read-only access, like the Windows build job: no token that could publish, attest
+  # or write to the repository. scripts/bundle-macos.sh also checks what it made (signature,
+  # architectures, Info.plist, disk image and zip contents) and runs the bundled binary's
+  # self-check.
+  build-macos:
+    name: Build macOS app
+    needs: [checks, checks-macos, audit]
+    if: needs.checks.outputs.preview == 'true'
+    runs-on: macos-15
+    env:
+      VERSION: ${{ needs.checks.outputs.version }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build and package
+        run: sh scripts/bundle-macos.sh "$VERSION" dist-macos
+
+      - name: Privacy scan
+        shell: pwsh
+        env:
+          SESSIONMUX_PRIVACY_TERMS: ${{ secrets.SESSIONMUX_PRIVACY_TERMS }}
+        run: |
+          & ./scripts/check-binary-privacy.ps1 dist-macos/Sessionmux.app dist-macos/BUILDINFO-macOS.txt
+          exit $LASTEXITCODE
+
+      # The macOS part of the release notes; the publish job puts it right after the Windows
+      # download.
+      - name: Write the macOS release notes
+        run: |
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION"
+          mb=$(awk -v b="$(stat -f %z dist-macos/Sessionmux-macOS.dmg)" 'BEGIN { printf "%.1f", b / 1048576 }')
+          if [ "$MACOS_PREVIEW" = "true" ]; then heading='### macOS (preview)'; else heading='### macOS'; fi
+          {
+            echo "$heading"
+            echo
+            if [ "$MACOS_PREVIEW" = "true" ]; then
+              echo '> **Preview, not yet verified on a Mac.** The macOS app passes the automated checks on GitHub'"'"'s macOS machines but has not been tried on a real Mac yet. It is signed ad hoc (no Apple Developer ID) and not notarized, so macOS asks you to confirm it once.'
+              echo
+            fi
+            echo "**[Sessionmux-macOS.dmg]($base/Sessionmux-macOS.dmg)** · $mb MB · macOS 13 or later · one app for Apple silicon and Intel (Cowork needs Apple silicon)"
+            echo
+            echo "Also as a zip: [Sessionmux-macOS.zip]($base/Sessionmux-macOS.zip). The same files with the version in the name: [Sessionmux-$VERSION-macOS.dmg]($base/Sessionmux-$VERSION-macOS.dmg) · [Sessionmux-$VERSION-macOS.zip]($base/Sessionmux-$VERSION-macOS.zip)."
+            echo
+            echo '**First start**'
+            echo
+            echo '1. Open the disk image and drag **Sessionmux** onto **Applications**.'
+            echo '2. Open Sessionmux from Applications. macOS says it cannot check the app for malicious software; choose **Done** (or **Cancel**).'
+            echo '3. Open **System Settings > Privacy & Security**, scroll down to **Security** and choose **Open Anyway** next to the line about Sessionmux, then confirm with **Open Anyway** and your password.'
+            echo
+            echo 'You do this once; afterwards Sessionmux opens normally. It lives in the menu bar and has no Dock icon.'
+            if [ "$MACOS_PREVIEW" = "true" ]; then
+              echo
+              echo '**Not yet verified on a Mac**'
+              echo
+              echo '- Signing in to an extra account with Google or Apple (sign-in link routing), including the "Use / Keep" questions macOS 26.4 and later asks. The automated checks switch the link handler to Sessionmux and back on macOS 15, but passing a sign-in link on to the right Claude window has not been tried yet. Signing in with an e-mail code is the safe way meanwhile.'
+              echo '- Bringing a minimised Claude window, or one in another Space, to the front; whether the Accessibility switch is needed for that.'
+              echo '- Open at login, and whether it survives an update.'
+              echo '- The global shortcut on non-US keyboard layouts.'
+              echo '- Two people using Sessionmux on the same Mac at the same time.'
+              echo '- How Sessionmux behaves while Claude updates itself with several accounts open.'
+              echo '- The look of the floating button and menu bar icon on real displays (the automated checks only see images).'
+            fi
+            echo
+            echo '<details>'
+            echo '<summary><b>Verify the macOS download</b> (SHA-256, build provenance, toolchain)</summary>'
+            echo
+            echo 'In the folder with the downloaded disk image and this release'"'"'s `SHA256SUMS`:'
+            echo
+            echo '```'
+            echo "grep '  Sessionmux-macOS.dmg\$' SHA256SUMS | shasum -a 256 -c"
+            echo "gh attestation verify Sessionmux-macOS.dmg --repo $GITHUB_REPOSITORY --signer-workflow $GITHUB_REPOSITORY/.github/workflows/release.yml --source-ref refs/tags/v$VERSION"
+            echo '```'
+            echo
+            echo 'Toolchain (also in `BUILDINFO-macOS.txt`):'
+            echo
+            echo '```'
+            cat dist-macos/BUILDINFO-macOS.txt
+            echo '```'
+            echo
+            echo "To rebuild: check out this tag on a Mac with the toolchain above, run \`sh scripts/bundle-macos.sh $VERSION dist-macos\` and compare the SHA-256 of \`dist-macos/Sessionmux.app/Contents/MacOS/Sessionmux\` with its line in \`SHA256SUMS\`."
+            echo '</details>'
+          } > dist-macos/notes-macos.md
+          cat dist-macos/notes-macos.md
+
+      - name: Keep the release files for the publish job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-files-macos
+          path: |
+            dist-macos/Sessionmux-${{ env.VERSION }}-macOS.dmg
+            dist-macos/Sessionmux-macOS.dmg
+            dist-macos/Sessionmux-${{ env.VERSION }}-macOS.zip
+            dist-macos/Sessionmux-macOS.zip
+            dist-macos/SHA256SUMS-macos
+            dist-macos/BUILDINFO-macOS.txt
+            dist-macos/notes-macos.md
+          if-no-files-found: error
+          retention-days: 7
+
   # Attests and publishes the files built above. It checks out nothing and runs no build code.
   publish:
     name: Attest and create draft release
     needs: [checks, build]
+    if: needs.checks.outputs.preview != 'true'
     runs-on: ubuntu-latest
     permissions:
       # create the draft release and upload its files
@@ -263,7 +456,7 @@ jobs:
     env:
       VERSION: ${{ needs.checks.outputs.version }}
     steps:
-      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-files
           path: release
@@ -301,3 +494,88 @@ jobs:
             "release/Sessionmux-Setup-$VERSION.exe" release/Sessionmux-Setup.exe \
             release/SHA256SUMS release/BUILDINFO.txt \
             --repo "$GITHUB_REPOSITORY" --title "Sessionmux $VERSION" --notes-file release/notes.md --draft
+
+  # Previews only: attests and publishes the Windows and macOS files built above as one
+  # pre-release, never marked as the latest release. It checks out nothing and runs no build code.
+  publish-preview:
+    name: Attest and create draft pre-release
+    needs: [checks, build, build-macos]
+    if: needs.checks.outputs.preview == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      # create the draft release and upload its files
+      contents: write
+      # OIDC token that binds the provenance attestation to this workflow run
+      id-token: write
+      # store the attestation in this repository
+      attestations: write
+    env:
+      VERSION: ${{ needs.checks.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: release
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files-macos
+          path: release
+
+      # One SHA256SUMS for both builds: the Windows lines, then the macOS lines. Sessionmux.exe
+      # and the binary inside Sessionmux.app are not separate files of the release; every other
+      # line must match.
+      - name: Combine and check SHA256SUMS
+        working-directory: release
+        run: |
+          tr -d '\r' < SHA256SUMS > SHA256SUMS-windows
+          tr -d '\r' < SHA256SUMS-macos > SHA256SUMS-mac
+          cat SHA256SUMS-windows SHA256SUMS-mac > SHA256SUMS
+          rm SHA256SUMS-windows SHA256SUMS-mac SHA256SUMS-macos
+          cat SHA256SUMS
+          grep -v -e '  Sessionmux\.exe$' -e '  Sessionmux\.app/Contents/MacOS/Sessionmux$' SHA256SUMS \
+            | sha256sum --check --strict
+
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release/Sessionmux-Setup-${{ env.VERSION }}.exe
+            release/Sessionmux-Setup.exe
+            release/Sessionmux-${{ env.VERSION }}-macOS.dmg
+            release/Sessionmux-macOS.dmg
+            release/Sessionmux-${{ env.VERSION }}-macOS.zip
+            release/Sessionmux-macOS.zip
+            release/SHA256SUMS
+            release/BUILDINFO.txt
+            release/BUILDINFO-macOS.txt
+
+      # The macOS section goes where the Windows notes hold @MACOS_SECTION@, the combined hashes
+      # where they hold @SHA256SUMS@, and the attestation link replaces @ATTESTATION_URL@; \, |
+      # and & in the link are escaped so it is inserted as written. The release is created as a
+      # draft pre-release that is never marked as the latest release.
+      - name: Create draft pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+        run: |
+          for p in @MACOS_SECTION@ @SHA256SUMS@ @ATTESTATION_URL@; do
+            grep -qF "$p" release/notes.md || { echo "release/notes.md has no $p placeholder" >&2; exit 1; }
+          done
+          sed -i -e '/^@MACOS_SECTION@\r\{0,1\}$/{r release/notes-macos.md' -e 'd}' release/notes.md
+          sed -i -e '/^@SHA256SUMS@\r\{0,1\}$/{r release/SHA256SUMS' -e 'd}' release/notes.md
+          if grep -q -e '@MACOS_SECTION@' -e '@SHA256SUMS@' release/notes.md; then
+            echo 'a placeholder in release/notes.md was not replaced' >&2
+            exit 1
+          fi
+          url=$(printf '%s' "$ATTESTATION_URL" | sed 's/[\\|&]/\\&/g')
+          sed -i "s|@ATTESTATION_URL@|$url|" release/notes.md
+          gh release create "$TAG" \
+            "release/Sessionmux-Setup-$VERSION.exe" release/Sessionmux-Setup.exe \
+            "release/Sessionmux-$VERSION-macOS.dmg" release/Sessionmux-macOS.dmg \
+            "release/Sessionmux-$VERSION-macOS.zip" release/Sessionmux-macOS.zip \
+            release/SHA256SUMS release/BUILDINFO.txt release/BUILDINFO-macOS.txt \
+            --repo "$GITHUB_REPOSITORY" --title "Sessionmux $VERSION" --notes-file release/notes.md \
+            --draft --prerelease --latest=false
