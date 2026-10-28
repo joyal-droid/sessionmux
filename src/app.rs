@@ -1087,7 +1087,13 @@ fn show_open_failure(id: u64, plan: &OpenPlan, v: &Value) {
             show_panel();
         }
     }
-    if id == 0 {
+    // The page that asked may have been destroyed while the open ran (the panel hid during a
+    // long Automation prompt); the page shown now cannot take its reply, so it gets the event.
+    let stale = id != 0 && id != tag_id(id & ID_MASK);
+    if stale {
+        with_state(|st| emit(st, "show-tab", &json!("accounts")));
+    }
+    if id == 0 || stale {
         let payload = open_failed_payload(plan, v);
         with_state(|st| emit(st, "openFailed", &payload));
     }
