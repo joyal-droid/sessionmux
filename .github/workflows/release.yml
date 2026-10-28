@@ -428,7 +428,11 @@ jobs:
             echo '2. Open Sessionmux from Applications. macOS says it cannot check the app for malicious software; choose **Done** (or **Cancel**).'
             echo '3. Open **System Settings > Privacy & Security**, scroll down to **Security** and choose **Open Anyway** next to the line about Sessionmux, then confirm with **Open Anyway** and your password.'
             echo
-            echo 'You do this once; afterwards Sessionmux opens normally. It lives in the menu bar and has no Dock icon.'
+            echo 'On **macOS 13 and 14**, instead of steps 2 and 3: Control-click Sessionmux in Applications, choose **Open**, then **Open** again.'
+            echo
+            echo 'If macOS instead says Sessionmux "is damaged and can'"'"'t be opened", run `xattr -dr com.apple.quarantine /Applications/Sessionmux.app` in Terminal and open it again.'
+            echo
+            echo 'You do this once per version; afterwards Sessionmux opens normally. It lives in the menu bar and has no Dock icon.'
             if [ "$MACOS_PREVIEW" = "true" ]; then
               echo
               echo '**Not yet verified on a Mac**'
