@@ -148,7 +148,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 lipo -create -output "$BIN" \
     "$TARGET_DIR/aarch64-apple-darwin/release/$NAME" "$TARGET_DIR/x86_64-apple-darwin/release/$NAME"
-lipo -verify_arch arm64 x86_64 "$BIN" || fail "the binary is not universal (arm64 + x86_64)"
+lipo "$BIN" -verify_arch arm64 x86_64 || fail "the binary is not universal (arm64 + x86_64)"
 lipo -info "$BIN"
 
 # ---------------------------------------------------------------- 4. Info.plist
