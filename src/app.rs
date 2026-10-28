@@ -733,7 +733,15 @@ fn clean_account_patch(p: &Value, require_name: bool) -> UResult<AccountPatch> {
 fn clean_settings_patch(p: &Value) -> UResult<Value> {
     let Some(o) = p.as_object() else { return Err("Invalid settings.".into()) };
     let mut out = serde_json::Map::new();
-    for k in ["startWithWindows", "shareMcpConfig", "showBubble", "signInRouting", "autoHandover", "approveFromPanel"] {
+    for k in [
+        "startWithWindows",
+        "shareMcpConfig",
+        "showBubble",
+        "signInRouting",
+        "autoHandover",
+        "approveFromPanel",
+        "raiseWindowsWithAccessibility",
+    ] {
         if let Some(v) = o.get(k) {
             if !v.is_boolean() {
                 return Err(format!("Invalid value for {k}."));
@@ -4268,6 +4276,11 @@ mod tests {
             clean_settings_patch(&json!({ "autoHandover": true, "approveFromPanel": false })).unwrap(),
             json!({ "autoHandover": true, "approveFromPanel": false })
         );
+        assert_eq!(
+            clean_settings_patch(&json!({ "raiseWindowsWithAccessibility": true })).unwrap(),
+            json!({ "raiseWindowsWithAccessibility": true })
+        );
+        assert!(clean_settings_patch(&json!({ "raiseWindowsWithAccessibility": "on" })).is_err());
         // A key older builds accepted is dropped like any unknown key, whatever its value.
         let retired = concat!("tamper", "Gesture");
         for v in [json!(false), json!("off")] {
