@@ -638,8 +638,10 @@ mod tests {
         fn LSRegisterURL(url: *const c_void, update: u8) -> i32;
     }
 
-    const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/\r
-                              LaunchServices.framework/Support/lsregister";
+    const LSREGISTER: &str = concat!(
+        "/System/Library/Frameworks/CoreServices.framework/Frameworks/",
+        "LaunchServices.framework/Support/lsregister"
+    );
 
     /// Tell Launch Services about the app at `app`, including the schemes it declares.
     fn register(app: &Path) {
@@ -700,7 +702,8 @@ mod tests {
                 return;
             }
         };
-        let d = tempfile::tempdir().unwrap();
+        // Not a hidden folder, so Launch Services treats the apps in it like any others.
+        let d = tempfile::Builder::new().prefix("sessionmux-test-").tempdir().unwrap();
         let root = d.path().canonicalize().unwrap();
         let first = app_copy(&f, &root, "First");
         let second = app_copy(&f, &root, "Second");
