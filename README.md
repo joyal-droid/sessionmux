@@ -214,7 +214,10 @@ Recording, Full Disk Access or notifications.
   e-mail code instead.
 - **Accessibility**: only if you turn on **Bring minimised Claude windows to the front** in
   Settings. macOS does not let an app un-minimise another app's window or fetch it from another
-  Space without it; Sessionmux offers the switch when bringing a window forward did not work.
+  Space without it; Sessionmux offers the switch when bringing a window forward did not work. It
+  also lets a click on the account whose Claude window is in front minimise that window; without
+  it the click brings the window forward as before, since macOS does not let Sessionmux hide
+  another app.
 - **Login Items**: turning on **Open at login** shows a "Background Items Added" notice. If
   Settings says so, allow Sessionmux in **System Settings > General > Login Items**.
 

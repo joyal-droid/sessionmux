@@ -2992,7 +2992,7 @@ function initPanel() {
           toggleRow('shareMcpConfig', 'Share MCP servers from Main', "Copy Main's MCP server config into the other accounts when it changes."),
           mac
             ? toggleRow('raiseWindowsWithAccessibility', 'Bring minimised Claude windows to the front',
-              'When switching to an account leaves its window minimised or in another Space, Sessionmux uses Accessibility to bring it forward. macOS asks for it again after each update.')
+              'When switching to an account leaves its window minimised or in another Space, Sessionmux uses Accessibility to bring it forward. It also lets a click on the account in front minimise its window. macOS asks for it again after each update.')
             : null,
           mac && s.raiseWindowsWithAccessibility && s.accessibilityTrusted === false
             ? noteRow('Allow Sessionmux in System Settings > Privacy & Security > Accessibility.',

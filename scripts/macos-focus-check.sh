@@ -58,7 +58,7 @@
 #           raise setting on                                           of it on screen, no message
 #                                                                      in the panel
 #       S9  panel row, Second's window minimised as S8 left it, raise  must come back in front
-#           setting off (shown again as a click on its Dock icon does)
+#           setting still on (un-minimised through Accessibility)
 #
 # Leaves in <out-dir>: focus-check.json, sessionmux.log, startup.txt, script.log, summary.txt
 # and one screenshot per step. Prints one GitHub notice per step. Exits 0 when the startup log
@@ -99,8 +99,8 @@ SCRIPT_LOG="$OUT/script.log"
 SUMMARY="$OUT/summary.txt"
 # S7 turns the raise setting on for the rest of the run and S5 leaves Second's Claude slow to
 # answer after it is resumed, so S7 runs before S5 and S5 runs last. S9 starts from what S8 left.
-# S9 turns the raise setting off, so the minimised window comes back as after a click on its Dock
-# icon, and S5 turns it back on.
+# S8 and S9 keep the raise setting on, as a user who has the click minimise a window has it: S8
+# minimises Second's window through Accessibility and S9 un-minimises it.
 STEPS="S1 S2 S3 S4 S6 S7 S8 S9 S5"
 STOPPED_PID=""
 
@@ -521,10 +521,8 @@ cat >"$WORK/plan.json" <<JSON
     { "name": "S7", "account": "$SECOND_ID", "via": "panel", "expect": "front", "windowBefore": false,
       "settings": { "raiseWindowsWithAccessibility": true } },
     { "name": "S8", "account": "$SECOND_ID", "via": "panel", "expect": "minimised", "windowBefore": true },
-    { "name": "S9", "account": "$SECOND_ID", "via": "panel", "expect": "front", "windowBefore": false,
-      "settings": { "raiseWindowsWithAccessibility": false } },
-    { "name": "S5", "account": "$SECOND_ID", "via": "panel", "expect": "visible-failure",
-      "settings": { "raiseWindowsWithAccessibility": true } }
+    { "name": "S9", "account": "$SECOND_ID", "via": "panel", "expect": "front", "windowBefore": false },
+    { "name": "S5", "account": "$SECOND_ID", "via": "panel", "expect": "visible-failure" }
   ]
 }
 JSON

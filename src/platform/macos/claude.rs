@@ -360,8 +360,8 @@ pub(crate) trait FocusSteps {
     fn in_front(&mut self, pid: Pid) -> bool;
     /// Whether raising windows through Accessibility is turned on and allowed.
     fn accessibility(&mut self) -> AxState;
-    /// Un-minimise and raise `pid`'s largest window through Accessibility and make it the main
-    /// window of the app in front.
+    /// Un-minimise and raise `pid`'s largest minimised window (else its largest) through
+    /// Accessibility and make it the main window of the app in front.
     fn raise_with_accessibility(&mut self, pid: Pid) -> bool;
     /// Where `pid`'s windows are.
     fn window_state(&mut self, pid: Pid) -> WinState;
@@ -813,8 +813,13 @@ fn ax_area(win: &CFType) -> f64 {
     }
 }
 
-/// Un-minimise `pid`'s largest window, raise it, make it the app's main window and the app the
-/// one in front. True when the raise or the move to the front was accepted; with the result
+/// True when an Accessibility window is minimised.
+fn ax_minimised(win: &CFType) -> bool {
+    ax_attr(win, "AXMinimized").and_then(|v| v.downcast::<CFBoolean>().ok()).is_some_and(|b| b.as_bool())
+}
+
+/// Un-minimise `pid`'s largest minimised window (else its largest), raise it, make it the app's
+/// main window and the app the one in front. True when the raise or the move to the front was accepted; with the result
 /// codes of every call, for the log.
 fn ax_raise(pid: Pid) -> (bool, String) {
     let Some(p) = ns_pid(pid) else { return (false, "bad pid".into()) };
@@ -834,7 +839,16 @@ fn ax_raise(pid: Pid) -> (bool, String) {
     // only passed back to Accessibility calls.
     let list: CFRetained<CFArray<CFType>> = unsafe { CFRetained::cast_unchecked(list) };
     let count = list.len();
-    let Some(win) = list.iter().map(|w| (ax_area(&w), w)).max_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, w)| w) else {
+    // A minimised window comes back first (the one a click on the account in front put away),
+    // else the largest.
+    let largest = |only_minimised: bool| {
+        list.iter()
+            .filter(|w| !only_minimised || ax_minimised(w))
+            .map(|w| (ax_area(&w), w))
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, w)| w)
+    };
+    let Some(win) = largest(true).or_else(|| largest(false)) else {
         return (false, "windows 0".into());
     };
     let unminimised = ax_set_bool(&win, "AXMinimized", false);

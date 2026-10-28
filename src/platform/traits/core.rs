@@ -246,7 +246,8 @@ pub trait Focus {
     /// Whether `pid` shows a window on screen now: not minimised, its app not hidden.
     fn showing(pid: Pid) -> bool;
     /// Put away `pid`'s window that is in front: [`FocusResult::Minimised`] when it is off
-    /// screen now. [`Focus::focus`] brings it back.
+    /// screen now. [`Focus::focus`] brings it back. On macOS only through Accessibility, with the
+    /// raise setting on: macOS does not let Sessionmux hide another app.
     fn minimise(pid: Pid) -> FocusResult;
     /// Whether Sessionmux may raise other apps' windows; with `prompt`, the system is asked to
     /// show its grant prompt when it may not yet. None where no such permission exists.
