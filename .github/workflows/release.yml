@@ -30,6 +30,10 @@ jobs:
   checks:
     name: Tag, tests and lints
     runs-on: windows-latest
+    permissions:
+      contents: read
+      # read the CI runs of a preview's commit
+      actions: read
     outputs:
       version: ${{ steps.version.outputs.version }}
       preview: ${{ steps.version.outputs.preview }}
@@ -75,6 +79,26 @@ jobs:
             Write-Error "the tagged commit $commit is not on $branch"
             exit 1
           }
+
+      # The macos branch takes direct pushes, not pull requests, so a preview also needs a CI run
+      # of the tagged commit on that branch that passed in full (the macOS jobs included).
+      - name: Check that CI passed on the tagged commit
+        if: steps.version.outputs.preview == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $commit = git rev-parse "$env:GITHUB_SHA^{commit}"
+          $uri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$commit&branch=macos&event=push&per_page=20"
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
+          $runs = @((Invoke-RestMethod -Uri $uri -Headers $headers).workflow_runs)
+          $passed = @($runs | Where-Object { $_.status -eq 'completed' -and $_.conclusion -eq 'success' })
+          if ($passed.Count -eq 0) {
+            $seen = ($runs | ForEach-Object { "$($_.status)/$($_.conclusion)" }) -join ', '
+            Write-Error "no passed CI run on macos for $commit (runs: $(if ($seen) { $seen } else { 'none' })); re-run this workflow once CI has passed"
+            exit 1
+          }
+          "CI passed on $commit`: $($passed[0].html_url)"
 
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
         shell: pwsh
