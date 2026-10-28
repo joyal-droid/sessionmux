@@ -2579,6 +2579,7 @@ function initPanel() {
     state.settings = Object.assign({}, state.settings || {}, s);
     applyTheme(state.settings.theme);
     renderSignInNotice();
+    renderHotkeyHint();
     if (state.tab === 'settings') renderSettings();
   }
 
@@ -2786,6 +2787,23 @@ function initPanel() {
         h('span', { class: 'setting__label', text: 'Show / hide panel' }),
         h('span', { class: 'setting__desc', text: mac ? 'Works from anywhere on your Mac.' : 'Works from anywhere in Windows.' })),
       h('span', { class: 'kbd-group', attrs: { 'aria-label': 'Shortcut ' + spoken } },
+        parts.map((p) => h('kbd', { text: p }))));
+  }
+
+  /** The quiet show/hide shortcut line under the Accounts footer buttons; hidden without a shortcut. */
+  function renderHotkeyHint() {
+    const hint = $('hotkeyHint');
+    if (!hint) return;
+    const mac = onMac();
+    const parts = hotkeyParts(state.settings && state.settings.hotkey, mac);
+    hint.textContent = '';
+    hint.hidden = parts.length === 0;
+    if (!parts.length) return;
+    const spoken = mac ? parts.map((p) => MAC_KEY_NAMES[p] || p).join(' ') : parts.join(' plus ');
+    hint.append(
+      h('span', { text: 'Show or hide panel' }),
+      h('span', { class: 'footer__hint-spoken', text: ': ' + spoken }),
+      h('span', { class: 'kbd-group', attrs: { 'aria-hidden': 'true' } },
         parts.map((p) => h('kbd', { text: p }))));
   }
 

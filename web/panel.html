@@ -82,13 +82,15 @@
           <ul class="disc-list" id="discoveredList" aria-labelledby="discoveredTitle"></ul>
         </div>
       </div>
-      <footer class="footer">
+      <footer class="footer footer--accounts">
         <button class="btn btn--ghost" id="btnAdd" type="button" aria-expanded="false">
           <span class="ico" data-icon="plus"></span>Add account
         </button>
         <button class="btn btn--invert" id="btnOpenAll" type="button">
           <span class="ico" data-icon="layers"></span>Open all
         </button>
+        <!-- The global show/hide shortcut, filled by panel.js -->
+        <p class="footer__hint" id="hotkeyHint" hidden></p>
       </footer>
     </section>
 

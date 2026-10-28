@@ -193,6 +193,45 @@ body {
   border-top: 1px solid var(--border);
 }
 
+/* Accounts footer: the buttons, then a quiet line with the show/hide shortcut under them. */
+.footer--accounts { flex-wrap: wrap; row-gap: var(--s-2); }
+.footer__hint {
+  flex: 1 0 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin: 0;
+  color: var(--fg-subtle);
+  font-size: var(--fs-xs);
+  letter-spacing: 0.01em;
+  line-height: 1;
+  flex-wrap: wrap;
+  row-gap: 4px;
+  white-space: nowrap;
+}
+.footer__hint[hidden] { display: none; }
+.footer__hint-spoken {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.footer__hint .kbd-group { gap: 3px; }
+.footer__hint kbd {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-color: var(--border);
+  background: transparent;
+  box-shadow: none;
+  color: var(--fg-muted);
+  font-size: 10px;
+}
+
 /* ---------- Icons ---------- */
 
 .ico {
