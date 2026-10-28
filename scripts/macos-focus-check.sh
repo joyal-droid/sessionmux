@@ -54,10 +54,10 @@
 #       S6  opened from posted work, with no input event               recorded
 #       S7  panel row, Second's window closed with Cmd-W, raise setting   must reopen and come forward
 #           on (Accessibility recorded for Sessionmux when the runner lets it)
-#       S8  panel row, Second's window open and Second in front        must be put away: minimised
-#           (with the raise setting on and Accessibility allowed) or Second hidden, no window
-#           of it on screen and no message in the panel
-#       S9  panel row, Second's window as S8 left it                    must come back in front
+#       S8  panel row, Second's window open and Second in front,      must be put away: Second
+#           raise setting off                                          hidden, no window of it on
+#                                                                      screen, no message in the panel
+#       S9  panel row, Second hidden as S8 left it, raise setting on   must come back in front
 #
 # Leaves in <out-dir>: focus-check.json, sessionmux.log, startup.txt, script.log, summary.txt
 # and one screenshot per step. Prints one GitHub notice per step. Exits 0 when the startup log
@@ -98,6 +98,8 @@ SCRIPT_LOG="$OUT/script.log"
 SUMMARY="$OUT/summary.txt"
 # S7 turns the raise setting on for the rest of the run and S5 leaves Second's Claude slow to
 # answer after it is resumed, so S7 runs before S5 and S5 runs last. S9 starts from what S8 left.
+# S8 turns the raise setting off, so the click hides Second rather than minimising its window
+# through Accessibility, and S9 turns it back on for S5.
 STEPS="S1 S2 S3 S4 S6 S7 S8 S9 S5"
 STOPPED_PID=""
 
@@ -501,8 +503,10 @@ cat >"$WORK/plan.json" <<JSON
     { "name": "S6", "account": "$SECOND_ID", "via": "posted", "expect": "record", "windowBefore": true },
     { "name": "S7", "account": "$SECOND_ID", "via": "panel", "expect": "front", "windowBefore": false,
       "settings": { "raiseWindowsWithAccessibility": true } },
-    { "name": "S8", "account": "$SECOND_ID", "via": "panel", "expect": "minimised", "windowBefore": true },
-    { "name": "S9", "account": "$SECOND_ID", "via": "panel", "expect": "front", "windowBefore": false },
+    { "name": "S8", "account": "$SECOND_ID", "via": "panel", "expect": "minimised", "windowBefore": true,
+      "settings": { "raiseWindowsWithAccessibility": false } },
+    { "name": "S9", "account": "$SECOND_ID", "via": "panel", "expect": "front", "windowBefore": false,
+      "settings": { "raiseWindowsWithAccessibility": true } },
     { "name": "S5", "account": "$SECOND_ID", "via": "panel", "expect": "visible-failure" }
   ]
 }
