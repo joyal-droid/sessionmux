@@ -46,6 +46,10 @@ const HELPER_FLAG: &str = "--type=";
 const BUNDLE_EXE_SUFFIX: &str = "/Claude.app/Contents/MacOS/Claude";
 /// Extra room when reading the process table, for processes started between the two calls.
 const PID_HEADROOM: usize = 64;
+/// The data folder given to a Claude main process whose arguments cannot be read (one that is
+/// starting or ending, or another user's). It names no folder, so the process belongs to no
+/// account, Main included, and is never closed or sent a link as one.
+pub(crate) const UNKNOWN_DATA_DIR: &str = "?";
 
 // ───────────────────────────────────────────────────────────── arguments ──
 
@@ -225,8 +229,17 @@ struct Seen {
     argv: Option<Vec<String>>,
 }
 
-/// Running Claude Desktop main processes, without their windows.
+/// Running Claude Desktop main processes of the located installation, without their windows.
 pub(crate) fn claude_mains(l: Option<&Located>) -> Vec<Proc> {
+    mains(l, false)
+}
+
+/// Like [`claude_mains`], but processes of any `Claude.app` copy count, not only the located one.
+pub(crate) fn any_claude_mains(l: Option<&Located>) -> Vec<Proc> {
+    mains(l, true)
+}
+
+fn mains(l: Option<&Located>, any_copy: bool) -> Vec<Proc> {
     let claude = ClaudeExe::new(l);
     let me = std::process::id();
     let seen: Vec<Seen> = all_pids()
@@ -234,7 +247,8 @@ pub(crate) fn claude_mains(l: Option<&Located>) -> Vec<Proc> {
         .filter(|&pid| pid != me)
         .filter_map(|pid| {
             let exe = pid_path(pid)?;
-            claude.matches(&exe).then(|| Seen { pid, exe, argv: <Os as Processes>::argv(pid) })
+            let ours = if any_copy { claude.matches_any(&exe) } else { claude.matches(&exe) };
+            ours.then(|| Seen { pid, exe, argv: <Os as Processes>::argv(pid) })
         })
         .collect();
     let claude_pids: HashSet<Pid> = seen.iter().map(|s| s.pid).collect();
@@ -248,7 +262,7 @@ pub(crate) fn claude_mains(l: Option<&Located>) -> Vec<Proc> {
                 if <Os as Processes>::parent(s.pid).is_some_and(|pp| claude_pids.contains(&pp)) {
                     continue;
                 }
-                (String::new(), None)
+                (String::new(), Some(UNKNOWN_DATA_DIR.to_string()))
             }
         };
         out.push(Proc { pid: s.pid, exe: s.exe, cmdline, data_dir, hwnd: 0 });
@@ -440,6 +454,20 @@ mod tests {
         assert!(!one.matches("/Applications/Claude.app/Contents/MacOS/Claude"));
         assert!(one.matches_any("/Applications/Claude.app/Contents/MacOS/Claude"));
         assert!(!one.matches_any("/bin/sh"));
+    }
+
+    #[test]
+    fn an_unknown_data_folder_belongs_to_no_account() {
+        let p = Proc {
+            pid: 1,
+            exe: String::new(),
+            cmdline: String::new(),
+            data_dir: Some(UNKNOWN_DATA_DIR.into()),
+            hwnd: 0,
+        };
+        assert!(!crate::core::claude_app::matches_data_dir(&p, None));
+        assert!(!crate::core::claude_app::matches_data_dir(&p, Some("/Users/u/Library/Application Support/Claude-X")));
+        assert!(!crate::core::claude_app::matches_data_dir(&p, Some("/")));
     }
 
     #[test]

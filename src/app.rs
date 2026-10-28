@@ -873,7 +873,11 @@ fn open_worker(plan: &OpenPlan, located: Option<Located>, focus: bool, wake: &Op
         if !focus {
             return ok();
         }
-        if let Some(w) = running.iter().find(|p| p.hwnd != 0) {
+        // On macOS a running instance is never started again, so activation (and the opt-in
+        // Accessibility raise) is tried even when none of its windows is on screen.
+        let shown = running.iter().find(|p| p.hwnd != 0);
+        let target = shown.or_else(|| running.first().filter(|_| cfg!(target_os = "macos")));
+        if let Some(w) = target {
             if is_smoke() {
                 log::info("smoke: blocked claude_app::focus");
             } else {
@@ -961,13 +965,19 @@ fn request_poll(st: &mut AppState) {
 }
 
 fn open_account(id: u64, acc_id: &Value, focus: bool) -> UResult<()> {
-    let (plan, located, wake) = state_call_raw(|st| {
+    let (plan, located, wake, running) = state_call_raw(|st| {
         let acc = find_account(st, acc_id)?;
         st.last_opened = Some(acc.id.clone());
         set_active(st, Some(&acc.id));
         let plan = prepare_open(st, &acc)?;
-        Ok((plan, st.located.clone(), st.poll_wake.clone()))
+        let running = st.procs.iter().find(|p| claude_app::matches_data_dir(p, plan.dir.as_deref())).map(|p| p.pid);
+        Ok((plan, st.located.clone(), st.poll_wake.clone(), running))
     })?;
+    // Still inside the user's click or shortcut: where the system asks for that, the activation
+    // the worker passes to Claude is taken here.
+    if let Some(pid) = running.filter(|_| focus && !is_smoke()) {
+        <Os as Focus>::prepare_focus(pid);
+    }
     spawn_then(move || open_worker(&plan, located, focus, &wake), move |v| resolve(id, v));
     Ok(())
 }

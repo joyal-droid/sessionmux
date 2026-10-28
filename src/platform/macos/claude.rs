@@ -48,13 +48,14 @@ use std::time::{Duration, Instant};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
+use objc2::MainThreadMarker;
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSRunningApplication, NSWorkspace, NSWorkspaceOpenConfiguration,
 };
 use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFRetained, CFString, CFType, CGSize};
 use objc2_foundation::{NSArray, NSBundle, NSError, NSOperatingSystemVersion, NSProcessInfo, NSString, NSURL};
 
-use super::process::{self, claude_mains, is_helper, pid_path, real_path, ClaudeExe, UDD};
+use super::process::{self, any_claude_mains, claude_mains, is_helper, pid_path, real_path, ClaudeExe, UDD};
 use super::window::{front_window_owner, on_main_wait};
 use crate::core::claude_app::{self, Located};
 use crate::platform::{ClaudeInstall, Closer, Focus, FocusResult, Launcher, Os, Paths, Pid, Processes, Windows};
@@ -204,8 +205,10 @@ fn open_instance(l: &Located, args: &[String]) -> Result<Pid, String> {
 }
 
 /// The main process already running on `data_dir` (None = Main), if any.
+/// Instances started from any copy of Claude.app count: a second copy on the same folder would
+/// not hand over either.
 fn running_on(l: &Located, data_dir: Option<&str>) -> Option<Pid> {
-    claude_mains(Some(l)).into_iter().find(|p| claude_app::matches_data_dir(p, data_dir)).map(|p| p.pid)
+    any_claude_mains(Some(l)).into_iter().find(|p| claude_app::matches_data_dir(p, data_dir)).map(|p| p.pid)
 }
 
 /// Refuse a start on a folder that already runs (a second instance would not hand over).
@@ -274,21 +277,32 @@ pub(crate) fn focus_with(s: &mut impl FocusSteps, pid: Pid, handoff: bool) -> Fo
     FocusResult::Failed
 }
 
+/// Activate Sessionmux and, on macOS 14 and later, yield activation to `pid`. Only effective
+/// inside the handler of the user's click or shortcut: later, the system may refuse it.
+fn activate_self_now(mtm: MainThreadMarker, pid: Option<Pid>) {
+    let app = NSApplication::sharedApplication(mtm);
+    if !macos_at_least(14) {
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
+        return;
+    }
+    app.activate();
+    if let Some(target) = pid.and_then(ns_pid).and_then(NSRunningApplication::runningApplicationWithProcessIdentifier) {
+        app.yieldActivationToApplication(&target);
+    }
+}
+
 /// The real focus steps: AppKit activation on the main thread, Accessibility from the caller's
 /// thread.
 struct SystemFocus;
 
 impl FocusSteps for SystemFocus {
+    /// Done by [`Focus::prepare_focus`] in the user's event handler; from a worker thread, after
+    /// that event, activating Sessionmux could take activation away from the app the user is in.
     fn activate_self(&mut self) {
-        on_main_wait(MAIN_WAIT, |mtm| {
-            let app = NSApplication::sharedApplication(mtm);
-            if macos_at_least(14) {
-                app.activate();
-            } else {
-                #[allow(deprecated)]
-                app.activateIgnoringOtherApps(true);
-            }
-        });
+        if let Some(mtm) = MainThreadMarker::new() {
+            activate_self_now(mtm, None);
+        }
     }
 
     fn pass_activation(&mut self, pid: Pid) {
@@ -600,6 +614,15 @@ impl ClaudeInstall for Os {
 }
 
 impl Focus for Os {
+    /// Activate Sessionmux inside the user's click or shortcut and yield activation to `pid`, so
+    /// the activation that [`Focus::focus`] asks for from a worker thread is granted.
+    fn prepare_focus(pid: Pid) {
+        match MainThreadMarker::new() {
+            Some(mtm) => activate_self_now(mtm, Some(pid)),
+            None => log::debug("claude_app: activation can only be prepared on the main thread"),
+        }
+    }
+
     fn focus(pid: Pid) -> FocusResult {
         if !<Os as Processes>::alive(pid) {
             return FocusResult::Failed;

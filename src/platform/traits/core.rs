@@ -191,6 +191,10 @@ pub trait Launcher {
 
 /// Bringing a Claude window to the front.
 pub trait Focus {
+    /// Called on the UI thread from the handler of the user's click, shortcut or menu choice,
+    /// before [`Focus::focus`] runs on a worker thread, where the system lets an app pass the
+    /// activation on only from within such an event. Does nothing where that is not needed.
+    fn prepare_focus(_pid: Pid) {}
     fn focus(pid: Pid) -> FocusResult;
     /// Whether Sessionmux may raise other apps' windows; with `prompt`, the system is asked to
     /// show its grant prompt when it may not yet. None where no such permission exists.
