@@ -737,19 +737,19 @@ mod tests {
         let second = app_copy(&f, d.path(), "Second");
         register(&first);
         register(&second);
+        // Taking the scheme does not need a handler to exist yet; when Launch Services offers
+        // none, the take below fails with what it knows about the scheme.
         if !wait_for(10, || Os::current(fake::SCHEME).is_some()) {
-            // Some machines never offer apps from a temporary folder for a scheme; nothing about
-            // the handler code can be checked there.
-            println!(
-                "skipped: Launch Services offers no app for the test scheme: {}",
-                scheme_report(&[&first, &second])
-            );
-            return;
+            println!("no handler offered for the test scheme yet: {}", scheme_report(&[&first, &second]));
         }
 
         let (a, b) = (first.clone(), second.clone());
         let worker = std::thread::spawn(move || {
-            assert!(settles(change_handler(fake::SCHEME, &a), &a), "first app takes the test scheme");
+            assert!(
+                settles(change_handler(fake::SCHEME, &a), &a),
+                "first app takes the test scheme: {}",
+                scheme_report(&[&a, &b])
+            );
             let now = Os::current(fake::SCHEME).expect("a handler");
             assert!(<Os as Paths>::same_path(&now.0, &a.to_string_lossy()), "{now:?}");
             assert!(!Os::is_us(&now));
