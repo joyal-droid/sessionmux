@@ -68,10 +68,13 @@ jobs:
             [ -e "$f" ] || continue
             title=$(tr -d '\r\n' < "$f" | sed 's/%/%25/g; s/:/%3A/g; s/,/%2C/g')
             log="${f%.failed}.log"
+            # Colour codes go first, so compiler errors match at the start of a line.
+            plain="$f.plain"
+            perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g' "$log" > "$plain"
             # The failing tests and compiler errors first, then the end of the output, in pieces
             # small enough for one annotation each.
-            { grep -E -A8 '^---- |panicked at|^error(\[|:)' "$log" | head -n 400; echo '[...]'; tail -n 25 "$log"; } \
-              | perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g' > "$f.txt"
+            { grep -E -A8 '^---- |panicked at|^error(\[|:)' "$plain" | head -n 400; echo '[...]'; tail -n 25 "$plain"; } \
+              > "$f.txt"
             split -b 3500 "$f.txt" "$f.part."
             for p in $(ls "$f".part.* | head -n 8); do
               body=$(perl -pe 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g' "$p")
@@ -186,10 +189,13 @@ jobs:
             [ -e "$f" ] || continue
             title=$(tr -d '\r\n' < "$f" | sed 's/%/%25/g; s/:/%3A/g; s/,/%2C/g')
             log="${f%.failed}.log"
+            # Colour codes go first, so compiler errors match at the start of a line.
+            plain="$f.plain"
+            perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g' "$log" > "$plain"
             # The failing tests and compiler errors first, then the end of the output, in pieces
             # small enough for one annotation each.
-            { grep -E -A8 '^---- |panicked at|^error(\[|:)' "$log" | head -n 400; echo '[...]'; tail -n 25 "$log"; } \
-              | perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g' > "$f.txt"
+            { grep -E -A8 '^---- |panicked at|^error(\[|:)' "$plain" | head -n 400; echo '[...]'; tail -n 25 "$plain"; } \
+              > "$f.txt"
             split -b 3500 "$f.txt" "$f.part."
             for p in $(ls "$f".part.* | head -n 8); do
               body=$(perl -pe 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g' "$p")
@@ -249,10 +255,13 @@ jobs:
             [ -e "$f" ] || continue
             title=$(tr -d '\r\n' < "$f" | sed 's/%/%25/g; s/:/%3A/g; s/,/%2C/g')
             log="${f%.failed}.log"
+            # Colour codes go first, so compiler errors match at the start of a line.
+            plain="$f.plain"
+            perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g' "$log" > "$plain"
             # The failing tests and compiler errors first, then the end of the output, in pieces
             # small enough for one annotation each.
-            { grep -E -A8 '^---- |panicked at|^error(\[|:)' "$log" | head -n 400; echo '[...]'; tail -n 25 "$log"; } \
-              | perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g' > "$f.txt"
+            { grep -E -A8 '^---- |panicked at|^error(\[|:)' "$plain" | head -n 400; echo '[...]'; tail -n 25 "$plain"; } \
+              > "$f.txt"
             split -b 3500 "$f.txt" "$f.part."
             for p in $(ls "$f".part.* | head -n 8); do
               body=$(perl -pe 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g' "$p")
