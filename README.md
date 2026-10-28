@@ -9,9 +9,9 @@ Windows 10 and 11, 64-bit · about 0.7 MB · installs for your user, no administ
 
 If Windows shows "Windows protected your PC", choose **More info**, then **Run anyway** ([why](#why-does-windows-show-a-smartscreen-warning)).
 
-<a href="https://github.com/joyal-droid/sessionmux/releases/download/v1.1.0-preview.1/Sessionmux-macOS.dmg"><img src="docs/download-button-macos.png" width="360" alt="Download Sessionmux-macOS.dmg for macOS, preview"></a>
+<a href="https://github.com/joyal-droid/sessionmux/releases/download/v1.1.0-preview.2/Sessionmux-macOS.dmg"><img src="docs/download-button-macos.png" width="360" alt="Download Sessionmux-macOS.dmg for macOS, preview"></a>
 
-**Preview** · macOS 13 or later · one app for Apple silicon and Intel · [release page](https://github.com/joyal-droid/sessionmux/releases/tag/v1.1.0-preview.1)
+**Preview** · macOS 13 or later · one app for Apple silicon and Intel · [release page](https://github.com/joyal-droid/sessionmux/releases/tag/v1.1.0-preview.2)
 
 Built and tested automatically, [not yet verified on a Mac](#not-yet-verified-on-a-mac). macOS asks you to confirm it once with **Open Anyway** ([how](#install-on-macos)).
 
@@ -157,7 +157,7 @@ The macOS app is a preview. It has the full feature set of the Windows app and p
 checks on GitHub's macOS machines (Apple silicon and Intel, macOS 15 and 26), but nobody has tried
 it on a real Mac yet; see [Not yet verified on a Mac](#not-yet-verified-on-a-mac). It is built from
 the [`macos` branch](https://github.com/joyal-droid/sessionmux/tree/macos) and published as the
-pre-release [v1.1.0-preview.1](https://github.com/joyal-droid/sessionmux/releases/tag/v1.1.0-preview.1),
+pre-release [v1.1.0-preview.2](https://github.com/joyal-droid/sessionmux/releases/tag/v1.1.0-preview.2),
 next to a Windows installer of the same version. Once it has been checked on a real Mac, it moves
 into the main branch and the normal releases, and the preview label goes.
 
@@ -186,22 +186,24 @@ into the main branch and the normal releases, and the preview label goes.
 
 #### Install on macOS
 
-1. Download [Sessionmux-macOS.dmg](https://github.com/joyal-droid/sessionmux/releases/download/v1.1.0-preview.1/Sessionmux-macOS.dmg)
-   from the [pre-release](https://github.com/joyal-droid/sessionmux/releases/tag/v1.1.0-preview.1)
+1. Download [Sessionmux-macOS.dmg](https://github.com/joyal-droid/sessionmux/releases/download/v1.1.0-preview.2/Sessionmux-macOS.dmg)
+   from the [pre-release](https://github.com/joyal-droid/sessionmux/releases/tag/v1.1.0-preview.2)
    (a `.zip` of the same app is there too) and optionally [verify it](#verify-your-download).
-2. Open the disk image and drag **Sessionmux** onto **Applications**. Run it from Applications, not
-   from the disk image: approval from the panel, Open at login and sign-in routing need the app to
-   stay where it is.
+2. Open the disk image. In the window that opens, drag **Sessionmux** onto **Applications**, then
+   eject the disk image. Run the app from Applications, not from the disk image: approval from the
+   panel, Open at login and sign-in routing need the app to stay where it is.
 3. Open Sessionmux from Applications. The app is signed ad hoc, without an Apple Developer ID, and
-   not notarized, so macOS says it cannot check it for malicious software.
+   not notarized, so macOS says it cannot check it for malicious software. Confirm it once per
+   version:
    - **macOS 15 and later:** choose **Done**, open **System Settings > Privacy & Security**, scroll
      down to **Security** and choose **Open Anyway** next to the line about Sessionmux, then
-     confirm with **Open Anyway** and your password.
+     confirm with **Open Anyway** and your password. Right-click > **Open** no longer skips this
+     on macOS 15.
    - **macOS 13 and 14:** Control-click Sessionmux in Applications, choose **Open**, then **Open**
      again.
 
-   You do this once per version; afterwards Sessionmux opens normally. (If you prefer Terminal:
-   `xattr -dr com.apple.quarantine /Applications/Sessionmux.app` does the same.)
+   If macOS instead says Sessionmux "is damaged and can't be opened", run
+   `xattr -dr com.apple.quarantine /Applications/Sessionmux.app` in Terminal and open it again.
 
 **Permissions macOS may ask for.** The core features (floating button, menu bar icon, accounts,
 sessions, approvals) need no permission at all. Sessionmux never asks for Input Monitoring, Screen
@@ -293,7 +295,7 @@ provenance):
 
 ```sh
 gh attestation verify Sessionmux-Setup-<version>.exe --repo joyal-droid/sessionmux --signer-workflow joyal-droid/sessionmux/.github/workflows/release.yml
-gh attestation verify Sessionmux-macOS.dmg --repo joyal-droid/sessionmux --signer-workflow joyal-droid/sessionmux/.github/workflows/release.yml --source-ref refs/tags/v1.1.0-preview.1
+gh attestation verify Sessionmux-macOS.dmg --repo joyal-droid/sessionmux --signer-workflow joyal-droid/sessionmux/.github/workflows/release.yml --source-ref refs/tags/v1.1.0-preview.2
 ```
 
 [SECURITY.md](SECURITY.md#verifying-a-download) explains both checks and how to rebuild the exe

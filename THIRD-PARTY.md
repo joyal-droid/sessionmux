@@ -2,7 +2,7 @@
 
 Sessionmux is licensed under the Common Public Attribution License 1.0 (CPAL-1.0, see
 `LICENSE`). It is built with the open-source components listed below, each under its own
-license. Versions are taken from `Cargo.lock` of Sessionmux 1.1.0-preview.1. The MIT and Apache
+license. Versions are taken from `Cargo.lock` of Sessionmux 1.1.0-preview.2. The MIT and Apache
 licenses require that their copyright and license notices accompany copies of the software,
 which is what this file is for.
 
@@ -109,7 +109,9 @@ The `url`, `dirs` and `icu_*` crates come in through `wry`'s macOS code.
 they are not compiled into either build.
 
 Build tools that are not part of the shipped files: `winresource` (MIT) for the exe resources,
-`tempfile` (MIT OR Apache-2.0) for tests, and NSIS (zlib/libpng license) for the installer.
+`tempfile` (MIT OR Apache-2.0) for tests, NSIS (zlib/libpng license) for the installer, and
+`dmgbuild` (MIT, with its `ds_store` and `mac_alias` modules, MIT) to lay out the macOS disk
+image window.
 The NSIS stub inside `Sessionmux-Setup-<version>.exe` is under the zlib/libpng license.
 
 ## License texts
@@ -424,7 +426,7 @@ END OF TERMS AND CONDITIONS
 
 ## Keeping this file current
 
-Versions above match `Cargo.lock` for Sessionmux 1.1.0-preview.1. After any dependency change,
+Versions above match `Cargo.lock` for Sessionmux 1.1.0-preview.2. After any dependency change,
 regenerate the crate list and compare:
 
 ```powershell
