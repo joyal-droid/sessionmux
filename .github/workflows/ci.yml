@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, macos]
   pull_request:
   # Weekly, so new RustSec advisories against an unchanged Cargo.lock are reported.
   schedule:
@@ -23,6 +23,10 @@ env:
 
 # Every action is pinned to a full commit SHA; the comment names the release it belongs to.
 # Dependabot (.github/dependabot.yml) proposes updates to these pins.
+#
+# Build, lint and test steps keep their output in ci-logs/ and mark a failure there with the
+# step's name; the last step of the job then reports the end of each failed step's output as an
+# error annotation, which can be read on the run page without signing in.
 jobs:
   fmt:
     name: Format
@@ -49,7 +53,23 @@ jobs:
           rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --component clippy
           rustup default $env:RUST_TOOLCHAIN
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Clippy
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          New-Item -ItemType Directory -Force ci-logs | Out-Null
+          cmd /c "cargo clippy --all-targets --locked -- -D warnings 2>&1" | Tee-Object -FilePath ci-logs/clippy.log
+          if ($LASTEXITCODE -ne 0) { 'Clippy' | Set-Content ci-logs/clippy.failed; exit $LASTEXITCODE }
+
+      - name: Report failed steps
+        if: failure()
+        shell: bash
+        run: |
+          for f in ci-logs/*.failed; do
+            [ -e "$f" ] || continue
+            title=$(tr -d '\r\n' < "$f" | sed 's/%/%25/g; s/:/%3A/g; s/,/%2C/g')
+            body=$(tail -n 150 "${f%.failed}.log" | perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g; s/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')
+            echo "::error title=$title log tail::$body"
+          done
 
   audit:
     name: Dependency audit
@@ -104,7 +124,11 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Build (release)
-        run: cargo build --release --locked
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          New-Item -ItemType Directory -Force ci-logs | Out-Null
+          cmd /c "cargo build --release --locked 2>&1" | Tee-Object -FilePath ci-logs/build.log
+          if ($LASTEXITCODE -ne 0) { 'Build (release)' | Set-Content ci-logs/build.failed; exit $LASTEXITCODE }
 
       - name: Privacy scan
         shell: pwsh
@@ -120,7 +144,11 @@ jobs:
         run: (Get-FileHash -Algorithm SHA256 -LiteralPath target\release\Sessionmux.exe).Hash.ToLowerInvariant()
 
       - name: Test
-        run: cargo test --locked
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          New-Item -ItemType Directory -Force ci-logs | Out-Null
+          cmd /c "cargo test --locked 2>&1" | Tee-Object -FilePath ci-logs/test.log
+          if ($LASTEXITCODE -ne 0) { 'Test' | Set-Content ci-logs/test.failed; exit $LASTEXITCODE }
 
       - name: Smoke
         shell: pwsh
@@ -141,3 +169,69 @@ jobs:
           name: smoke-captures
           path: smoke/*.png
           if-no-files-found: warn
+
+      - name: Report failed steps
+        if: failure()
+        shell: bash
+        run: |
+          for f in ci-logs/*.failed; do
+            [ -e "$f" ] || continue
+            title=$(tr -d '\r\n' < "$f" | sed 's/%/%25/g; s/:/%3A/g; s/,/%2C/g')
+            body=$(tail -n 150 "${f%.failed}.log" | perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g; s/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')
+            echo "::error title=$title log tail::$body"
+          done
+
+  macos:
+    name: macOS build and test
+    # Apple silicon.
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+          rustup default "$RUST_TOOLCHAIN"
+          rustup target add x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Clippy
+        run: |
+          mkdir -p ci-logs
+          cargo clippy --all-targets --locked -- -D warnings 2>&1 | tee ci-logs/clippy.log \
+            || { echo 'Clippy' > ci-logs/clippy.failed; exit 1; }
+
+      - name: Test
+        run: |
+          mkdir -p ci-logs
+          cargo test --locked 2>&1 | tee ci-logs/test.log || { echo 'Test' > ci-logs/test.failed; exit 1; }
+
+      - name: Build (release)
+        run: |
+          mkdir -p ci-logs
+          cargo build --release --locked 2>&1 | tee ci-logs/build.log \
+            || { echo 'Build (release)' > ci-logs/build.failed; exit 1; }
+
+      # The Intel slice of the universal binary, built on this Apple silicon runner.
+      - name: Build Intel (release)
+        run: |
+          mkdir -p ci-logs
+          cargo build --release --locked --target x86_64-apple-darwin 2>&1 | tee ci-logs/build-intel.log \
+            || { echo 'Build Intel (release)' > ci-logs/build-intel.failed; exit 1; }
+
+      - name: Report failed steps
+        if: failure()
+        shell: bash
+        run: |
+          for f in ci-logs/*.failed; do
+            [ -e "$f" ] || continue
+            title=$(tr -d '\r\n' < "$f" | sed 's/%/%25/g; s/:/%3A/g; s/,/%2C/g')
+            body=$(tail -n 150 "${f%.failed}.log" | perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g; s/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')
+            echo "::error title=$title log tail::$body"
+          done
