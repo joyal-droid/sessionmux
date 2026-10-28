@@ -69,6 +69,11 @@ const WINDOW_WAIT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(100);
 /// How long one Apple Event may take to be accepted, in ticks of 1/60 s (5 s).
 const SEND_TIMEOUT_TICKS: libc::c_long = 300;
+/// How long sending one Apple Event may take in all when nobody is asked for permission.
+const SEND_WAIT: Duration = Duration::from_secs(5);
+/// How long the user may take to answer the Automation prompt before the send gives up (the
+/// prompt stays open and its answer still counts for the next send).
+const ASK_WAIT: Duration = Duration::from_secs(120);
 
 /// A four-character Apple Event code as the number the system uses.
 const fn fourcc(c: &[u8; 4]) -> u32 {
@@ -400,7 +405,9 @@ pub(crate) enum AeSendError {
 /// Send the Apple Event `class`/`id` to process `pid` and nothing else, without waiting for an
 /// answer; the receiver may come forward. `text` is put in as the direct object (UTF-8). With
 /// `ask`, the user is asked for Automation permission the first time (blocking while the prompt
-/// is open); without it, a target the user was never asked about is `NotPermitted(-1744)`.
+/// is open, up to [`ASK_WAIT`]); without it, a target the user was never asked about is
+/// `NotPermitted(-1744)`. The system's permission check waits on the target, so a stopped or
+/// hung process gives up after [`SEND_WAIT`] instead of blocking the caller.
 pub(crate) fn send_event_to_pid(
     pid: Pid,
     class: u32,
@@ -408,6 +415,20 @@ pub(crate) fn send_event_to_pid(
     text: Option<&str>,
     ask: bool,
 ) -> Result<(), AeSendError> {
+    let text = text.map(str::to_owned);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("apple-event".into())
+        .spawn(move || {
+            let _ = tx.send(send_event_now(pid, class, id, text.as_deref(), ask));
+        })
+        .map_err(|e| AeSendError::Failed(format!("apple event thread: {e}")))?;
+    let wait = if ask { ASK_WAIT } else { SEND_WAIT };
+    rx.recv_timeout(wait)
+        .unwrap_or_else(|_| Err(AeSendError::Failed(format!("pid {pid} did not answer within {} s", wait.as_secs()))))
+}
+
+fn send_event_now(pid: Pid, class: u32, id: u32, text: Option<&str>, ask: bool) -> Result<(), AeSendError> {
     let p = libc::pid_t::try_from(pid).ok().filter(|&p| p > 0).ok_or_else(|| AeSendError::Failed("bad pid".into()))?;
     let mut target = AeDesc::new();
     // SAFETY: the data is the 4-byte pid this frame owns; `target` is an initialised descriptor
