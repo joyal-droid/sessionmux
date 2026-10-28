@@ -48,7 +48,7 @@
 #       S3  panel row, Second's window minimised, raise setting off    recorded
 #           (the settings file leaves "Bring minimised Claude windows to the front" off)
 #       S4  floating button avatar, Second's window closed with Cmd-W  must reopen and come forward
-#       S5  panel row, Second's Claude stopped (SIGSTOP)               must fail visibly in the panel
+#       S5  panel row, Second's window closed and Claude stopped      must fail visibly in the panel
 #       S6  opened from posted work, with no input event               recorded
 #
 # Leaves in <out-dir>: focus-check.json, sessionmux.log, startup.txt, script.log, summary.txt
@@ -126,10 +126,11 @@ sysevents() { osascript -e 'tell application "System Events"' "$@" -e 'end tell'
 window_count() { sysevents -e "count windows of (first process whose unix id is $1)"; }
 
 # "yes" when a process has a window that is not minimised.
+# A window whose minimised state cannot be read is skipped.
 open_window() {
     sysevents -e "set p to first process whose unix id is $1" \
         -e 'repeat with w in windows of p' \
-        -e 'if value of attribute "AXMinimized" of w is false then return "yes"' \
+        -e 'try' -e 'if value of attribute "AXMinimized" of w is false then return "yes"' -e 'end try' \
         -e 'end repeat' -e 'return "no"'
 }
 
@@ -208,7 +209,7 @@ setup_step() {
                 textedit_front
                 echo "note: window open, TextEdit in front"
             else
-                echo "error: Second's Claude has no open window"
+                echo "error: Second's Claude has no open window ($(open_window "$second"); windows: $(window_count "$second"))"
             fi
             ;;
         S2 | S4)
@@ -220,7 +221,7 @@ setup_step() {
         S3)
             restore_windows "$second"
             if ! has_open_window "$second"; then
-                echo "error: Second's Claude has no window to minimise"
+                echo "error: Second's Claude has no window to minimise ($(open_window "$second"); windows: $(window_count "$second"))"
                 return
             fi
             r="$(minimise_window "$second")"
@@ -228,11 +229,15 @@ setup_step() {
             case "$r" in error*) echo "$r" ;; *) echo "note: $r, TextEdit in front" ;; esac
             ;;
         S5)
+            # A stopped app's visible window is still brought forward by the window server, so
+            # the window is closed first: a stopped Claude cannot show it again.
             restore_windows "$second"
+            r="$(close_window "$second")"
             textedit_front
+            case "$r" in error*) echo "$r"; return ;; esac
             if kill -STOP "$second" 2>/dev/null; then
                 STOPPED_PID="$second"
-                echo "note: pid $second stopped, TextEdit in front"
+                echo "note: $r with Cmd-W, pid $second stopped, TextEdit in front"
             else
                 echo "error: pid $second could not be stopped"
             fi
