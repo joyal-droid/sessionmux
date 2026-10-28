@@ -21,15 +21,18 @@
 // interface of every copy and derivative; see docs/attribution.md.
 
 //! Opening links, files and System Settings pages, and showing files in Finder, through
-//! `NSWorkspace`.
+//! `NSWorkspace`. Requests are checked on the calling thread; the `NSWorkspace` call itself
+//! always runs on the main thread.
 
 use std::path::{Path, PathBuf};
 
 use objc2::rc::Retained;
+use objc2::MainThreadMarker;
 use objc2_app_kit::NSWorkspace;
 use objc2_foundation::{NSArray, NSString, NSURL};
 
-use crate::platform::{Os, PrivacyPane, Shell};
+use crate::platform::{EventLoop, Os, PrivacyPane, Shell};
+use crate::util::log;
 
 /// What [`Shell::open_url`] may open.
 #[derive(Debug, PartialEq, Eq)]
@@ -66,7 +69,29 @@ fn file_url(path: &Path) -> Retained<NSURL> {
     NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()))
 }
 
-/// Open `url` with the app the system picks for it.
+/// Run `f` on the main thread: now when called there, else posted to it. A failure after a post
+/// is logged, since the caller has already been answered.
+fn on_main(f: impl FnOnce() -> Result<(), String> + Send + 'static) -> Result<(), String> {
+    if MainThreadMarker::new().is_some() {
+        return f();
+    }
+    <Os as EventLoop>::post(Box::new(move || {
+        if let Err(e) = f() {
+            log::warn(&format!("shell: {e}"));
+        }
+    }));
+    Ok(())
+}
+
+/// A link for `NSURL`; checked on the calling thread so a bad one is reported to the caller.
+fn web_url(u: &str, invalid: &str) -> Result<String, String> {
+    match NSURL::URLWithString(&NSString::from_str(u)) {
+        Some(_) => Ok(u.to_string()),
+        None => Err(invalid.to_string()),
+    }
+}
+
+/// Open `url` with the app the system picks for it. Main thread only.
 fn open(url: &NSURL, what: &str) -> Result<(), String> {
     if NSWorkspace::sharedWorkspace().openURL(url) {
         Ok(())
@@ -75,18 +100,23 @@ fn open(url: &NSURL, what: &str) -> Result<(), String> {
     }
 }
 
+/// Open the link `u` (already checked by [`web_url`]) on the main thread.
+fn open_web(u: String, what: &'static str) -> Result<(), String> {
+    on_main(move || {
+        let ns = NSURL::URLWithString(&NSString::from_str(&u)).ok_or("the link is not a valid URL")?;
+        open(&ns, what)
+    })
+}
+
 impl Shell for Os {
     fn open_url(url: &str) -> Result<(), String> {
         match target(url)? {
-            Target::Web(u) => {
-                let ns = NSURL::URLWithString(&NSString::from_str(&u)).ok_or("the link is not a valid URL")?;
-                open(&ns, "the link")
-            }
+            Target::Web(u) => open_web(web_url(&u, "the link is not a valid URL")?, "the link"),
             Target::File(p) => {
                 if !p.exists() {
                     return Err(format!("{} does not exist", p.display()));
                 }
-                open(&file_url(&p), "the file")
+                on_main(move || open(&file_url(&p), "the file"))
             }
         }
     }
@@ -96,14 +126,16 @@ impl Shell for Os {
         if !path.is_absolute() || !path.exists() {
             return Err(format!("{} does not exist", path.display()));
         }
-        let urls = NSArray::from_retained_slice(&[file_url(path)]);
-        NSWorkspace::sharedWorkspace().activateFileViewerSelectingURLs(&urls);
-        Ok(())
+        let path = path.to_path_buf();
+        on_main(move || {
+            let urls = NSArray::from_retained_slice(&[file_url(&path)]);
+            NSWorkspace::sharedWorkspace().activateFileViewerSelectingURLs(&urls);
+            Ok(())
+        })
     }
 
     fn open_privacy_settings(pane: PrivacyPane) -> Result<(), String> {
-        let ns = NSURL::URLWithString(&NSString::from_str(privacy_url(pane))).ok_or("System Settings link")?;
-        open(&ns, "System Settings")
+        open_web(web_url(privacy_url(pane), "System Settings link")?, "System Settings")
     }
 }
 
