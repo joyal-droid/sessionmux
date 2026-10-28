@@ -237,6 +237,20 @@ bring_front() {
     sleep 2
 }
 
+# Click the title bar of a process's first window, so that window takes the keyboard (after a
+# click on the panel, the panel can keep it while another app is in front).
+click_window() {
+    local at
+    at="$(sysevents -e "set p to first process whose unix id is $1" \
+        -e 'set {x, y} to position of window 1 of p' -e 'set {w, h} to size of window 1 of p' \
+        -e 'return ((x + w div 2) as text) & " " & ((y + 12) as text)')"
+    case "$at" in
+        [0-9]*" "[0-9]*) [ -x "$WORK/postclick" ] && "$WORK/postclick" $at >>"$SCRIPT_LOG" 2>&1 ;;
+        *) echo "click_window $1: $at" >>"$SCRIPT_LOG" ;;
+    esac
+    sleep 1
+}
+
 # The unix id of the app in front, as System Events sees it.
 front_pid() { sysevents -e 'unix id of first process whose frontmost is true'; }
 
@@ -307,6 +321,8 @@ setup_step() {
             # A stopped app's visible window is still brought forward by the window server, so
             # the window is closed first: a stopped Claude cannot show it again.
             restore_windows "$second"
+            # S8 and S9 leave the panel holding the keyboard, which would take the Cmd-W.
+            click_window "$second"
             r="$(close_window "$second")"
             textedit_front
             case "$r" in error*) echo "$r"; return ;; esac
