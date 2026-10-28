@@ -51,7 +51,7 @@ use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSApplicationTerminateReply, NSEvent,
     NSEventMask, NSEventModifierFlags, NSEventType, NSMenu, NSMenuItem, NSScreen, NSWorkspace,
-    NSWorkspaceWillPowerOffNotification,
+    NSWorkspaceDidActivateApplicationNotification, NSWorkspaceWillPowerOffNotification,
 };
 use objc2_core_foundation::{kCFRunLoopCommonModes, CFAbsoluteTimeGetCurrent, CFRetained, CFRunLoop, CFRunLoopTimer};
 use objc2_foundation::{
@@ -138,6 +138,16 @@ define_class!(
         fn will_power_off(&self, _n: &NSNotification) {
             log::info("event loop: the system is powering off");
             send_quit();
+        }
+
+        /// Another app (or Sessionmux) became the active one.
+        #[unsafe(method(didActivateApp:))]
+        fn did_activate_app(&self, _n: &NSNotification) {
+            // Read now, when the notification arrives: the app just activated is the one in front.
+            let front = NSWorkspace::sharedWorkspace().frontmostApplication().map(|a| a.processIdentifier());
+            if let Some(pid) = front.and_then(|p| u32::try_from(p).ok()).filter(|&p| p != 0 && p != std::process::id()) {
+                post_event(PlatformEvent::FrontChanged(pid));
+            }
         }
     }
 
@@ -396,13 +406,19 @@ pub fn prepare(mtm: MainThreadMarker) {
     // Also installed here, so a link is caught when launching finished before the delegate was set.
     install_url_handler(&delegate);
     let center = NSWorkspace::sharedWorkspace().notificationCenter();
-    // SAFETY: the delegate implements `willPowerOff:` taking the notification; it stays alive in
-    // `DELEGATE` and is removed as an observer in `shutdown`.
+    // SAFETY: the delegate implements `willPowerOff:` and `didActivateApp:`, each taking the
+    // notification; it stays alive in `DELEGATE` and is removed as an observer in `shutdown`.
     unsafe {
         center.addObserver_selector_name_object(
             &delegate,
             sel!(willPowerOff:),
             Some(NSWorkspaceWillPowerOffNotification),
+            None,
+        );
+        center.addObserver_selector_name_object(
+            &delegate,
+            sel!(didActivateApp:),
+            Some(NSWorkspaceDidActivateApplicationNotification),
             None,
         );
     }

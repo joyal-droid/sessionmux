@@ -28,6 +28,8 @@
 //!   (posted by a second instance) → `ShowPanel`, [`WM_SESSIONMUX_GESTURE`] (posted by a refused
 //!   `--relay` launch) → `Gesture(BadLink)`, and `WM_CLOSE` (sent by the installer and the
 //!   uninstaller) → `QuitRequested`.
+//! - A foreground hook reports each change of the foreground window to another process (not the
+//!   taskbar or its tray flyout) as `FrontChanged`.
 //! - The tray icon and the global hotkey are bound to the same window ([`create_tray`],
 //!   [`register_hotkey`]).
 //!
@@ -55,13 +57,14 @@ use std::sync::{Mutex, OnceLock};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW,
     GetSystemMetrics, GetWindowLongPtrW, KillTimer, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SetTimer, SetWindowLongPtrW, TranslateMessage, GWLP_USERDATA, HICON, HWND_MESSAGE, IMAGE_ICON, LR_DEFAULTCOLOR,
-    MSG, SM_CXSMICON, SM_CYSMICON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_HOTKEY, WM_TIMER, WNDCLASSEXW,
-    WNDPROC,
+    SetTimer, SetWindowLongPtrW, TranslateMessage, EVENT_SYSTEM_FOREGROUND, GWLP_USERDATA, HICON, HWND_MESSAGE,
+    IMAGE_ICON, LR_DEFAULTCOLOR, MSG, SM_CXSMICON, SM_CYSMICON, WINDOW_EX_STYLE, WINDOW_STYLE, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CLOSE, WM_HOTKEY, WM_TIMER, WNDCLASSEXW, WNDPROC,
 };
 
 /// Run a closure queued by [`post_to`] (wparam = per-process key, lparam = task id). The closure
@@ -314,6 +317,7 @@ impl EventLoop for Os {
             return Err(format!("message window: {}", win::last_error()));
         }
         APP_WINDOW.store(hwnd.0 as isize, Ordering::Release);
+        watch_foreground();
         Ok(())
     }
 
@@ -366,6 +370,12 @@ impl EventLoop for Os {
     }
 
     fn shutdown() {
+        let hook = FOREGROUND_HOOK.swap(0, Ordering::AcqRel);
+        if hook != 0 {
+            // SAFETY: the hook was set on this thread by `init`; the swap above clears it first,
+            // so it is removed once.
+            let _ = unsafe { UnhookWinEvent(HWINEVENTHOOK(hook as _)) };
+        }
         let h = APP_WINDOW.swap(0, Ordering::AcqRel);
         if h != 0 {
             // SAFETY: the window was created on this thread by `init`; the swap above clears it
@@ -375,6 +385,39 @@ impl EventLoop for Os {
         if let Ok(mut g) = HANDLER.lock() {
             *g = None;
         }
+    }
+}
+
+/// The hook reporting each change of the foreground window (0 = none).
+static FOREGROUND_HOOK: AtomicIsize = AtomicIsize::new(0);
+
+/// Report every change of the foreground window to another process as `FrontChanged`, from the
+/// UI thread's message loop. A failure is logged; the app then reads the foreground itself.
+fn watch_foreground() {
+    // SAFETY: an out-of-context hook needs no module; its callback runs on this thread while it
+    // waits for messages, and is removed in `shutdown`.
+    let hook = unsafe {
+        SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            None,
+            Some(on_foreground),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        )
+    };
+    if hook.is_invalid() {
+        log::warn(&format!("foreground changes not reported: {}", win::last_error()));
+        return;
+    }
+    FOREGROUND_HOOK.store(hook.0 as isize, Ordering::Release);
+}
+
+unsafe extern "system" fn on_foreground(_: HWINEVENTHOOK, _: u32, hwnd: HWND, _: i32, _: i32, _: u32, _: u32) {
+    if let Some(pid) = super::window::user_window_pid(hwnd) {
+        // Posted, so the app handles it as any other task, outside of whatever is running now.
+        <Os as EventLoop>::post(Box::new(move || dispatch(PlatformEvent::FrontChanged(pid))));
     }
 }
 

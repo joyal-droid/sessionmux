@@ -87,11 +87,19 @@ impl Windows for Os {
     fn user_front_pid() -> Option<Pid> {
         // SAFETY: GetForegroundWindow has no preconditions.
         let fg = unsafe { GetForegroundWindow() };
-        if fg.0.is_null() || is_shell_tray(&class_name(fg)) {
-            return None;
-        }
-        foreground_pid()
+        user_window_pid(fg)
     }
+}
+
+/// The process of `hwnd`, unless the window is the taskbar or its tray flyout (or unknown).
+pub(super) fn user_window_pid(hwnd: HWND) -> Option<u32> {
+    if hwnd.0.is_null() || is_shell_tray(&class_name(hwnd)) {
+        return None;
+    }
+    let mut pid = 0u32;
+    // SAFETY: hwnd may be stale; the API tolerates invalid handles (returns 0).
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    (pid != 0).then_some(pid)
 }
 
 /// The window classes of the taskbars and of the flyout of hidden tray icons.
@@ -135,6 +143,7 @@ mod tests {
     fn no_window_for_a_missing_process() {
         assert_eq!(Os::main_window(0), None);
         assert_eq!(hwnd_of(0), HWND(std::ptr::null_mut()));
+        assert_eq!(user_window_pid(hwnd_of(0)), None);
     }
 
     #[test]

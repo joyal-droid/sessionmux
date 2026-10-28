@@ -261,6 +261,9 @@ pub struct AppState {
     /// The last process other than Sessionmux that had the window the user worked in: the app
     /// in front just before the user turned to the panel, the floating button or the tray.
     last_front: Option<u32>,
+    /// The system reports each change of the app in front, so `last_front` is kept from those
+    /// reports and no longer from the poll, which can be up to one poll old.
+    front_tracked: bool,
     last_opened: Option<String>,
     last_accounts_json: String,
     last_discovered: Vec<Discovered>,
@@ -2225,7 +2228,9 @@ fn on_poll(procs: Vec<Proc>, fg: Option<u32>, front: Option<u32>, located: Optio
     with_state(|st| {
         st.procs = procs;
         st.fg_pid = fg;
-        note_front(&mut st.last_front, front);
+        if !st.front_tracked {
+            note_front(&mut st.last_front, front);
+        }
         if located.is_some() && located != st.located {
             st.located = located;
         }
@@ -2791,6 +2796,12 @@ fn on_event(ev: PlatformEvent) {
         PlatformEvent::PanelBlur => on_blur(),
         PlatformEvent::DisplayChanged => {
             with_state(|st| reposition_panel(st));
+        }
+        PlatformEvent::FrontChanged(pid) => {
+            with_state(|st| {
+                st.front_tracked = true;
+                note_front(&mut st.last_front, Some(pid));
+            });
         }
     }
 }
@@ -3902,6 +3913,7 @@ pub fn init(hidden: bool) -> Result<(), String> {
         procs,
         fg_pid,
         last_front: None,
+        front_tracked: false,
         last_opened: None,
         last_accounts_json: String::new(),
         last_discovered: Vec::new(),

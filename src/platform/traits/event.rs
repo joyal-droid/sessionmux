@@ -68,6 +68,9 @@ pub enum PlatformEvent {
     PanelBlur,
     /// Displays were added, removed or rearranged.
     DisplayChanged,
+    /// The window or app in front changed to one of this process (never Sessionmux itself, nor
+    /// on Windows the taskbar or its tray flyout).
+    FrontChanged(crate::platform::Pid),
     /// Quit cleanly: the tray's Quit, a close request from the installer, logout.
     QuitRequested,
 }
