@@ -6,6 +6,16 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [1.1.0-preview.2] - 2026-10-28
+
+The second macOS preview, again a GitHub pre-release built from the `macos` branch, with a Windows
+installer of the same code.
+
+### Changed
+
+- **macOS (preview):** the disk image now opens on a window that shows Sessionmux next to the
+  Applications folder with an arrow between them, so installing is one drag.
+
 ## [1.1.0-preview.1] - Unreleased
 
 A preview of Sessionmux for macOS, published as a GitHub pre-release built from the `macos` branch.
@@ -83,5 +93,6 @@ First public release: a multi-account switcher for Claude Desktop on Windows.
   non-affiliation notice.
 
 [Unreleased]: https://github.com/joyal-droid/sessionmux/compare/v1.0.0...HEAD
+[1.1.0-preview.2]: https://github.com/joyal-droid/sessionmux/releases/tag/v1.1.0-preview.2
 [1.1.0-preview.1]: https://github.com/joyal-droid/sessionmux/releases/tag/v1.1.0-preview.1
 [1.0.0]: https://github.com/joyal-droid/sessionmux/releases/tag/v1.0.0

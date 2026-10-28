@@ -1,6 +1,6 @@
 [package]
 name = "sessionmux"
-version = "1.1.0-preview.1"
+version = "1.1.0-preview.2"
 edition = "2021"
 description = "Switch between multiple Claude Desktop accounts and move your Code sessions with you"
 rust-version = "1.88"
