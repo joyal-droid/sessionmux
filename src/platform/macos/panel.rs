@@ -25,7 +25,8 @@
 //! corners (#101114) and a shadow. WKWebView (through wry) fills it.
 //!
 //! The panel takes the keyboard without activating Sessionmux, so the app the user came from
-//! stays active behind it. When the panel stops being the key window while it is visible
+//! stays active behind it. A mouse press in the panel does make Sessionmux the active app, inside
+//! that event, so a click that switches to a Claude window has activation to pass on. When the panel stops being the key window while it is visible
 //! (another app or window was clicked), the app receives the synthetic request `__blur` and
 //! decides whether to hide it (it stays while pinned). Hiding gives the activation back to the
 //! previous app when Sessionmux had become active.
@@ -41,8 +42,8 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSColor, NSEvent, NSPanel, NSScreen, NSStatusWindowLevel, NSView, NSWindow,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSApplication, NSBackingStoreType, NSColor, NSEvent, NSEventType, NSPanel, NSScreen, NSStatusWindowLevel, NSView,
+    NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_graphics::CGColor;
 use objc2_foundation::{NSInteger, NSObjectProtocol, NSPoint, NSRect, NSSize};
@@ -86,6 +87,19 @@ define_class!(
         #[unsafe(method(canBecomeMainWindow))]
         fn can_become_main_window(&self) -> bool {
             false
+        }
+
+        /// A mouse press makes Sessionmux the active app while the press is still being handled,
+        /// where the system grants it; the page then handles the click as before.
+        #[unsafe(method(sendEvent:))]
+        fn send_event(&self, event: &NSEvent) {
+            if event.r#type() == NSEventType::LeftMouseDown {
+                super::claude::take_activation(self.mtm());
+            }
+            // SAFETY: runs NSWindow's own `sendEvent:` with the event it was given.
+            unsafe {
+                let _: () = msg_send![super(self), sendEvent: event];
+            }
         }
 
         /// The panel lost the keyboard: tell the app, once the current event is done, if the
@@ -174,6 +188,22 @@ pub(super) fn find_web_view(view: &NSView) -> Option<Retained<WKWebView>> {
         Ok(wk) => Some(wk),
         Err(_) => view.subviews().iter().find_map(|v| find_web_view(&v)),
     }
+}
+
+/// Where the page of Sessionmux's window `id` is on screen, in points with the origin at the
+/// top left of the primary display. Main thread only.
+pub(crate) fn page_rect(id: WindowId) -> Option<Rect> {
+    let mtm = MainThreadMarker::new()?;
+    let window = NSApplication::sharedApplication(mtm).windowWithWindowNumber(id.0 as NSInteger)?;
+    let wk = window.contentView().and_then(|v| find_web_view(&v))?;
+    let f = window.convertRectToScreen(wk.convertRect_toView(wk.bounds(), None));
+    let ph = primary_height(mtm);
+    Some(Rect {
+        x: f.origin.x.round() as i32,
+        y: (ph - f.origin.y - f.size.height).round() as i32,
+        w: f.size.width.round() as i32,
+        h: f.size.height.round() as i32,
+    })
 }
 
 /// Keep the page running and drawing while its window is off every display: macOS would

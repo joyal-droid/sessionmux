@@ -27,16 +27,23 @@
 //! A Claude Desktop main process is one whose executable is the located Claude's executable and
 //! whose arguments carry no `--type=` (renderers and other helpers run from helper apps inside
 //! the bundle and always carry it). Its data folder is the value of `--user-data-dir=`; none means
-//! the Main account. When a process's arguments cannot be read, it counts as a main process only
-//! if its parent is not itself a Claude main process.
+//! the Main account. A process started by another Claude process is never a main process,
+//! whatever its arguments (Claude runs its own executable for tools and extensions too), and
+//! neither is one whose arguments cannot be read while its parent is a Claude process. Main
+//! processes the system knows as running apps are listed first, so the one with the windows is
+//! picked when two claim the same data folder.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
+
+use objc2_app_kit::NSRunningApplication;
 
 use crate::core::claude_app::{Located, Proc};
 use crate::platform::{Os, Paths, Pid, Processes};
+use crate::util::log;
 
 /// The argument that names an instance's data folder.
 pub(crate) const UDD: &str = "--user-data-dir=";
@@ -254,20 +261,55 @@ fn mains(l: Option<&Located>, any_copy: bool) -> Vec<Proc> {
     let claude_pids: HashSet<Pid> = seen.iter().map(|s| s.pid).collect();
     let mut out = Vec::new();
     for s in seen {
+        // Started by a Claude process: a helper or a tool run with Claude's executable.
+        if <Os as Processes>::parent(s.pid).is_some_and(|pp| claude_pids.contains(&pp)) {
+            continue;
+        }
         let (cmdline, data_dir) = match &s.argv {
             Some(argv) if is_helper(argv) => continue,
             Some(argv) => (argv.join(" "), user_data_dir(argv)),
-            None => {
-                // Unreadable arguments: a helper is always started by a main process.
-                if <Os as Processes>::parent(s.pid).is_some_and(|pp| claude_pids.contains(&pp)) {
-                    continue;
-                }
-                (String::new(), Some(UNKNOWN_DATA_DIR.to_string()))
-            }
+            None => (String::new(), Some(UNKNOWN_DATA_DIR.to_string())),
         };
         out.push(Proc { pid: s.pid, exe: s.exe, cmdline, data_dir, hwnd: 0 });
     }
+    // Running apps first (stable, so the system's order is kept otherwise).
+    out.sort_by_key(|p| !is_running_app(p.pid));
     out
+}
+
+/// True when the system knows `pid` as a running app (one that can be activated).
+pub(crate) fn is_running_app(pid: Pid) -> bool {
+    libc::pid_t::try_from(pid)
+        .ok()
+        .filter(|&p| p > 0)
+        .and_then(NSRunningApplication::runningApplicationWithProcessIdentifier)
+        .is_some()
+}
+
+/// One line describing the classified Claude processes: pid, parent, data folder, window and
+/// whether the system knows it as a running app.
+fn describe(found: &[Proc]) -> String {
+    let parts: Vec<String> = found
+        .iter()
+        .map(|p| {
+            let ppid = <Os as Processes>::parent(p.pid).unwrap_or(0);
+            let dir = p.data_dir.as_deref().unwrap_or("Main");
+            format!("pid={} ppid={ppid} dir={dir} window={} app={}", p.pid, p.hwnd, is_running_app(p.pid))
+        })
+        .collect();
+    format!("[{}]", parts.join("; "))
+}
+
+/// The process list logged last, so it is logged again only when it changes.
+static LAST_LISTED: Mutex<String> = Mutex::new(String::new());
+
+fn log_if_changed(found: &[Proc]) {
+    let now = describe(found);
+    let Ok(mut last) = LAST_LISTED.lock() else { return };
+    if *last != now {
+        log::info(&format!("claude_app: processes {now}"));
+        *last = now;
+    }
 }
 
 /// The running processes as (pid, parent, start time), for walking process trees.
@@ -295,6 +337,7 @@ impl Processes for Os {
                 p.hwnd = wins.get(&p.pid).map_or(0, |w| w.0 as isize);
             }
         }
+        log_if_changed(&found);
         found
     }
 

@@ -78,6 +78,10 @@ const fn fourcc(c: &[u8; 4]) -> u32 {
 /// `kInternetEventClass` and `kAEGetURL`: "open this link".
 const INTERNET_EVENT_CLASS: u32 = fourcc(b"GURL");
 const AE_GET_URL: u32 = fourcc(b"GURL");
+/// `kCoreEventClass` and `kAEReopenApplication`: "show yourself" (what a click on the Dock icon
+/// of a running app sends).
+pub(crate) const CORE_EVENT_CLASS: u32 = fourcc(b"aevt");
+pub(crate) const AE_REOPEN_APPLICATION: u32 = fourcc(b"rapp");
 /// `keyDirectObject`: the link itself.
 const KEY_DIRECT_OBJECT: u32 = fourcc(b"----");
 /// `typeKernelProcessID`: an address given as a process id.
@@ -90,9 +94,9 @@ const ANY_TRANSACTION_ID: i32 = 0;
 /// `kAENoReply | kAECanSwitchLayer`: do not wait for an answer; the receiver may come forward.
 const SEND_MODE: i32 = 0x0000_0001 | 0x0000_0040;
 /// `errAEEventNotPermitted`: the user has not allowed Sessionmux to send events to the target.
-const ERR_NOT_PERMITTED: i32 = -1743;
+pub(crate) const ERR_NOT_PERMITTED: i32 = -1743;
 /// `errAEEventWouldRequireUserConsent`: the user has not been asked yet.
-const ERR_NEEDS_CONSENT: i32 = -1744;
+pub(crate) const ERR_NEEDS_CONSENT: i32 = -1744;
 /// `procNotFound`: the target process is gone.
 const ERR_PROC_NOT_FOUND: i32 = -600;
 /// `userCanceledErr`.
@@ -381,47 +385,61 @@ fn target_pid(l: &Located, data_dir: Option<&str>, pid: Option<Pid>) -> Result<P
     Ok(started)
 }
 
-/// Send `url` as a get-URL Apple Event to process `pid` and nothing else. Asks the user for
-/// Automation permission the first time (blocking while the prompt is open).
-fn send_get_url(pid: Pid, url: &str) -> Result<(), ForwardError> {
-    let p = libc::pid_t::try_from(pid).ok().filter(|&p| p > 0).ok_or_else(|| ForwardError::Failed("bad pid".into()))?;
+/// Why an Apple Event to one process was not sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AeSendError {
+    /// The user refused Automation for this target (`-1743`), or has not been asked yet and no
+    /// prompt was allowed (`-1744`). Carries the code.
+    NotPermitted(i32),
+    /// The target process is gone.
+    Gone,
+    /// Any other failure, with the API name and code.
+    Failed(String),
+}
+
+/// Send the Apple Event `class`/`id` to process `pid` and nothing else, without waiting for an
+/// answer; the receiver may come forward. `text` is put in as the direct object (UTF-8). With
+/// `ask`, the user is asked for Automation permission the first time (blocking while the prompt
+/// is open); without it, a target the user was never asked about is `NotPermitted(-1744)`.
+pub(crate) fn send_event_to_pid(
+    pid: Pid,
+    class: u32,
+    id: u32,
+    text: Option<&str>,
+    ask: bool,
+) -> Result<(), AeSendError> {
+    let p = libc::pid_t::try_from(pid).ok().filter(|&p| p > 0).ok_or_else(|| AeSendError::Failed("bad pid".into()))?;
     let mut target = AeDesc::new();
     // SAFETY: the data is the 4-byte pid this frame owns; `target` is an initialised descriptor
     // that receives a copy of it.
     let err = unsafe { AECreateDesc(TYPE_KERNEL_PROCESS_ID, (&p as *const libc::pid_t).cast(), 4, &mut target) };
     if err != 0 {
-        return Err(ForwardError::Failed(format!("AECreateDesc: code {err}")));
+        return Err(AeSendError::Failed(format!("AECreateDesc: code {err}")));
     }
     // SAFETY: `target` is a valid address descriptor; the call only reads it.
-    let perm = unsafe { AEDeterminePermissionToAutomateTarget(&target, INTERNET_EVENT_CLASS, AE_GET_URL, 1) };
+    let perm = unsafe { AEDeterminePermissionToAutomateTarget(&target, class, id, u8::from(ask)) };
     match perm {
         0 => {}
-        ERR_NOT_PERMITTED | ERR_NEEDS_CONSENT => return Err(ForwardError::NotPermitted),
-        ERR_PROC_NOT_FOUND => return Err(ForwardError::Failed(format!("Claude (pid {pid}) is no longer running"))),
-        other => log::debug(&format!("url handler: Automation check for pid {pid}: code {other}")),
+        ERR_NOT_PERMITTED | ERR_NEEDS_CONSENT => return Err(AeSendError::NotPermitted(perm)),
+        ERR_PROC_NOT_FOUND => return Err(AeSendError::Gone),
+        other => log::debug(&format!("apple event: Automation check for pid {pid}: code {other}")),
     }
     let mut event = AeDesc::new();
     // SAFETY: `target` is a valid address descriptor and `event` an initialised descriptor that
     // receives the new event.
-    let err = unsafe {
-        AECreateAppleEvent(
-            INTERNET_EVENT_CLASS,
-            AE_GET_URL,
-            &target,
-            AUTO_GENERATE_RETURN_ID,
-            ANY_TRANSACTION_ID,
-            &mut event,
-        )
-    };
+    let err =
+        unsafe { AECreateAppleEvent(class, id, &target, AUTO_GENERATE_RETURN_ID, ANY_TRANSACTION_ID, &mut event) };
     if err != 0 {
-        return Err(ForwardError::Failed(format!("AECreateAppleEvent: code {err}")));
+        return Err(AeSendError::Failed(format!("AECreateAppleEvent: code {err}")));
     }
-    let len = libc::c_long::try_from(url.len()).map_err(|_| ForwardError::Failed("link too long".into()))?;
-    // SAFETY: `event` is the event created above; the data is the link's bytes, valid for the
-    // call, and copied into the event.
-    let err = unsafe { AEPutParamPtr(&mut event, KEY_DIRECT_OBJECT, TYPE_UTF8_TEXT, url.as_ptr().cast(), len) };
-    if err != 0 {
-        return Err(ForwardError::Failed(format!("AEPutParamPtr: code {err}")));
+    if let Some(text) = text {
+        let len = libc::c_long::try_from(text.len()).map_err(|_| AeSendError::Failed("text too long".into()))?;
+        // SAFETY: `event` is the event created above; the data is the text's bytes, valid for the
+        // call, and copied into the event.
+        let err = unsafe { AEPutParamPtr(&mut event, KEY_DIRECT_OBJECT, TYPE_UTF8_TEXT, text.as_ptr().cast(), len) };
+        if err != 0 {
+            return Err(AeSendError::Failed(format!("AEPutParamPtr: code {err}")));
+        }
     }
     let mut reply = AeDesc::new();
     // SAFETY: `event` is a complete Apple Event and `reply` an initialised descriptor; with no
@@ -429,9 +447,21 @@ fn send_get_url(pid: Pid, url: &str) -> Result<(), ForwardError> {
     let status = unsafe { AESendMessage(&event, &mut reply, SEND_MODE, SEND_TIMEOUT_TICKS) };
     match status {
         0 => Ok(()),
-        ERR_NOT_PERMITTED | ERR_NEEDS_CONSENT => Err(ForwardError::NotPermitted),
-        other => Err(ForwardError::Failed(format!("AESendMessage to pid {pid}: code {other}"))),
+        ERR_NOT_PERMITTED | ERR_NEEDS_CONSENT => Err(AeSendError::NotPermitted(status)),
+        ERR_PROC_NOT_FOUND => Err(AeSendError::Gone),
+        other => Err(AeSendError::Failed(format!("AESendMessage to pid {pid}: code {other}"))),
     }
+}
+
+/// Send `url` as a get-URL Apple Event to process `pid` and nothing else. Asks the user for
+/// Automation permission the first time (blocking while the prompt is open).
+fn send_get_url(pid: Pid, url: &str) -> Result<(), ForwardError> {
+    send_event_to_pid(pid, INTERNET_EVENT_CLASS, AE_GET_URL, Some(url), true).map_err(|e| match e {
+        AeSendError::NotPermitted(_) => ForwardError::NotPermitted,
+        AeSendError::Gone => ForwardError::Failed(format!("Claude (pid {pid}) is no longer running")),
+        AeSendError::Failed(e) if e == "text too long" => ForwardError::Failed("link too long".into()),
+        AeSendError::Failed(e) => ForwardError::Failed(e),
+    })
 }
 
 /// Deliver `url` to the Claude instance of `data_dir` by an Apple Event to its process.

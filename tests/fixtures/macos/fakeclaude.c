@@ -26,11 +26,17 @@
  * Main process (no --type= argument):
  * - writes its arguments, one per line, to <folder of Claude.app>/argv-<pid>.txt;
  * - starts two helper processes with --type=renderer (and the same --user-data-dir=);
- * - runs as a regular app with one window;
+ * - runs as a regular app with one window; starts without a window when its data folder holds a
+ *   file named "start-windowless";
+ * - when asked to show itself (the reopen Apple Event, as a click on its Dock icon sends), appends
+ *   a line to <folder of Claude.app>/reopen-<pid>.txt, opens its window again (creating it when
+ *   there is none) and activates itself;
  * - appends every link it is asked to open to <folder of Claude.app>/url-<pid>.txt;
  * - quits when asked to (Quit Apple Event), and 0.5 s after SIGTERM, ending its helpers;
- * - ignores both when its data folder holds a file named "ignore-quit".
- * Helper process: waits until its parent is gone, then exits.
+ * - ignores both when its data folder holds a file named "ignore-quit";
+ * - also starts its own executable as a tool (with --sessionmux-test-tool and no --type=) when its
+ *   data folder holds a file named "spawn-tool".
+ * Helper and tool processes: wait until their parent is gone, then exit.
  */
 
 #include <limits.h>
@@ -50,13 +56,15 @@
 #include <objc/runtime.h>
 
 #define UDD "--user-data-dir="
+#define TOOL_FLAG "--sessionmux-test-tool"
 #define TERMINATE_CANCEL 0UL
 #define TERMINATE_NOW 1UL
 
 static char g_root[PATH_MAX];
 static int g_ignore_quit;
-static pid_t g_helpers[2];
+static pid_t g_helpers[3];
 static int g_nhelpers;
+static id g_win;
 
 static id msg0(id obj, const char *sel) {
     return ((id (*)(id, SEL))objc_msgSend)(obj, sel_registerName(sel));
@@ -101,11 +109,22 @@ static const char *udd_arg(int argc, char **argv) {
 
 static int is_helper(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--type=", 7) == 0) {
+        if (strncmp(argv[i], "--type=", 7) == 0 || strcmp(argv[i], TOOL_FLAG) == 0) {
             return 1;
         }
     }
     return 0;
+}
+
+/* True when the data folder named by `udd` (or NULL) holds a file called `name`. */
+static int has_marker(const char *udd, const char *name) {
+    if (udd == NULL) {
+        return 0;
+    }
+    char marker[PATH_MAX];
+    struct stat st;
+    snprintf(marker, sizeof marker, "%s/%s", udd + strlen(UDD), name);
+    return stat(marker, &st) == 0;
 }
 
 static void record_args(int argc, char **argv) {
@@ -134,14 +153,14 @@ static void record_url(const char *url) {
     fclose(f);
 }
 
-static void spawn_helpers(const char *exe, const char *udd) {
-    for (int i = 0; i < 2; i++) {
+static void spawn_helpers(const char *exe, const char *udd, int with_tool) {
+    for (int i = 0; i < 2 + with_tool; i++) {
         pid_t p = fork();
         if (p == 0) {
             char *args[4];
             int n = 0;
             args[n++] = (char *)exe;
-            args[n++] = "--type=renderer";
+            args[n++] = i < 2 ? "--type=renderer" : TOOL_FLAG;
             if (udd != NULL) {
                 args[n++] = (char *)udd;
             }
@@ -210,12 +229,37 @@ static void open_urls(id self, SEL cmd, id app, id urls) {
     }
 }
 
+static void record_reopen(void) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof path, "%s/reopen-%d.txt", g_root, (int)getpid());
+    FILE *f = fopen(path, "a");
+    if (f == NULL) {
+        return;
+    }
+    fprintf(f, "reopen\n");
+    fclose(f);
+}
+
+static id make_window(void) {
+    CGRect frame = CGRectMake(120, 120, 480, 360);
+    id win = msg0((id)objc_getClass("NSWindow"), "alloc");
+    win = ((id (*)(id, SEL, CGRect, unsigned long, unsigned long, BOOL))objc_msgSend)(
+        win, sel_registerName("initWithContentRect:styleMask:backing:defer:"), frame, 15UL, 2UL, NO);
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(win, sel_registerName("setReleasedWhenClosed:"), NO);
+    return win;
+}
+
 static BOOL reopen(id self, SEL cmd, id app, BOOL visible) {
     (void)self;
     (void)cmd;
-    (void)app;
     (void)visible;
-    return YES;
+    record_reopen();
+    if (g_win == nil) {
+        g_win = make_window();
+    }
+    ((void (*)(id, SEL, id))objc_msgSend)(g_win, sel_registerName("makeKeyAndOrderFront:"), nil);
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(app, sel_registerName("activateIgnoringOtherApps:"), YES);
+    return NO;
 }
 
 int main(int argc, char **argv) {
@@ -230,13 +274,8 @@ int main(int argc, char **argv) {
     record_args(argc, argv);
 
     const char *udd = udd_arg(argc, argv);
-    if (udd != NULL) {
-        char marker[PATH_MAX];
-        struct stat st;
-        snprintf(marker, sizeof marker, "%s/ignore-quit", udd + strlen(UDD));
-        g_ignore_quit = stat(marker, &st) == 0;
-    }
-    spawn_helpers(exe, udd);
+    g_ignore_quit = has_marker(udd, "ignore-quit");
+    spawn_helpers(exe, udd, has_marker(udd, "spawn-tool"));
 
     signal(SIGTERM, SIG_IGN);
     dispatch_source_t term = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGTERM, 0, dispatch_get_main_queue());
@@ -254,12 +293,10 @@ int main(int argc, char **argv) {
     ((void (*)(id, SEL, long))objc_msgSend)(app, sel_registerName("setActivationPolicy:"), 0L);
     ((void (*)(id, SEL, id))objc_msgSend)(app, sel_registerName("setDelegate:"), delegate);
 
-    CGRect frame = CGRectMake(120, 120, 480, 360);
-    id win = msg0((id)objc_getClass("NSWindow"), "alloc");
-    win = ((id (*)(id, SEL, CGRect, unsigned long, unsigned long, BOOL))objc_msgSend)(
-        win, sel_registerName("initWithContentRect:styleMask:backing:defer:"), frame, 15UL, 2UL, NO);
-    ((void (*)(id, SEL, BOOL))objc_msgSend)(win, sel_registerName("setReleasedWhenClosed:"), NO);
-    ((void (*)(id, SEL, id))objc_msgSend)(win, sel_registerName("makeKeyAndOrderFront:"), nil);
+    if (!has_marker(udd, "start-windowless")) {
+        g_win = make_window();
+        ((void (*)(id, SEL, id))objc_msgSend)(g_win, sel_registerName("makeKeyAndOrderFront:"), nil);
+    }
 
     ((void (*)(id, SEL))objc_msgSend)(app, sel_registerName("run"));
     return 0;

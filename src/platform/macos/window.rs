@@ -85,7 +85,19 @@ fn number(d: &CFDictionary<CFString, CFType>, key: &CFString) -> Option<CFRetain
 
 /// On-screen windows, front to back, desktop elements left out.
 pub(crate) fn on_screen() -> Vec<WinInfo> {
-    let opts = CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements;
+    window_list(CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements)
+}
+
+/// True when `pid` has a normal window that is not on screen now: minimised, on another Space or
+/// ordered out.
+pub(crate) fn has_off_screen_window(pid: Pid) -> bool {
+    window_list(CGWindowListOption::OptionAll | CGWindowListOption::ExcludeDesktopElements)
+        .iter()
+        .any(|w| w.pid == pid && w.layer == 0 && w.w >= MIN_SIDE && w.h >= MIN_SIDE)
+}
+
+/// The windows the window server lists for `opts`.
+fn window_list(opts: CGWindowListOption) -> Vec<WinInfo> {
     let Some(list) = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) else { return Vec::new() };
     // SAFETY: the window server documents this list as an array of dictionaries with string keys;
     // values are read with checked downcasts only.

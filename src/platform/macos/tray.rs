@@ -30,6 +30,8 @@
 //!   detached again, so a left click never opens it. A chosen item is the event its tag maps to.
 //! - Requests waiting for approval show as a number beside the icon and in the tooltip.
 //! - Events reach the app from the top of the loop, after the click or the menu has returned.
+//!   Choosing an account (or all of them) makes Sessionmux the active app first, inside the menu
+//!   choice, so it can pass the activation on to Claude.
 //! - Dropping the Tray removes the icon.
 
 use std::cell::{Cell, RefCell};
@@ -93,6 +95,9 @@ define_class!(
                 None => self.ivars().model.borrow().command_event(cmd),
             };
             if let Some(ev) = ev {
+                if matches!(ev, TrayEvent::OpenAccount(_) | TrayEvent::OpenAll) {
+                    super::claude::take_activation(self.mtm());
+                }
                 post_event(PlatformEvent::Tray(ev));
             }
         }

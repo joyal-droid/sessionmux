@@ -608,6 +608,11 @@ impl BubbleView {
     fn route(&self, f: impl FnOnce(&Inner) -> Option<BubbleEvent>) {
         let Some(inner) = self.ivars().inner.borrow().upgrade() else { return };
         if let Some(ev) = f(&inner) {
+            if matches!(ev, BubbleEvent::AvatarClick(_)) {
+                // Still inside the click: Sessionmux becomes the active app, so it can pass the
+                // activation on to the account's Claude.
+                super::claude::take_activation(self.mtm());
+            }
             (inner.on_event)(ev);
         }
     }

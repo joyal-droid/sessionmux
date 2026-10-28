@@ -23,7 +23,8 @@
 //! Claude Desktop on macOS: find the app, start an account, bring its window forward, close it.
 //!
 //! - Claude is found by its bundle id through Launch Services, else in `/Applications` or
-//!   `~/Applications`. Main keeps its data in `~/Library/Application Support/Claude`; every other
+//!   `~/Applications`; a copy Launch Services names on a mounted disk image, in the Trash or
+//!   in a translocated folder comes after those two. Main keeps its data in `~/Library/Application Support/Claude`; every other
 //!   account is a `--user-data-dir=` folder next to it.
 //! - Accounts are started through Launch Services as a new instance of the app, so Claude is its
 //!   own responsible process (its permission prompts are its own) and gets a clean environment.
@@ -31,10 +32,16 @@
 //!   running instance: it keeps running beside it. So Sessionmux never starts Claude on a folder
 //!   that already runs, and a window that cannot be brought forward is never shown by starting
 //!   its folder again.
-//! - Bringing a window forward uses cooperative activation from the user's click or shortcut;
-//!   activation does not un-minimise a window or switch Spaces, so when the user turned on
-//!   "Bring minimised Claude windows to the front" and allowed Accessibility, the window is
-//!   un-minimised and raised through Accessibility and activated again.
+//! - Bringing a window forward uses cooperative activation: the user's click, menu choice or
+//!   shortcut makes Sessionmux the active app inside that event, and the focus worker waits
+//!   briefly for that to complete before it yields the activation to Claude. Activation does
+//!   not un-minimise a window or switch Spaces, so when the user turned on "Bring minimised
+//!   Claude windows to the front" and allowed Accessibility, the window is un-minimised, raised
+//!   and made main through Accessibility, the app is put in front, and activated again.
+//! - An instance with no window on screen is asked to show itself the way a click on its Dock
+//!   icon does (the reopen Apple Event, sent to its process only; the only instance of a copy of
+//!   Claude is reached through Launch Services instead, which needs no Automation permission).
+//!   Claude then opens its window again. That never starts another instance.
 //! - Closing asks each instance to quit, waits up to 3 s, then ends what is left of each instance's
 //!   process tree. Only Claude Desktop main processes are accepted, and other accounts' instances
 //!   are never ended, whatever their parent is.
@@ -56,9 +63,14 @@ use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFRetained, CFStri
 use objc2_foundation::{NSArray, NSBundle, NSError, NSOperatingSystemVersion, NSProcessInfo, NSString, NSURL};
 
 use super::process::{self, any_claude_mains, claude_mains, is_helper, pid_path, real_path, ClaudeExe, UDD};
-use super::window::{front_window_owner, on_main_wait};
+use super::url_handler::{
+    send_event_to_pid, AeSendError, AE_REOPEN_APPLICATION, CORE_EVENT_CLASS, ERR_NEEDS_CONSENT, ERR_NOT_PERMITTED,
+};
+use super::window::{front_window_owner, has_off_screen_window, on_main_wait};
 use crate::core::claude_app::{self, Located};
-use crate::platform::{ClaudeInstall, Closer, Focus, FocusResult, Launcher, Os, Paths, Pid, Processes, Windows};
+use crate::platform::{
+    ClaudeInstall, Closer, Focus, FocusFailure, FocusResult, Launcher, Os, Paths, Pid, Processes, Windows,
+};
 use crate::util::{json, log, paths};
 
 /// Whether starting Claude again on a data folder that already runs hands over to the running
@@ -81,12 +93,23 @@ const POLL: Duration = Duration::from_millis(100);
 const SETTLE: Duration = Duration::from_millis(300);
 /// How long another thread waits for the main thread to pass activation on.
 const MAIN_WAIT: Duration = Duration::from_secs(1);
+/// How long passing activation on waits for Sessionmux to be the active app.
+const ACTIVE_WAIT: Duration = Duration::from_millis(500);
+/// How often that is checked, and how long one check may wait for the main thread.
+const ACTIVE_POLL: Duration = Duration::from_millis(25);
+const ACTIVE_ASK_WAIT: Duration = Duration::from_millis(250);
+/// How long an instance asked to show itself may take to put a window on screen.
+const REOPEN_WAIT: Duration = Duration::from_millis(1500);
+/// How long Launch Services may take to reach a running instance.
+const REOPEN_LAUNCH_WAIT: Duration = Duration::from_secs(5);
 /// How long one Accessibility request to Claude may take.
 const AX_TIMEOUT_SECS: f32 = 1.0;
 /// `kAXValueCGSizeType`.
 const AX_VALUE_CG_SIZE: u32 = 2;
 /// `kAXErrorSuccess`.
 const AX_SUCCESS: i32 = 0;
+/// `kAXErrorNoValue`: the attribute has no value.
+const AX_NO_VALUE: i32 = -25212;
 /// `SZOMB`: the process has ended and waits for its parent to collect it.
 const SZOMB: u32 = 5;
 
@@ -147,18 +170,41 @@ pub(crate) fn located_at(bundle: &Path) -> Result<Located, String> {
     })
 }
 
+/// True for a copy of an app that is not where apps are installed: on a mounted disk image, in
+/// the Trash, or run from a translocated (quarantined, read-only) folder.
+fn is_transient_copy(p: &Path) -> bool {
+    let s = p.to_string_lossy();
+    s.starts_with("/Volumes/") || s.contains("/.Trash/") || s.contains("/AppTranslocation/")
+}
+
+/// Where Claude may be installed, best first: the copy Launch Services names for the bundle id,
+/// then `/Applications`, then `~/Applications`; a transient copy named by Launch Services goes
+/// last.
+fn order_candidates(registered: Option<PathBuf>, home: &Path) -> Vec<PathBuf> {
+    let fixed = [PathBuf::from("/Applications/Claude.app"), home.join("Applications").join("Claude.app")];
+    let mut out = Vec::new();
+    match registered {
+        Some(r) if is_transient_copy(&r) => {
+            out.extend(fixed);
+            out.push(r);
+        }
+        Some(r) => {
+            out.push(r);
+            out.extend(fixed);
+        }
+        None => out.extend(fixed),
+    }
+    out
+}
+
 /// Where Claude may be installed, best first.
 fn bundle_candidates() -> Vec<PathBuf> {
-    let mut out = Vec::new();
     let ws = NSWorkspace::sharedWorkspace();
-    if let Some(url) = ws.URLForApplicationWithBundleIdentifier(&NSString::from_str(CLAUDE_BUNDLE_ID)) {
-        if let Some(p) = url.path() {
-            out.push(PathBuf::from(p.to_string()));
-        }
-    }
-    out.push(PathBuf::from("/Applications/Claude.app"));
-    out.push(<Os as Paths>::home().join("Applications").join("Claude.app"));
-    out
+    let registered = ws
+        .URLForApplicationWithBundleIdentifier(&NSString::from_str(CLAUDE_BUNDLE_ID))
+        .and_then(|url| url.path())
+        .map(|p| PathBuf::from(p.to_string()));
+    order_candidates(registered, &<Os as Paths>::home())
 }
 
 // ───────────────────────────────────────────────────────────── launch ──
@@ -178,7 +224,12 @@ fn open_instance(l: &Located, args: &[String]) -> Result<Pid, String> {
     cfg.setPromptsUserIfNeeded(true);
     let ns_args: Vec<Retained<NSString>> = args.iter().map(|a| NSString::from_str(a)).collect();
     cfg.setArguments(&NSArray::from_retained_slice(&ns_args));
+    open_app(&url, &cfg, LAUNCH_WAIT)
+}
 
+/// Open the app at `url` through Launch Services with `cfg`, and wait up to `wait` for the
+/// system to report the process it reached.
+fn open_app(url: &NSURL, cfg: &NSWorkspaceOpenConfiguration, wait: Duration) -> Result<Pid, String> {
     let (tx, rx) = mpsc::channel::<Result<Pid, String>>();
     let done = RcBlock::new(move |app: *mut NSRunningApplication, err: *mut NSError| {
         // SAFETY: Launch Services passes either a running app or an error, each valid for the
@@ -196,11 +247,11 @@ fn open_instance(l: &Located, args: &[String]) -> Result<Pid, String> {
         };
         let _ = tx.send(r);
     });
-    NSWorkspace::sharedWorkspace().openApplicationAtURL_configuration_completionHandler(&url, &cfg, Some(&done));
-    match rx.recv_timeout(LAUNCH_WAIT) {
+    NSWorkspace::sharedWorkspace().openApplicationAtURL_configuration_completionHandler(url, cfg, Some(&done));
+    match rx.recv_timeout(wait) {
         Ok(Ok(pid)) => Ok(pid),
         Ok(Err(e)) => Err(format!("Could not start Claude: {e}")),
-        Err(_) => Err(format!("Claude did not start within {} s.", LAUNCH_WAIT.as_secs())),
+        Err(_) => Err(format!("Claude did not start within {} s.", wait.as_secs())),
     }
 }
 
@@ -238,10 +289,61 @@ fn udd_arg(data_dir: &str) -> Result<String, String> {
 
 // ───────────────────────────────────────────────────────────── focus ──
 
+/// Whether the opt-in Accessibility raise may be used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AxState {
+    Allowed,
+    /// The user did not turn on "Bring minimised Claude windows to the front".
+    Off,
+    /// The setting is on, but the system does not trust Sessionmux for Accessibility.
+    Untrusted,
+}
+
+impl AxState {
+    fn name(self) -> &'static str {
+        match self {
+            AxState::Allowed => "allowed",
+            AxState::Off => "setting-off",
+            AxState::Untrusted => "untrusted",
+        }
+    }
+}
+
+/// Where a process's windows are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WinState {
+    /// A normal window is on screen.
+    OnScreen,
+    /// It has a normal window, but none on screen (minimised, on another Space, ordered out).
+    OffScreen,
+    /// It has no normal window at all (closed).
+    None,
+}
+
+impl WinState {
+    fn name(self) -> &'static str {
+        match self {
+            WinState::OnScreen => "on-screen",
+            WinState::OffScreen => "off-screen",
+            WinState::None => "none",
+        }
+    }
+}
+
+/// Outcome of asking a running instance to show itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reopen {
+    /// The request reached the process.
+    Sent,
+    /// The user did not allow Sessionmux to control Claude (Automation).
+    Denied,
+    Failed,
+}
+
 /// The steps of bringing a Claude window forward, so their order can be checked without a screen.
 pub(crate) trait FocusSteps {
-    /// Activate Sessionmux itself, inside the user's click or shortcut, so it holds activation it
-    /// may pass on.
+    /// Activate Sessionmux on the main thread, so it holds activation it may pass on. Nothing on
+    /// other threads: the click, menu choice or shortcut took the activation already.
     fn activate_self(&mut self);
     /// Pass activation to `pid` and ask it to come forward with all its windows.
     fn pass_activation(&mut self, pid: Pid);
@@ -249,14 +351,23 @@ pub(crate) trait FocusSteps {
     fn settle(&mut self);
     /// True when `pid` is the app in front and has a window on screen.
     fn in_front(&mut self, pid: Pid) -> bool;
-    /// True when the user turned on raising windows through Accessibility and allowed it.
-    fn accessibility_allowed(&mut self) -> bool;
-    /// Un-minimise and raise `pid`'s largest window through Accessibility.
+    /// Whether raising windows through Accessibility is turned on and allowed.
+    fn accessibility(&mut self) -> AxState;
+    /// Un-minimise and raise `pid`'s largest window through Accessibility and make it the main
+    /// window of the app in front.
     fn raise_with_accessibility(&mut self, pid: Pid) -> bool;
+    /// Where `pid`'s windows are.
+    fn window_state(&mut self, pid: Pid) -> WinState;
+    /// Ask `pid` to show itself, as a click on its Dock icon does; it opens a window when it has
+    /// none.
+    fn reopen(&mut self, pid: Pid) -> Reopen;
+    /// Wait a little for `pid` to put a window on screen. True when it did.
+    fn wait_for_window(&mut self, pid: Pid) -> bool;
 }
 
 /// Bring `pid` forward: activation first; when that is not enough, the hand-off by a new start
-/// (only where Claude hands a second start over), else the Accessibility raise when allowed.
+/// (only where Claude hands a second start over), else the Accessibility raise when allowed,
+/// else, when no window of it is on screen, a request to the instance to show itself.
 pub(crate) fn focus_with(s: &mut impl FocusSteps, pid: Pid, handoff: bool) -> FocusResult {
     s.activate_self();
     s.pass_activation(pid);
@@ -267,49 +378,125 @@ pub(crate) fn focus_with(s: &mut impl FocusSteps, pid: Pid, handoff: bool) -> Fo
     if handoff {
         return FocusResult::NeedsHandOff;
     }
-    if s.accessibility_allowed() && s.raise_with_accessibility(pid) {
+    let ax = s.accessibility();
+    let mut raised = false;
+    if ax == AxState::Allowed && s.raise_with_accessibility(pid) {
+        raised = true;
         s.pass_activation(pid);
         s.settle();
         if s.in_front(pid) {
             return FocusResult::Focused;
         }
     }
-    FocusResult::Failed
+    let mut reopen = None;
+    if !raised && s.window_state(pid) != WinState::OnScreen {
+        let r = s.reopen(pid);
+        reopen = Some(r);
+        if r == Reopen::Sent && s.wait_for_window(pid) {
+            if s.in_front(pid) {
+                return FocusResult::Focused;
+            }
+            if ax == AxState::Allowed {
+                s.raise_with_accessibility(pid);
+            }
+            s.pass_activation(pid);
+            s.settle();
+            if s.in_front(pid) {
+                return FocusResult::Focused;
+            }
+        }
+    }
+    FocusResult::Failed(failure(ax, reopen, s.window_state(pid)))
 }
 
-/// Activate Sessionmux and, on macOS 14 and later, yield activation to `pid`. Only effective
-/// inside the handler of the user's click or shortcut: later, the system may refuse it.
-fn activate_self_now(mtm: MainThreadMarker, pid: Option<Pid>) {
+/// Why a window did not come forward, from what was tried and where its windows are now.
+fn failure(ax: AxState, reopen: Option<Reopen>, win: WinState) -> FocusFailure {
+    match (win, ax) {
+        (WinState::OnScreen | WinState::OffScreen, AxState::Untrusted) => FocusFailure::AccessibilityUntrusted,
+        (WinState::OnScreen, _) => FocusFailure::Refused,
+        (WinState::OffScreen, AxState::Off) => FocusFailure::AccessibilityOff,
+        _ if reopen == Some(Reopen::Denied) => FocusFailure::AutomationDenied,
+        (WinState::OffScreen, _) => FocusFailure::Refused,
+        (WinState::None, _) => FocusFailure::NoWindow,
+    }
+}
+
+/// Make Sessionmux the active app, when it is not. Called from the handler of the user's click,
+/// menu choice or shortcut: there the system grants it, and Sessionmux can then pass the
+/// activation on to Claude. On macOS 14 and later the request completes shortly after.
+pub(crate) fn take_activation(mtm: MainThreadMarker) {
     let app = NSApplication::sharedApplication(mtm);
-    if !macos_at_least(14) {
-        #[allow(deprecated)]
-        app.activateIgnoringOtherApps(true);
+    if app.isActive() {
         return;
     }
-    app.activate();
-    if let Some(target) = pid.and_then(ns_pid).and_then(NSRunningApplication::runningApplicationWithProcessIdentifier) {
-        app.yieldActivationToApplication(&target);
+    if macos_at_least(14) {
+        app.activate();
+    } else {
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
     }
 }
 
-/// The real focus steps: AppKit activation on the main thread, Accessibility from the caller's
-/// thread.
-struct SystemFocus;
+/// What one focus attempt saw, for its log line.
+#[derive(Default)]
+struct Report {
+    activation: Vec<String>,
+    ax: Vec<String>,
+    reopen: Option<String>,
+}
+
+impl Report {
+    fn line(&self) -> String {
+        let list = |v: &[String]| if v.is_empty() { "n/a".to_string() } else { v.join(", ") };
+        format!(
+            "activation=[{}] ax=[{}] reopen={}",
+            list(&self.activation),
+            list(&self.ax),
+            self.reopen.as_deref().unwrap_or("n/a")
+        )
+    }
+}
+
+/// The real focus steps: AppKit activation on the main thread, Accessibility and the reopen
+/// request from the caller's thread.
+#[derive(Default)]
+struct SystemFocus {
+    report: Report,
+}
+
+/// Whether Sessionmux is the active app, polled from another thread for up to [`ACTIVE_WAIT`]
+/// (the activation taken in the user's click completes shortly after it). Returns the answer
+/// and how long the wait took; None when the main thread does not answer.
+fn wait_until_active() -> (Option<bool>, Duration) {
+    let start = Instant::now();
+    if let Some(mtm) = MainThreadMarker::new() {
+        return (Some(NSApplication::sharedApplication(mtm).isActive()), start.elapsed());
+    }
+    loop {
+        let active = on_main_wait(ACTIVE_ASK_WAIT, |mtm| NSApplication::sharedApplication(mtm).isActive());
+        match active {
+            Some(false) if start.elapsed() < ACTIVE_WAIT => std::thread::sleep(ACTIVE_POLL),
+            _ => return (active, start.elapsed()),
+        }
+    }
+}
 
 impl FocusSteps for SystemFocus {
-    /// Done by [`Focus::prepare_focus`] in the user's event handler; from a worker thread, after
-    /// that event, activating Sessionmux could take activation away from the app the user is in.
     fn activate_self(&mut self) {
         if let Some(mtm) = MainThreadMarker::new() {
-            activate_self_now(mtm, None);
+            take_activation(mtm);
         }
     }
 
+    /// macOS 14 and later: only the active app can pass activation on, so this waits briefly for
+    /// Sessionmux to be active, then yields to `pid` and asks it to activate.
     fn pass_activation(&mut self, pid: Pid) {
         let Some(p) = ns_pid(pid) else { return };
+        let modern = macos_at_least(14);
+        let (active, waited) = if modern { wait_until_active() } else { (None, Duration::ZERO) };
         let sent = on_main_wait(MAIN_WAIT, move |mtm| {
             let target = NSRunningApplication::runningApplicationWithProcessIdentifier(p)?;
-            if macos_at_least(14) {
+            if modern {
                 NSApplication::sharedApplication(mtm).yieldActivationToApplication(&target);
                 let me = NSRunningApplication::currentApplication();
                 Some(target.activateFromApplication_options(&me, NSApplicationActivationOptions::ActivateAllWindows))
@@ -319,9 +506,16 @@ impl FocusSteps for SystemFocus {
                     | NSApplicationActivationOptions::ActivateIgnoringOtherApps;
                 Some(target.activateWithOptions(opts))
             }
-        })
-        .flatten();
-        log::debug(&format!("claude_app: activation of pid {pid} requested: {sent:?}"));
+        });
+        let sent = match sent {
+            None => "no-main-thread".to_string(),
+            Some(None) => "not-a-running-app".to_string(),
+            Some(Some(b)) => b.to_string(),
+        };
+        let active = active.map_or_else(|| "unknown".to_string(), |a| a.to_string());
+        let note = format!("active_at_yield={active} wait_ms={} sent={sent}", waited.as_millis());
+        log::debug(&format!("claude_app: activation of pid {pid}: {note}"));
+        self.report.activation.push(note);
     }
 
     fn settle(&mut self) {
@@ -333,12 +527,139 @@ impl FocusSteps for SystemFocus {
         front && <Os as Windows>::main_window(pid).is_some()
     }
 
-    fn accessibility_allowed(&mut self) -> bool {
-        raise_setting_on() && <Os as Focus>::accessibility_trusted(false) == Some(true)
+    fn accessibility(&mut self) -> AxState {
+        let state = if !raise_setting_on() {
+            AxState::Off
+        } else if <Os as Focus>::accessibility_trusted(false) == Some(true) {
+            AxState::Allowed
+        } else {
+            AxState::Untrusted
+        };
+        if state != AxState::Allowed {
+            log::debug(&format!("claude_app: Accessibility raise not used: {}", state.name()));
+            self.report.ax.push(format!("off:{}", state.name()));
+        }
+        state
     }
 
     fn raise_with_accessibility(&mut self, pid: Pid) -> bool {
-        ax_raise(pid)
+        let (ok, note) = ax_raise(pid);
+        log::debug(&format!("claude_app: Accessibility raise of pid {pid}: {note}"));
+        self.report.ax.push(note);
+        ok
+    }
+
+    fn window_state(&mut self, pid: Pid) -> WinState {
+        window_state(pid)
+    }
+
+    fn reopen(&mut self, pid: Pid) -> Reopen {
+        let (r, note) = reopen_instance(pid);
+        log::info(&format!("claude_app: reopen pid {pid}: {r:?} ({note})"));
+        self.report.reopen = Some(format!("{r:?} ({note})"));
+        r
+    }
+
+    fn wait_for_window(&mut self, pid: Pid) -> bool {
+        let deadline = Instant::now() + REOPEN_WAIT;
+        loop {
+            if <Os as Windows>::main_window(pid).is_some() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+/// Where `pid`'s windows are, read from the window server's list.
+fn window_state(pid: Pid) -> WinState {
+    if <Os as Windows>::main_window(pid).is_some() {
+        WinState::OnScreen
+    } else if has_off_screen_window(pid) {
+        WinState::OffScreen
+    } else {
+        WinState::None
+    }
+}
+
+/// The `.app` folder `pid` runs from, when it is the only running app with its bundle id. Launch
+/// Services finds a running app by its bundle id, so only then does opening that folder reach
+/// exactly this instance.
+fn sole_instance_bundle(pid: Pid) -> Option<String> {
+    let p = ns_pid(pid)?;
+    let app = NSRunningApplication::runningApplicationWithProcessIdentifier(p)?;
+    let id = app.bundleIdentifier()?;
+    let all = NSRunningApplication::runningApplicationsWithBundleIdentifier(&id);
+    if all.len() != 1 || all.iter().any(|a| a.processIdentifier() != p) {
+        return None;
+    }
+    let path = app.bundleURL()?.path()?.to_string();
+    Some(real_path(&path))
+}
+
+/// Ask the running instance `pid` to show itself, as a click on its Dock icon does. When it is
+/// the only instance running from its copy of Claude, Launch Services does that (it activates the
+/// instance and needs no Automation permission). Otherwise, or when that fails, the reopen Apple
+/// Event is sent to that process only; the user is asked once for Automation permission. Returns
+/// the outcome and what was tried, for the log.
+fn reopen_instance(pid: Pid) -> (Reopen, String) {
+    let mut tried = Vec::new();
+    if let Some(bundle) = sole_instance_bundle(pid) {
+        match reopen_by_launch(pid, &bundle) {
+            Ok(()) => return (Reopen::Sent, "launch services".into()),
+            Err(e) => tried.push(format!("launch services: {e}")),
+        }
+    }
+    let mut sent = send_event_to_pid(pid, CORE_EVENT_CLASS, AE_REOPEN_APPLICATION, None, false);
+    if sent == Err(AeSendError::NotPermitted(ERR_NEEDS_CONSENT)) {
+        tried.push(format!("apple event: {}", ae_error(&AeSendError::NotPermitted(ERR_NEEDS_CONSENT))));
+        sent = send_event_to_pid(pid, CORE_EVENT_CLASS, AE_REOPEN_APPLICATION, None, true);
+    }
+    let r = match &sent {
+        Ok(()) => Reopen::Sent,
+        Err(AeSendError::NotPermitted(_)) => Reopen::Denied,
+        Err(_) => Reopen::Failed,
+    };
+    tried.push(match &sent {
+        Ok(()) => "apple event".into(),
+        Err(e) => format!("apple event: {}", ae_error(e)),
+    });
+    (r, tried.join("; "))
+}
+
+fn ae_error(e: &AeSendError) -> String {
+    match e {
+        AeSendError::NotPermitted(code) if *code == ERR_NOT_PERMITTED => format!("not permitted ({code})"),
+        AeSendError::NotPermitted(code) => format!("not asked yet ({code})"),
+        AeSendError::Gone => "process gone".into(),
+        AeSendError::Failed(s) => s.clone(),
+    }
+}
+
+/// Open the copy of Claude at `bundle` through Launch Services without a new instance: its only
+/// running instance, `pid`, is activated and asked to show itself. Should Launch Services start
+/// a new process instead, that one is asked to quit again at once; a process that already ran is
+/// never touched.
+fn reopen_by_launch(pid: Pid, bundle: &str) -> Result<(), String> {
+    let url = NSURL::fileURLWithPath_isDirectory(&NSString::from_str(bundle), true);
+    let cfg = NSWorkspaceOpenConfiguration::configuration();
+    cfg.setCreatesNewApplicationInstance(false);
+    cfg.setActivates(true);
+    cfg.setAddsToRecentItems(false);
+    cfg.setPromptsUserIfNeeded(false);
+    let before: HashSet<Pid> = any_claude_mains(None).into_iter().map(|p| p.pid).collect();
+    match open_app(&url, &cfg, REOPEN_LAUNCH_WAIT) {
+        Ok(got) if got == pid => Ok(()),
+        Ok(other) if before.contains(&other) => Err(format!("reached pid {other}")),
+        Ok(other) => {
+            log::warn(&format!("claude_app: reopening pid {pid} started pid {other}; asking it to quit"));
+            ask_to_quit(other);
+            Err(format!("started pid {other}"))
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -355,16 +676,29 @@ fn owned(ptr: *mut CFType) -> Option<CFRetained<CFType>> {
     NonNull::new(ptr).map(|p| unsafe { CFRetained::from_raw(p) })
 }
 
-/// An Accessibility attribute of `el`, owned.
-fn ax_attr(el: &CFType, name: &str) -> Option<CFRetained<CFType>> {
+/// An Accessibility attribute of `el`, owned, or the error code.
+fn ax_attr_or_code(el: &CFType, name: &str) -> Result<CFRetained<CFType>, i32> {
     let mut value: *mut CFType = std::ptr::null_mut();
     // SAFETY: `el` is a live accessibility object, the name a live string, and `value` a writable
     // out-pointer that receives a new reference on success.
     let err = unsafe { AXUIElementCopyAttributeValue(el, &CFString::from_str(name), &mut value) };
     if err != AX_SUCCESS {
-        return None;
+        return Err(err);
     }
-    owned(value)
+    owned(value).ok_or(AX_NO_VALUE)
+}
+
+/// An Accessibility attribute of `el`, owned.
+fn ax_attr(el: &CFType, name: &str) -> Option<CFRetained<CFType>> {
+    ax_attr_or_code(el, name).ok()
+}
+
+/// Set a boolean Accessibility attribute of `el`; the result code.
+fn ax_set_bool(el: &CFType, name: &str, value: bool) -> i32 {
+    let v: &CFType = CFBoolean::new(value);
+    // SAFETY: `el` is a live accessibility object, the name a live string and the value a
+    // constant boolean.
+    unsafe { AXUIElementSetAttributeValue(el, &CFString::from_str(name), v) }
 }
 
 /// The area of an Accessibility window, 0 when unknown.
@@ -380,32 +714,37 @@ fn ax_area(win: &CFType) -> f64 {
     }
 }
 
-/// Un-minimise `pid`'s largest window and raise it. True when the raise was accepted.
-fn ax_raise(pid: Pid) -> bool {
-    let Some(p) = ns_pid(pid) else { return false };
+/// Un-minimise `pid`'s largest window, raise it, make it the app's main window and the app the
+/// one in front. True when the raise or the move to the front was accepted; with the result
+/// codes of every call, for the log.
+fn ax_raise(pid: Pid) -> (bool, String) {
+    let Some(p) = ns_pid(pid) else { return (false, "bad pid".into()) };
     // SAFETY: creating an accessibility object for a pid has no preconditions; it returns a new
     // reference, owned below.
-    let Some(app) = owned(unsafe { AXUIElementCreateApplication(p) }) else { return false };
+    let Some(app) = owned(unsafe { AXUIElementCreateApplication(p) }) else {
+        return (false, "no application element".into());
+    };
     // SAFETY: `app` is a live accessibility object; a failure only keeps the default timeout.
     unsafe { AXUIElementSetMessagingTimeout(&app, AX_TIMEOUT_SECS) };
-    let Some(list) = ax_attr(&app, "AXWindows").and_then(|v| v.downcast::<CFArray>().ok()) else {
-        log::debug(&format!("claude_app: no Accessibility windows for pid {pid}"));
-        return false;
+    let list = match ax_attr_or_code(&app, "AXWindows") {
+        Ok(v) => v,
+        Err(code) => return (false, format!("windows error {code}")),
     };
+    let Ok(list) = list.downcast::<CFArray>() else { return (false, "windows is not a list".into()) };
     // SAFETY: the windows attribute is documented as an array of accessibility objects; they are
     // only passed back to Accessibility calls.
     let list: CFRetained<CFArray<CFType>> = unsafe { CFRetained::cast_unchecked(list) };
+    let count = list.len();
     let Some(win) = list.iter().map(|w| (ax_area(&w), w)).max_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, w)| w) else {
-        return false;
+        return (false, "windows 0".into());
     };
-    let no: &CFType = CFBoolean::new(false);
-    // SAFETY: `win` is a live accessibility object of Claude's, the names live strings and the
-    // value a constant boolean.
-    let unminimised = unsafe { AXUIElementSetAttributeValue(&win, &CFString::from_str("AXMinimized"), no) };
-    // SAFETY: as above.
+    let unminimised = ax_set_bool(&win, "AXMinimized", false);
+    // SAFETY: `win` is a live accessibility object of Claude's and the action name a live string.
     let raised = unsafe { AXUIElementPerformAction(&win, &CFString::from_str("AXRaise")) };
-    log::debug(&format!("claude_app: Accessibility raise of pid {pid}: unminimise {unminimised}, raise {raised}"));
-    raised == AX_SUCCESS
+    let main = ax_set_bool(&win, "AXMain", true);
+    let frontmost = ax_set_bool(&app, "AXFrontmost", true);
+    let note = format!("windows {count}, unminimise {unminimised}, raise {raised}, main {main}, frontmost {frontmost}");
+    (raised == AX_SUCCESS || frontmost == AX_SUCCESS, note)
 }
 
 // ───────────────────────────────────────────────────────────── close ──
@@ -614,21 +953,34 @@ impl ClaudeInstall for Os {
 }
 
 impl Focus for Os {
-    /// Activate Sessionmux inside the user's click or shortcut and yield activation to `pid`, so
-    /// the activation that [`Focus::focus`] asks for from a worker thread is granted.
-    fn prepare_focus(pid: Pid) {
+    /// Make Sessionmux the active app before [`Focus::focus`] runs on a worker thread. The
+    /// click, menu choice or shortcut usually did this already, inside its own event; here it
+    /// only covers a request that came without one.
+    fn prepare_focus(_pid: Pid) {
         match MainThreadMarker::new() {
-            Some(mtm) => activate_self_now(mtm, Some(pid)),
+            Some(mtm) => take_activation(mtm),
             None => log::debug("claude_app: activation can only be prepared on the main thread"),
         }
     }
 
+    /// Bring `pid` forward and log one line with what was tried and what was seen.
     fn focus(pid: Pid) -> FocusResult {
         if !<Os as Processes>::alive(pid) {
-            return FocusResult::Failed;
+            log::info(&format!("claude_app: focus pid {pid}: not running"));
+            return FocusResult::Failed(FocusFailure::Gone);
         }
-        let r = focus_with(&mut SystemFocus, pid, RELAUNCH_HANDOFF);
-        log::debug(&format!("claude_app: focus pid {pid}: {r:?}"));
+        let mut s = SystemFocus::default();
+        let mut r = focus_with(&mut s, pid, RELAUNCH_HANDOFF);
+        if matches!(r, FocusResult::Failed(_)) && !<Os as Processes>::alive(pid) {
+            r = FocusResult::Failed(FocusFailure::Gone);
+        }
+        let front = <Os as Windows>::foreground_pid().or_else(front_window_owner);
+        let front = front.map_or_else(|| "unknown".to_string(), |p| p.to_string());
+        log::info(&format!(
+            "claude_app: focus pid {pid}: {r:?} {} front_pid={front} window={}",
+            s.report.line(),
+            window_state(pid).name()
+        ));
         r
     }
 
@@ -781,6 +1133,30 @@ pub(crate) mod fake {
                 .unwrap_or_default()
         }
 
+        /// Give this stand-in a bundle id of its own (before it is started).
+        pub(crate) fn set_bundle_id(&self, id: &str) {
+            let plist = self.bundle.join("Contents").join("Info.plist");
+            let text = std::fs::read_to_string(&plist).expect("Info.plist").replace(BUNDLE_ID, id);
+            std::fs::write(&plist, text).expect("Info.plist");
+        }
+
+        /// How often main process `pid` was asked to show itself.
+        pub(crate) fn recorded_reopens(&self, pid: u32) -> usize {
+            std::fs::read_to_string(self.root.join(format!("reopen-{pid}.txt"))).map_or(0, |s| s.lines().count())
+        }
+
+        /// How many main processes of the stand-in have started so far.
+        pub(crate) fn started_count(&self) -> usize {
+            std::fs::read_dir(&self.root).map_or(0, |d| {
+                d.filter_map(Result::ok)
+                    .filter(|e| {
+                        let n = e.file_name().to_string_lossy().into_owned();
+                        n.starts_with("argv-") && n.ends_with(".txt")
+                    })
+                    .count()
+            })
+        }
+
         /// A data folder next to the bundle.
         pub(crate) fn data_dir(&self, name: &str) -> PathBuf {
             let d = self.root.join(name);
@@ -811,13 +1187,30 @@ mod tests {
 
     // ── focus order ──
 
-    #[derive(Default)]
     struct Script {
         steps: Vec<String>,
         /// `in_front` answers, in order; false once used up.
         front: VecDeque<bool>,
-        ax_allowed: bool,
+        ax: AxState,
         ax_raised: bool,
+        /// `window_state` answers, in order; the last one repeats.
+        windows: VecDeque<WinState>,
+        reopen: Reopen,
+        window_after_reopen: bool,
+    }
+
+    impl Default for Script {
+        fn default() -> Script {
+            Script {
+                steps: Vec::new(),
+                front: VecDeque::new(),
+                ax: AxState::Off,
+                ax_raised: false,
+                windows: VecDeque::from([WinState::OnScreen]),
+                reopen: Reopen::Sent,
+                window_after_reopen: false,
+            }
+        }
     }
 
     impl FocusSteps for Script {
@@ -834,37 +1227,87 @@ mod tests {
             self.steps.push(format!("front?-{pid}"));
             self.front.pop_front().unwrap_or(false)
         }
-        fn accessibility_allowed(&mut self) -> bool {
-            self.steps.push("ax-allowed?".into());
-            self.ax_allowed
+        fn accessibility(&mut self) -> AxState {
+            self.steps.push("ax?".into());
+            self.ax
         }
         fn raise_with_accessibility(&mut self, pid: Pid) -> bool {
             self.steps.push(format!("ax-raise-{pid}"));
             self.ax_raised
         }
+        fn window_state(&mut self, pid: Pid) -> WinState {
+            self.steps.push(format!("windows?-{pid}"));
+            if self.windows.len() > 1 {
+                self.windows.pop_front().unwrap_or(WinState::None)
+            } else {
+                self.windows.front().copied().unwrap_or(WinState::None)
+            }
+        }
+        fn reopen(&mut self, pid: Pid) -> Reopen {
+            self.steps.push(format!("reopen-{pid}"));
+            self.reopen
+        }
+        fn wait_for_window(&mut self, pid: Pid) -> bool {
+            self.steps.push(format!("wait-window-{pid}"));
+            self.window_after_reopen
+        }
     }
 
-    fn script(front: &[bool], ax_allowed: bool, ax_raised: bool) -> Script {
-        Script { front: front.iter().copied().collect(), ax_allowed, ax_raised, ..Script::default() }
+    fn script(front: &[bool], ax: AxState, ax_raised: bool) -> Script {
+        Script { front: front.iter().copied().collect(), ax, ax_raised, ..Script::default() }
+    }
+
+    fn failed(f: FocusFailure) -> FocusResult {
+        FocusResult::Failed(f)
     }
 
     #[test]
     fn activation_alone_is_enough_for_a_visible_window() {
-        let mut s = script(&[true], true, true);
+        let mut s = script(&[true], AxState::Allowed, true);
         assert_eq!(focus_with(&mut s, 7, false), FocusResult::Focused);
         assert_eq!(s.steps, ["activate-self", "pass-7", "settle", "front?-7"]);
     }
 
     #[test]
     fn hand_off_comes_before_accessibility_where_claude_hands_over() {
-        let mut s = script(&[false], true, true);
+        let mut s = script(&[false], AxState::Allowed, true);
         assert_eq!(focus_with(&mut s, 7, true), FocusResult::NeedsHandOff);
         assert_eq!(s.steps, ["activate-self", "pass-7", "settle", "front?-7"]);
     }
 
     #[test]
     fn accessibility_raise_then_activation_again() {
-        let mut s = script(&[false, true], true, true);
+        let mut s = script(&[false, true], AxState::Allowed, true);
+        assert_eq!(focus_with(&mut s, 7, false), FocusResult::Focused);
+        assert_eq!(
+            s.steps,
+            ["activate-self", "pass-7", "settle", "front?-7", "ax?", "ax-raise-7", "pass-7", "settle", "front?-7"]
+        );
+        // Raised but still not in front: refused, and no reopen (the window exists).
+        let mut s = script(&[false, false], AxState::Allowed, true);
+        assert_eq!(focus_with(&mut s, 7, false), failed(FocusFailure::Refused));
+        assert!(!s.steps.iter().any(|x| x.starts_with("reopen")), "{:?}", s.steps);
+    }
+
+    #[test]
+    fn a_visible_window_that_stays_behind_is_refused_or_needs_accessibility() {
+        let mut s = script(&[false], AxState::Off, true);
+        assert_eq!(focus_with(&mut s, 7, false), failed(FocusFailure::Refused));
+        assert_eq!(s.steps, ["activate-self", "pass-7", "settle", "front?-7", "ax?", "windows?-7", "windows?-7"]);
+        let mut s = script(&[false], AxState::Untrusted, true);
+        assert_eq!(focus_with(&mut s, 7, false), failed(FocusFailure::AccessibilityUntrusted));
+        assert!(!s.steps.iter().any(|x| x.starts_with("ax-raise")), "{:?}", s.steps);
+    }
+
+    #[test]
+    fn a_closed_window_is_reopened_and_brought_forward() {
+        // Activation is not enough; the reopened window is already in front.
+        let mut s = Script {
+            front: VecDeque::from([false, true]),
+            windows: VecDeque::from([WinState::None, WinState::OnScreen]),
+            window_after_reopen: true,
+            ..Script::default()
+        };
         assert_eq!(focus_with(&mut s, 7, false), FocusResult::Focused);
         assert_eq!(
             s.steps,
@@ -873,25 +1316,84 @@ mod tests {
                 "pass-7",
                 "settle",
                 "front?-7",
-                "ax-allowed?",
+                "ax?",
+                "windows?-7",
+                "reopen-7",
+                "wait-window-7",
+                "front?-7"
+            ]
+        );
+
+        // The reopened window came up behind: activation (and the raise, when allowed) again.
+        let mut s = Script {
+            front: VecDeque::from([false, false, true]),
+            ax: AxState::Allowed,
+            ax_raised: false,
+            windows: VecDeque::from([WinState::None, WinState::OnScreen]),
+            window_after_reopen: true,
+            ..Script::default()
+        };
+        assert_eq!(focus_with(&mut s, 7, false), FocusResult::Focused);
+        assert_eq!(
+            s.steps,
+            [
+                "activate-self",
+                "pass-7",
+                "settle",
+                "front?-7",
+                "ax?",
+                "ax-raise-7",
+                "windows?-7",
+                "reopen-7",
+                "wait-window-7",
+                "front?-7",
                 "ax-raise-7",
                 "pass-7",
                 "settle",
                 "front?-7"
             ]
         );
-        let mut s = script(&[false, false], true, true);
-        assert_eq!(focus_with(&mut s, 7, false), FocusResult::Failed);
     }
 
     #[test]
-    fn without_accessibility_the_result_is_a_failure_notice() {
-        let mut s = script(&[false], false, true);
-        assert_eq!(focus_with(&mut s, 7, false), FocusResult::Failed);
-        assert_eq!(s.steps, ["activate-self", "pass-7", "settle", "front?-7", "ax-allowed?"]);
-        let mut s = script(&[false], true, false);
-        assert_eq!(focus_with(&mut s, 7, false), FocusResult::Failed);
-        assert_eq!(s.steps.last().map(String::as_str), Some("ax-raise-7"));
+    fn reopen_failures_have_their_own_reasons() {
+        let closed = |reopen: Reopen| Script {
+            windows: VecDeque::from([WinState::None]),
+            reopen,
+            window_after_reopen: false,
+            ..Script::default()
+        };
+        let mut s = closed(Reopen::Sent);
+        assert_eq!(focus_with(&mut s, 7, false), failed(FocusFailure::NoWindow));
+        assert_eq!(s.steps.last().map(String::as_str), Some("windows?-7"));
+        assert!(s.steps.contains(&"wait-window-7".to_string()));
+
+        let mut s = closed(Reopen::Denied);
+        assert_eq!(focus_with(&mut s, 7, false), failed(FocusFailure::AutomationDenied));
+        assert!(!s.steps.contains(&"wait-window-7".to_string()), "nothing to wait for");
+
+        let mut s = closed(Reopen::Failed);
+        assert_eq!(focus_with(&mut s, 7, false), failed(FocusFailure::NoWindow));
+
+        // A minimised window with the setting off: reopen tried, then the setting is the advice.
+        let mut s = Script { windows: VecDeque::from([WinState::OffScreen]), ..Script::default() };
+        assert_eq!(focus_with(&mut s, 7, false), failed(FocusFailure::AccessibilityOff));
+        assert!(s.steps.contains(&"reopen-7".to_string()));
+    }
+
+    #[test]
+    fn failure_reasons() {
+        use AxState::{Allowed, Off, Untrusted};
+        use WinState::{OffScreen, OnScreen};
+        assert_eq!(failure(Off, None, OnScreen), FocusFailure::Refused);
+        assert_eq!(failure(Allowed, None, OnScreen), FocusFailure::Refused);
+        assert_eq!(failure(Untrusted, None, OnScreen), FocusFailure::AccessibilityUntrusted);
+        assert_eq!(failure(Off, Some(Reopen::Sent), OffScreen), FocusFailure::AccessibilityOff);
+        assert_eq!(failure(Untrusted, Some(Reopen::Denied), OffScreen), FocusFailure::AccessibilityUntrusted);
+        assert_eq!(failure(Allowed, Some(Reopen::Denied), OffScreen), FocusFailure::AutomationDenied);
+        assert_eq!(failure(Allowed, Some(Reopen::Sent), OffScreen), FocusFailure::Refused);
+        assert_eq!(failure(Untrusted, Some(Reopen::Denied), WinState::None), FocusFailure::AutomationDenied);
+        assert_eq!(failure(Off, Some(Reopen::Sent), WinState::None), FocusFailure::NoWindow);
     }
 
     #[test]
@@ -900,7 +1402,7 @@ mod tests {
             return;
         }
         assert_ne!(Os::focus(u32::MAX), FocusResult::NeedsHandOff);
-        assert_eq!(Os::focus(0), FocusResult::Failed);
+        assert_eq!(Os::focus(0), failed(FocusFailure::Gone));
     }
 
     // ── pure helpers ──
@@ -966,6 +1468,26 @@ mod tests {
         assert!(Os::launch(&l, "/tmp/Claude-X").is_err());
         assert!(Os::launch_main(&l).is_err());
         assert!(located_at(Path::new("/nowhere/Claude.app")).is_err());
+    }
+
+    #[test]
+    fn installed_copies_come_before_transient_ones() {
+        let home = Path::new("/Users/u");
+        let apps = PathBuf::from("/Applications/Claude.app");
+        let user_apps = PathBuf::from("/Users/u/Applications/Claude.app");
+        assert_eq!(order_candidates(None, home), vec![apps.clone(), user_apps.clone()]);
+        let elsewhere = PathBuf::from("/Applications/Tools/Claude.app");
+        assert_eq!(order_candidates(Some(elsewhere.clone()), home), vec![elsewhere, apps.clone(), user_apps.clone()]);
+        for transient in [
+            "/Volumes/Claude/Claude.app",
+            "/Users/u/.Trash/Claude.app",
+            "/private/var/folders/x/T/AppTranslocation/1234/d/Claude.app",
+        ] {
+            let t = PathBuf::from(transient);
+            assert!(is_transient_copy(&t), "{transient}");
+            assert_eq!(order_candidates(Some(t.clone()), home), vec![apps.clone(), user_apps.clone(), t]);
+        }
+        assert!(!is_transient_copy(Path::new("/Applications/Claude.app")));
     }
 
     #[test]
@@ -1083,6 +1605,122 @@ mod tests {
         }
         Os::close(&[pid]).expect("close");
         assert!(!Os::alive(pid) || Os::start_time(pid).is_none());
+    }
+
+    #[test]
+    fn a_tool_started_with_claudes_program_is_not_an_instance() {
+        let f = match fake::build() {
+            Ok(f) => f,
+            Err(why) => {
+                println!("skipped: {why}");
+                return;
+            }
+        };
+        let l = located_at(&f.bundle).unwrap();
+        let dir = f.data_dir("Claude-Tool");
+        std::fs::write(dir.join("spawn-tool"), b"").unwrap();
+        let dir_s = dir.to_string_lossy().into_owned();
+        let pid = Os::launch(&l, &dir_s).expect("start");
+        assert!(wait_for(10, || children_of(pid).len() >= 3), "helpers and the tool started");
+        let tool = children_of(pid)
+            .into_iter()
+            .find(|&c| Os::argv(c).is_some_and(|a| !is_helper(&a)))
+            .expect("the tool runs without --type=");
+        let listed = Os::list_claude(Some(&l));
+        assert!(listed.iter().all(|p| p.pid != tool), "the tool is not listed: {listed:?}");
+        let mine: Vec<Pid> =
+            listed.iter().filter(|p| claude_app::matches_data_dir(p, Some(&dir_s))).map(|p| p.pid).collect();
+        assert_eq!(mine, vec![pid]);
+        Os::close(&[pid]).expect("close");
+        assert!(wait_for(5, || !Os::alive(tool)), "the tool ended with its app");
+    }
+
+    /// Run `f` on a thread of its own and wait up to 60 s; None when it did not return in time
+    /// (a permission prompt nobody answers).
+    fn in_time<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> Option<R> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(60)).ok()
+    }
+
+    #[test]
+    fn reopen_reaches_only_the_targeted_instance() {
+        let f = match fake::build() {
+            Ok(f) => f,
+            Err(why) => {
+                println!("skipped: {why}");
+                return;
+            }
+        };
+        let l = located_at(&f.bundle).unwrap();
+        let dir_a = f.data_dir("Claude-ReopenA");
+        std::fs::write(dir_a.join("start-windowless"), b"").unwrap();
+        let dir_b = f.data_dir("Claude-ReopenB");
+        let pid_a = Os::launch(&l, &dir_a.to_string_lossy()).expect("start A");
+        let pid_b = Os::launch(&l, &dir_b.to_string_lossy()).expect("start B");
+        assert!(wait_for(10, || f.recorded_args(pid_a).is_some() && f.recorded_args(pid_b).is_some()));
+        // Two instances of one copy: Launch Services cannot tell them apart, so none is chosen.
+        assert_eq!(sole_instance_bundle(pid_a), None);
+
+        let sent = in_time(move || send_event_to_pid(pid_a, CORE_EVENT_CLASS, AE_REOPEN_APPLICATION, None, true));
+        match sent {
+            None => println!("Automation: the permission prompt was left open on this machine; delivery not checked"),
+            Some(Err(AeSendError::NotPermitted(code))) => {
+                println!("Automation: not allowed on this machine ({code}); delivery not checked")
+            }
+            Some(Err(e)) => panic!("reopen to A failed: {e:?}"),
+            Some(Ok(())) => {
+                println!("Automation: allowed on this machine");
+                assert!(wait_for(10, || f.recorded_reopens(pid_a) == 1), "A was asked to show itself");
+                std::thread::sleep(Duration::from_millis(500));
+                assert_eq!(f.recorded_reopens(pid_b), 0, "B was not");
+                if !super::super::window::on_screen().is_empty() {
+                    assert!(wait_for(10, || Os::main_window(pid_a).is_some()), "A opened its window");
+                }
+            }
+        }
+        let _ = Os::close(&[pid_a, pid_b]);
+    }
+
+    #[test]
+    fn focus_reopens_an_instance_without_a_window() {
+        let f = match fake::build() {
+            Ok(f) => f,
+            Err(why) => {
+                println!("skipped: {why}");
+                return;
+            }
+        };
+        if super::super::window::on_screen().is_empty() {
+            println!("skipped: no window server session");
+            return;
+        }
+        // A bundle id of its own: Launch Services reaches a running app by its id, and other tests
+        // run stand-ins with the shared one at the same time.
+        f.set_bundle_id(&format!("test.sessionmux.windowless.{}", std::process::id()));
+        let l = located_at(&f.bundle).unwrap();
+        let dir = f.data_dir("Claude-Windowless");
+        std::fs::write(dir.join("start-windowless"), b"").unwrap();
+        let dir_s = dir.to_string_lossy().into_owned();
+        let pid = Os::launch(&l, &dir_s).expect("start");
+        assert!(wait_for(10, || f.recorded_args(pid).is_some()));
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(window_state(pid), WinState::None, "the stand-in starts without a window");
+        assert_eq!(sole_instance_bundle(pid).as_deref(), Some(real_path(&f.bundle.to_string_lossy()).as_str()));
+
+        let r = in_time(move || Os::focus(pid)).expect("focus returned in time");
+        let front = front_window_owner();
+        assert!(f.recorded_reopens(pid) >= 1, "the instance was asked to show itself ({r:?})");
+        assert!(Os::main_window(pid).is_some(), "its window is on screen ({r:?})");
+        assert_eq!(r, FocusResult::Focused, "front window owner {front:?}, target {pid}");
+        // Reopening never starts another instance.
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(f.started_count(), 1, "no second instance was started");
+        let on_dir = Os::list_claude(Some(&l)).into_iter().filter(|p| claude_app::matches_data_dir(p, Some(&dir_s)));
+        assert_eq!(on_dir.count(), 1);
+        let _ = Os::close(&[pid]);
     }
 
     #[test]

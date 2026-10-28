@@ -49,7 +49,42 @@ pub enum FocusResult {
     /// The window could not be raised directly; launching the same data folder again makes
     /// Claude show it.
     NeedsHandOff,
-    Failed,
+    /// The window did not come forward, for the given reason.
+    Failed(FocusFailure),
+}
+
+/// Why a Claude window could not be brought to the front.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusFailure {
+    /// The system did not let Sessionmux bring Claude forward.
+    Refused,
+    /// Claude runs but has no window, and none could be reopened.
+    NoWindow,
+    /// The user did not allow Sessionmux to control Claude (Automation).
+    AutomationDenied,
+    /// Raising through Accessibility was needed, but the setting is off.
+    AccessibilityOff,
+    /// Raising through Accessibility was needed, but the system does not trust Sessionmux.
+    AccessibilityUntrusted,
+    /// The process ended before its window could be raised.
+    Gone,
+    /// Any other failure.
+    Other,
+}
+
+impl FocusFailure {
+    /// The reason sent to the panel with a failed open.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            FocusFailure::Refused => "focus-refused",
+            FocusFailure::NoWindow => "focus-no-window",
+            FocusFailure::AutomationDenied => "focus-automation-denied",
+            FocusFailure::AccessibilityOff => "focus-accessibility-off",
+            FocusFailure::AccessibilityUntrusted => "focus-accessibility-untrusted",
+            FocusFailure::Gone => "focus-gone",
+            FocusFailure::Other => "focus-failed",
+        }
+    }
 }
 
 /// Whether Sessionmux starts when the user logs in.
