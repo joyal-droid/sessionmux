@@ -265,7 +265,7 @@ on it.
 ### macOS (preview)
 
 The macOS app is published in pre-releases such as
-[v1.1.0-preview.2](https://github.com/joyal-droid/sessionmux/releases/tag/v1.1.0-preview.2),
+[v1.1.0-preview.3](https://github.com/joyal-droid/sessionmux/releases/tag/v1.1.0-preview.3),
 built from the `macos` branch by the same `release.yml` workflow. Each one carries
 `Sessionmux-macOS.dmg` and `Sessionmux-macOS.zip`, the same files with the version in the name,
 and `BUILDINFO-macOS.txt` (the Rust, Xcode and macOS SDK versions that built it). The release's
@@ -286,7 +286,7 @@ hashes below are what tie the download to this repository.
 2. **Attestation** (needs the [GitHub CLI](https://cli.github.com)):
 
    ```sh
-   gh attestation verify Sessionmux-macOS.dmg --repo joyal-droid/sessionmux --signer-workflow joyal-droid/sessionmux/.github/workflows/release.yml --source-ref refs/tags/v1.1.0-preview.2
+   gh attestation verify Sessionmux-macOS.dmg --repo joyal-droid/sessionmux --signer-workflow joyal-droid/sessionmux/.github/workflows/release.yml --source-ref refs/tags/v1.1.0-preview.3
    ```
 
    The same works for the zip and the versioned names.
@@ -305,8 +305,8 @@ hashes below are what tie the download to this repository.
    ```sh
    git clone https://github.com/joyal-droid/sessionmux
    cd sessionmux
-   git checkout v1.1.0-preview.2
-   sh scripts/bundle-macos.sh 1.1.0-preview.2 dist-macos
+   git checkout v1.1.0-preview.3
+   sh scripts/bundle-macos.sh 1.1.0-preview.3 dist-macos
    shasum -a 256 dist-macos/Sessionmux.app/Contents/MacOS/Sessionmux
    ```
 

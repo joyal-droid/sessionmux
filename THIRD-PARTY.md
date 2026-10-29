@@ -2,7 +2,7 @@
 
 Sessionmux is licensed under the Common Public Attribution License 1.0 (CPAL-1.0, see
 `LICENSE`). It is built with the open-source components listed below, each under its own
-license. Versions are taken from `Cargo.lock` of Sessionmux 1.1.0-preview.2. The MIT and Apache
+license. Versions are taken from `Cargo.lock` of Sessionmux 1.1.0-preview.3. The MIT and Apache
 licenses require that their copyright and license notices accompany copies of the software,
 which is what this file is for.
 
@@ -426,7 +426,7 @@ END OF TERMS AND CONDITIONS
 
 ## Keeping this file current
 
-Versions above match `Cargo.lock` for Sessionmux 1.1.0-preview.2. After any dependency change,
+Versions above match `Cargo.lock` for Sessionmux 1.1.0-preview.3. After any dependency change,
 regenerate the crate list and compare:
 
 ```powershell

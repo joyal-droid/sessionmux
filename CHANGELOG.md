@@ -6,6 +6,11 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [1.1.0-preview.3] - 2026-10-29
+
+The third macOS preview, a GitHub pre-release built from the `macos` branch, with a Windows
+installer of the same code.
+
 ### Added
 
 - A click on an account whose Claude window is in front (in the panel, on the floating button or
@@ -103,6 +108,7 @@ First public release: a multi-account switcher for Claude Desktop on Windows.
   non-affiliation notice.
 
 [Unreleased]: https://github.com/joyal-droid/sessionmux/compare/v1.0.0...HEAD
+[1.1.0-preview.3]: https://github.com/joyal-droid/sessionmux/releases/tag/v1.1.0-preview.3
 [1.1.0-preview.2]: https://github.com/joyal-droid/sessionmux/releases/tag/v1.1.0-preview.2
 [1.1.0-preview.1]: https://github.com/joyal-droid/sessionmux/releases/tag/v1.1.0-preview.1
 [1.0.0]: https://github.com/joyal-droid/sessionmux/releases/tag/v1.0.0
