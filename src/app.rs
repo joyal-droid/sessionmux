@@ -1948,7 +1948,10 @@ fn transfer_session(id: u64, opts: &Value) -> UResult<()> {
             if cowork {
                 // Claude itself owns a Cowork session while it runs.
                 from_s.running = procs.iter().any(|p| claude_app::matches_data_dir(p, from_dir.as_deref()));
-                sessions.transfer_cowork(&from_s, &to_s, &session_id, &mode)
+                let still_open = || {
+                    claude_app::list_processes().iter().any(|p| claude_app::matches_data_dir(p, from_dir.as_deref()))
+                };
+                sessions.transfer_cowork_checked(&from_s, &to_s, &session_id, &mode, &still_open)
             } else {
                 sessions.transfer(&from_s, &to_s, &session_id, &mode)
             }

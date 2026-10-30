@@ -99,12 +99,17 @@ fn record_files_in(dir: &Path) -> Vec<(PathBuf, String)> {
     out
 }
 
-/// Every record of every `<acct>/<org>` folder of the account (the `agent/` folders are not
-/// looked into).
+/// Every record of the account's `<acct>/<org>` folders: the signed-in account's folder (short or
+/// full name) when it is known, as that is the only one Claude loads, otherwise every account
+/// folder. The `agent/` folders are not looked into.
 fn records(a: &SessionAccount) -> Vec<CoworkRecord> {
     let base = root(a);
+    let mut accts = list_dirs(&base);
+    if let Some(u) = Sessions::account_uuid_of(a) {
+        accts.retain(|d| d.eq_ignore_ascii_case(&u) || d.eq_ignore_ascii_case(short(&u)));
+    }
     let mut out = Vec::new();
-    for acct in list_dirs(&base) {
+    for acct in accts {
         for org in list_dirs(&base.join(&acct)) {
             let dir = base.join(&acct).join(&org);
             for (file, session_id) in record_files_in(&dir) {
@@ -152,8 +157,12 @@ fn find_transcript(folder: &Path, cli: &str) -> Option<PathBuf> {
     dirs.into_iter().map(|d| projects.join(d).join(&file)).find(|p| p.is_file())
 }
 
+/// The record's `cliSessionId` when it is a lower-case uuid, as Claude requires; any other value
+/// is ignored, so it never becomes part of a path.
 fn cli_of(rec: &OVal) -> Option<String> {
-    rec.get_str("cliSessionId").filter(|c| !c.is_empty()).map(String::from)
+    rec.get_str("cliSessionId")
+        .filter(|c| uuid::Uuid::parse_str(c).map(|u| u.hyphenated().to_string() == *c).unwrap_or(false))
+        .map(String::from)
 }
 
 /// Cowork sessions of an account (unsorted). A record that does not parse is skipped.
@@ -340,8 +349,8 @@ fn copy_key(next: &mut OVal, rec: &OVal, key: &str) {
 }
 
 impl Sessions {
-    /// Copy or move a Cowork session to another account. Anything created is removed again if
-    /// a later step fails.
+    /// [`Self::transfer_cowork_checked`] going by `from.running` alone.
+    #[cfg(test)]
     pub fn transfer_cowork(
         &self,
         from: &SessionAccount,
@@ -349,8 +358,22 @@ impl Sessions {
         session_id: &str,
         mode: &str,
     ) -> TransferResult {
+        self.transfer_cowork_checked(from, to, session_id, mode, &|| false)
+    }
+
+    /// Copy or move a Cowork session to another account. Anything created is removed again if
+    /// a later step fails. A move asks `source_open` again right before it removes the source, for
+    /// a Claude that was opened for the source account while the files were copied.
+    pub fn transfer_cowork_checked(
+        &self,
+        from: &SessionAccount,
+        to: &SessionAccount,
+        session_id: &str,
+        mode: &str,
+        source_open: &dyn Fn() -> bool,
+    ) -> TransferResult {
         let mut created: Vec<PathBuf> = Vec::new();
-        match transfer_inner(from, to, session_id, mode, &mut created) {
+        match transfer_inner(from, to, session_id, mode, source_open, &mut created) {
             Ok(r) => r,
             Err(e) => {
                 log::error(&format!("sessions: Cowork transfer failed: {e}"));
@@ -395,6 +418,7 @@ fn transfer_inner(
     to: &SessionAccount,
     session_id: &str,
     mode: &str,
+    source_open: &dyn Fn() -> bool,
     created: &mut Vec<PathBuf>,
 ) -> Result<TransferResult, String> {
     if mode != "copy" && mode != "move" {
@@ -445,7 +469,7 @@ fn transfer_inner(
     // 4. Transcript (and its sibling folder), outputs and uploads.
     let mut warnings: Vec<String> = Vec::new();
     let mut skipped = 0usize;
-    let cli = cli_of(&record);
+    let mut cli = cli_of(&record);
     let transcript = cli.as_deref().and_then(|c| find_transcript(&src_folder, c));
     match (cli.as_deref(), transcript.as_deref().and_then(read_snapshot)) {
         (Some(c), Some(bytes)) => {
@@ -457,7 +481,11 @@ fn transfer_inner(
                 skipped += copy_dir(&sib, &dst_dir.join(c), false).map_err(|e| e.to_string())?;
             }
         }
-        _ => warnings.push("no-transcript".into()),
+        _ => {
+            // Without a transcript the copy opens as a fresh conversation that keeps the files.
+            cli = None;
+            warnings.push("no-transcript".into());
+        }
     }
     for sub in ["outputs", "uploads"] {
         let s = src_folder.join(sub);
@@ -514,7 +542,7 @@ fn transfer_inner(
 
     // 6. Move: remove the source only when its Claude is closed (an open one keeps it in memory
     // and would write it again).
-    let source_running = from.running;
+    let source_running = from.running || (mode == "move" && source_open());
     if mode == "move" {
         created.clear(); // past the point of no return; keep the copy.
         if source_running {
@@ -922,6 +950,81 @@ mod tests {
         assert_eq!(e.api.transfer_cowork(&e.a, &e.b, "local_nope", "copy").reason.as_deref(), Some("not-found"));
         assert_eq!(e.api.transfer_cowork(&e.a, &e.a, &id1(), "move").reason.as_deref(), Some("same-account"));
         assert!(!e.api.transfer_cowork(&e.a, &e.b, "../x", "copy").ok);
+    }
+
+    #[test]
+    fn records_of_other_signed_in_accounts_are_not_listed() {
+        let e = setup();
+        let other = e.dir_a.join(ROOT).join("eeeeeeee").join(short(ORG_A));
+        write_json(
+            &other.join("local_e1e1e1e1-0000-4000-8000-000000000000.json"),
+            &json!({"sessionId": "local_e1e1e1e1-0000-4000-8000-000000000000", "title": "Earlier account"}),
+        );
+        let titles: Vec<String> = e.api.list_all(&e.a).into_iter().map(|s| s.title).collect();
+        assert_eq!(titles, ["Quick chat", "Research notes"]);
+        // Without a known account every account folder is listed.
+        let unknown = SessionAccount { account_uuid: None, data_dir: s(&e.dir_a), ..e.a.clone() };
+        fs::remove_file(e.dir_a.join("config.json")).unwrap();
+        assert_eq!(e.api.list_all(&unknown).len(), 3);
+    }
+
+    #[test]
+    fn cli_session_id_that_is_not_a_uuid_is_never_used_as_a_path() {
+        let e = setup();
+        let rec = e.rec_a.join(format!("{}.json", id1()));
+        // Where "../../../../../x" points from the session's projects/session folder.
+        fs::write(e.dir_a.join(ROOT).join(short(ACCT_A)).join("x.jsonl"), "secret").unwrap();
+        let outside = e.dir_a.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("evil.jsonl"), "secret").unwrap();
+        let abs = s(&outside.join("evil"));
+        for bad in ["../../../../../x".to_string(), abs, CLI1.to_uppercase()] {
+            let mut v = read_json(&rec);
+            v["cliSessionId"] = json!(bad);
+            write_json(&rec, &v);
+            let listed = e.api.list_all(&e.a).into_iter().find(|s| s.session_id == id1()).unwrap();
+            assert_eq!(listed.cli_session_id, "", "{bad}");
+            assert!(!listed.has_transcript, "{bad}");
+
+            let r = e.api.transfer_cowork(&e.a, &e.b, &id1(), "copy");
+            assert!(r.ok, "{r:?}");
+            assert_eq!(r.warnings, ["no-transcript"], "{bad}");
+            let nid = r.new_session_id.unwrap();
+            let out = read_json(&rec_b(&e).join(format!("{nid}.json")));
+            assert!(out.get("cliSessionId").is_none(), "{bad}");
+            let folder = rec_b(&e).join(&nid["local_".len().."local_".len() + 8]);
+            assert!(!folder.join(".claude").exists(), "{bad}");
+        }
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1, "nothing written next to the planted file");
+        assert!(!e.dir_b.join("x.jsonl").exists());
+        assert!(!e.dir_b.join(ROOT).join(ACCT_B).join("x.jsonl").exists());
+    }
+
+    #[test]
+    fn copy_without_transcript_opens_as_a_fresh_session() {
+        let e = setup();
+        fs::remove_dir_all(e.folder1.join(".claude").join("projects")).unwrap();
+        let r = e.api.transfer_cowork(&e.a, &e.b, &id1(), "copy");
+        assert!(r.ok, "{r:?}");
+        assert_eq!(r.warnings, ["no-transcript"]);
+        let nid = r.new_session_id.unwrap();
+        let rec = read_json(&rec_b(&e).join(format!("{nid}.json")));
+        assert!(rec.get("cliSessionId").is_none());
+        assert!(rec_b(&e).join(&nid["local_".len().."local_".len() + 8]).join("outputs").join("report.md").exists());
+    }
+
+    #[test]
+    fn move_keeps_source_when_claude_opens_during_the_copy() {
+        let e = setup();
+        let r = e.api.transfer_cowork_checked(&e.a, &e.b, &id1(), "move", &|| true);
+        assert!(r.ok, "{r:?}");
+        assert!(r.source_running);
+        assert_eq!(r.warnings, ["source-left-open"]);
+        assert!(e.rec_a.join(format!("{}.json", id1())).exists());
+        assert!(e.folder1.exists());
+        // A copy never asks.
+        let r = e.api.transfer_cowork_checked(&e.a, &e.b, &id1(), "copy", &|| panic!("asked"));
+        assert!(r.ok && !r.source_running, "{r:?}");
     }
 
     #[test]
