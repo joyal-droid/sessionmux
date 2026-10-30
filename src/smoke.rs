@@ -48,7 +48,8 @@
 //! this process (`paths::set_folders`; the environment of child processes is unchanged), and
 //! Claude Desktop discovery returns a fixed demo installation with no running processes. The store holds the accounts Work (the Main profile),
 //! Personal and Client with the dark theme; Work has two Code sessions with transcripts, the
-//! first of them waiting for a permission, and Client has hit its session limit. Two approve
+//! first of them waiting for a permission, and two Cowork sessions, and Client has hit its
+//! session limit. Two approve
 //! requests (with no hook helper behind them) are added before the approvals capture. The
 //! sign-in notice is always captured in this mode.
 //!
@@ -305,6 +306,25 @@ const DEMO_SESSIONS: [(&str, &str, &str, &str, &str, u64); 2] = [
     ),
 ];
 
+/// Demo Cowork sessions of the Work account: (record id, CLI session id, title, selected folder
+/// (empty for none), minutes since the last activity).
+const DEMO_COWORK_SESSIONS: [(&str, &str, &str, &str, u64); 2] = [
+    (
+        "local_5fa06172-93a4-4eb5-8f26-e7f8091a2b3c",
+        "6a1b7283-a4b5-4fc6-9037-f8091a2b3c4d",
+        "Competitor pricing research",
+        "market-research",
+        52,
+    ),
+    (
+        "local_7c2d8394-b5c6-4d07-a148-091a2b3c4d5e",
+        "8d3e94a5-c6d7-4e18-b259-1a2b3c4d5e6f",
+        "Offsite agenda",
+        "",
+        3 * 24 * 60,
+    ),
+];
+
 fn mkdir(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
@@ -375,6 +395,33 @@ fn seed_fixture(user_data: &Path) -> Result<(), String> {
             "message": { "role": "user", "content": title },
         });
         write_text(&transcript, &format!("{line}\n"))?;
+    }
+    let cowork = work_dir.join("local-agent-mode-sessions").join(DEMO_WORK_UUID).join(DEMO_ORG_UUID);
+    for (i, (id, cli, title, folder, minutes)) in DEMO_COWORK_SESSIONS.into_iter().enumerate() {
+        let session_dir = cowork.join(&id["local_".len().."local_".len() + 8]);
+        let selected: Vec<String> = if folder.is_empty() { Vec::new() } else { vec![s(&projects.join(folder))] };
+        for f in &selected {
+            mkdir(Path::new(f))?;
+        }
+        let last = now_ms.saturating_sub(minutes * 60_000);
+        let name = ["calm-swift-heron", "keen-sunny-maple"][i % 2];
+        write_json(
+            &cowork.join(format!("{id}.json")),
+            &json!({
+                "sessionId": id, "cliSessionId": cli, "processName": name, "vmProcessName": name,
+                "cwd": s(&session_dir.join("outputs")), "hostLoopMode": true, "title": title,
+                "createdAt": last.saturating_sub(30 * 60_000), "lastActivityAt": last, "isArchived": false,
+                "userSelectedFolders": selected, "folderMountNames": {}, "resolvedFolderKinds": [],
+                "pendingNotifications": [],
+            }),
+        )?;
+        let line = json!({
+            "type": "user", "sessionId": cli, "timestamp": crate::util::date::iso_now(),
+            "message": { "role": "user", "content": title },
+        });
+        let transcript = session_dir.join(".claude").join("projects").join("session").join(format!("{cli}.jsonl"));
+        write_text(&transcript, &format!("{line}\n"))?;
+        mkdir(&session_dir.join("outputs"))?;
     }
 
     write_json(

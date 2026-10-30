@@ -141,8 +141,8 @@ to do what you ask**:
 
 - each account's Claude data folder, to tell whether it is signed in (Sessionmux reads the
   account id and checks that a sign-in entry exists; it never uses, copies or sends your
-  sign-in tokens), to count and list its Code sessions, and to copy MCP server settings
-  when you turn that on;
+  sign-in tokens), to count and list its Code and Cowork sessions, to move, copy or delete a
+  Cowork session when you ask, and to copy MCP server settings when you turn that on;
 - `%USERPROFILE%\.claude\` (`~/.claude/` on macOS: Claude Code's session state and transcripts), to show which
   sessions are running, to move, copy or hand over a session when you ask, and to look for a
   limit message in the last 64 KB of an open session's transcript;

@@ -66,7 +66,8 @@ said in brackets.
 - **Move or copy Claude Code sessions between accounts** on the Sessions tab, with the transcript,
   the scratch folder and the project memory, even while the session's tab is open in Claude. A
   closed session's original is removed only after the copy succeeded; the original of a session
-  that is still open stays open in its account until you close it there.
+  that is still open stays open in its account until you close it there. Cowork sessions move and
+  copy too, and **All · Code · Cowork** shows one kind or both.
 - **Hand over a session** to another account, from a session's **…** menu or automatically when
   an account hits its plan limit: Sessionmux copies the session to the next signed-in account that
   is not limited and opens that account's Claude window if it is closed. An open window is never
@@ -348,12 +349,22 @@ only your user can open. Details: [docs/architecture.md](docs/architecture.md).
 
 ## Sessions
 
-The **Sessions** tab lists the Code-tab sessions of each account, with a **Running** badge on the
-ones that are open in Claude.
+The **Sessions** tab lists the Code-tab and Cowork sessions of each account, with a **Running**
+badge on the Code sessions that are open in Claude. Each row says **Code** or **Cowork**, and
+**All · Code · Cowork** above the search box shows one kind or both; the search applies within
+that choice.
 
 - **Move to and Copy to** copy the session record with new internal IDs, its transcript, its
   scratch folder and the project memory to another account. The target account must be signed in
   and have opened the Code tab once; restart its Claude window to see the session there.
+- **Cowork sessions** move and copy the same way: Sessionmux writes a new session in the target
+  account with the conversation, its outputs and its uploads, the way Claude does when it imports
+  a session itself. Settings tied to the source account (projects, connectors, scheduled tasks)
+  stay behind, and scheduled or dispatched Cowork tasks are not listed. The target account must
+  have used Code or Cowork once. Claude reads Cowork sessions when it starts, so a copy shows in
+  the target after its Claude is restarted, and a move out of an account whose Claude is open
+  leaves the original there until you quit Claude and delete it. Deleting a Cowork session needs
+  that account's Claude closed.
 - **Even while the tab is open.** Copy and move also work on a session that is open in Claude.
   Sessionmux copies it as it is at that moment, so anything Claude is still writing will not be in
   the copy. When you move an open session, the original stays open in its account (Claude still

@@ -6,6 +6,15 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- The Sessions tab lists Cowork sessions next to Code sessions. Each row is marked **Code** or
+  **Cowork**, and **All · Code · Cowork** above the search box filters the list.
+- Cowork sessions can be moved, copied and deleted like Code sessions: the conversation, outputs
+  and uploads go to a new session in the other account, without the settings that belong to the
+  source account. The copy shows after the target's Claude is restarted; a move out of an account
+  whose Claude is open leaves the original there.
+
 ## [1.1.0-preview.3] - 2026-10-29
 
 The third macOS preview, a GitHub pre-release built from the `macos` branch, with a Windows
