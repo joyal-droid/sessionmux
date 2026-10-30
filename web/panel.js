@@ -270,14 +270,16 @@ function hotkeyParts(accel, mac) {
  * Turn a transferSession() result into toast content.
  * Returns { kind: 'success'|'warn'|'error', title, body }.
  */
-function transferMessage(res, mode, targetName, sourceName) {
+function transferMessage(res, mode, targetName, sourceName, kind) {
   const verb = mode === 'move' ? 'Moved' : 'Copied';
   if (res && res.ok) {
     const notes = [];
     const warnings = Array.isArray(res.warnings) ? res.warnings : [];
     const sourceOpen = sourceRunning(res);
     const source = sourceName || 'the other account';
-    if (mode === 'move' && sourceOpen) notes.push('The original is still open in ' + source + '; close it there when you are done.');
+    if (mode === 'move' && sourceOpen && kind === 'cowork') {
+      notes.push('The original stays in ' + source + " because its Claude is open; quit Claude and delete it there if you no longer need it.");
+    } else if (mode === 'move' && sourceOpen) notes.push('The original is still open in ' + source + '; close it there when you are done.');
     else if (sourceOpen) notes.push('It was copied as it was just now; anything Claude was still writing is not in the copy.');
     if (res.targetRunning) notes.push('Restart ' + targetName + "'s Claude window to see it.");
     if (warnings.includes('folder-not-removed')) notes.push("The original session folder couldn't be removed.");
@@ -2373,7 +2375,7 @@ function initPanel() {
     renderSessions();
     const res = await call('transferSession', { fromId: from.id, toId: to.id, sessionId: s.sessionId, mode, kind });
     state.busySessions.delete(s.sessionId);
-    const msg = transferMessage(res || { ok: false, error: 'No response from Sessionmux.' }, mode, to.name, from.name);
+    const msg = transferMessage(res || { ok: false, error: 'No response from Sessionmux.' }, mode, to.name, from.name, kind);
     toast(msg.kind, msg.title, msg.body);
     state.sessions.delete(to.id); // target list is stale now
     await loadSessions(from.id, { quiet: true });
