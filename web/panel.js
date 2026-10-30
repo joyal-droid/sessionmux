@@ -171,6 +171,19 @@ function validateName(name, accounts, excludeId) {
   return '';
 }
 
+/** Session kinds of the Sessions tab filter, in display order: [value, label]. */
+const SESSION_KINDS = [['all', 'All'], ['code', 'Code'], ['cowork', 'Cowork']];
+
+/** The kind of a listed session: 'cowork', or 'code' for anything else. */
+function sessionKind(session) {
+  return session && session.kind === 'cowork' ? 'cowork' : 'code';
+}
+
+/** Whether a session passes the kind filter ('all', 'code' or 'cowork'). */
+function matchesKind(session, kind) {
+  return kind !== 'code' && kind !== 'cowork' ? true : sessionKind(session) === kind;
+}
+
 /** Case-insensitive match of a session against a search query (title or cwd). */
 function matchesQuery(session, query) {
   const q = String(query || '').trim().toLowerCase();
@@ -267,6 +280,7 @@ function transferMessage(res, mode, targetName, sourceName) {
     if (mode === 'move' && sourceOpen) notes.push('The original is still open in ' + source + '; close it there when you are done.');
     else if (sourceOpen) notes.push('It was copied as it was just now; anything Claude was still writing is not in the copy.');
     if (res.targetRunning) notes.push('Restart ' + targetName + "'s Claude window to see it.");
+    if (warnings.includes('folder-not-removed')) notes.push("The original session folder couldn't be removed.");
     if (warnings.includes('no-transcript')) notes.push('No transcript was found, so only the session entry came across.');
     if (warnings.includes('source-not-removed')) notes.push('The original entry could not be removed; delete it by hand if you no longer need it.');
     if (warnings.includes('scratch-not-removed')) notes.push("The original scratch folder couldn't be removed.");
@@ -289,6 +303,13 @@ function transferMessage(res, mode, targetName, sourceName) {
       kind: 'error',
       title: targetName + " hasn't used Code yet",
       body: 'Open the Code tab in ' + targetName + "'s Claude window once, then try again.",
+    };
+  }
+  if (reason === 'target-never-opened') {
+    return {
+      kind: 'error',
+      title: targetName + " hasn't used Code or Cowork yet",
+      body: 'Open Code or Cowork in ' + targetName + "'s Claude window once, then try again.",
     };
   }
   return {
@@ -565,6 +586,7 @@ function initPanel() {
     activeId: null,
     settings: null,
     sessionsAccountId: null,
+    sessionKind: 'all',        // Sessions tab filter: 'all' | 'code' | 'cowork'
     sessions: new Map(),       // accountId → { list, loading, error, loadedAt }
     search: '',
     editingId: null,           // account whose inline edit form is open
@@ -1890,6 +1912,7 @@ function initPanel() {
    * ==================================================================== */
 
   const chipsEl = $('sessionChips');
+  const kindsEl = $('sessionKinds');
   const sessionList = $('sessionList');
   const searchInput = $('sessionSearch');
   const btnRefresh = $('btnRefreshSessions');
@@ -1910,7 +1933,7 @@ function initPanel() {
       for (const a of state.accounts) {
         const on = a.id === state.sessionsAccountId;
         const count = state.sessions.has(a.id) && Array.isArray(state.sessions.get(a.id).list)
-          ? state.sessions.get(a.id).list.length
+          ? state.sessions.get(a.id).list.filter((s) => matchesKind(s, state.sessionKind)).length
           : Number(a.sessionCount) || 0;
         chipsEl.appendChild(h('button', {
           class: 'chip', type: 'button', tabIndex: on ? 0 : -1,
@@ -1941,6 +1964,53 @@ function initPanel() {
       e.preventDefault();
       selectSessionAccount(chips[n].dataset.id);
       const again = chipsEl.querySelector('[data-id="' + CSS.escape(chips[n].dataset.id) + '"]');
+      if (again) again.focus();
+    }
+  });
+
+  /** The All · Code · Cowork filter, with the number of sessions of each kind once loaded. */
+  function renderKinds() {
+    const acct = accountById(state.sessionsAccountId);
+    const entry = acct ? state.sessions.get(acct.id) : null;
+    const list = entry && Array.isArray(entry.list) ? entry.list : null;
+    withFocusKept(() => {
+      kindsEl.textContent = '';
+      for (const [val, label] of SESSION_KINDS) {
+        const on = val === state.sessionKind;
+        const n = list ? list.filter((s) => matchesKind(s, val)).length : null;
+        kindsEl.appendChild(h('button', {
+          class: 'segmented__opt' + (on ? ' is-active' : ''), type: 'button', tabIndex: on ? 0 : -1,
+          dataset: { key: 'kind-' + val, val },
+          attrs: { role: 'radio', 'aria-checked': on ? 'true' : 'false', 'aria-label': n === null ? label : label + ', ' + plural(n, 'session') },
+          on: { click: () => selectSessionKind(val) },
+        }, h('span', { text: label }), n === null ? null : h('span', { class: 'segmented__count', text: String(n), attrs: { 'aria-hidden': 'true' } })));
+      }
+    });
+  }
+
+  function selectSessionKind(val) {
+    if (state.sessionKind === val) return;
+    closeMenu(false);
+    state.sessionKind = val;
+    $('sessionsScroll').scrollTop = 0;
+    renderSessions();
+    renderChips();
+  }
+
+  kindsEl.addEventListener('keydown', (e) => {
+    const opts = Array.from(kindsEl.querySelectorAll('.segmented__opt'));
+    const i = opts.indexOf(document.activeElement);
+    if (i < 0) return;
+    let n = -1;
+    if (e.key === 'ArrowRight') n = (i + 1) % opts.length;
+    else if (e.key === 'ArrowLeft') n = (i - 1 + opts.length) % opts.length;
+    else if (e.key === 'Home') n = 0;
+    else if (e.key === 'End') n = opts.length - 1;
+    if (n >= 0 && n !== i) {
+      e.preventDefault();
+      const val = opts[n].dataset.val;
+      selectSessionKind(val);
+      const again = kindsEl.querySelector('[data-val="' + CSS.escape(val) + '"]');
       if (again) again.focus();
     }
   });
@@ -1984,13 +2054,14 @@ function initPanel() {
   function renderSessions() {
     const acct = accountById(state.sessionsAccountId);
     const entry = acct ? state.sessions.get(acct.id) : null;
+    renderKinds();
 
     withFocusKept(() => {
       sessionList.textContent = '';
       sessionList.setAttribute('aria-busy', entry && entry.loading && !entry.list ? 'true' : 'false');
 
       if (!acct) {
-        sessionList.appendChild(h('li', null, emptyState('user', 'No account selected', 'Pick an account above to see its Code sessions.')));
+        sessionList.appendChild(h('li', null, emptyState('user', 'No account selected', 'Pick an account above to see its Code and Cowork sessions.')));
         return;
       }
       if (!entry || (entry.loading && !entry.list)) {
@@ -2010,13 +2081,20 @@ function initPanel() {
       if (all.length === 0) {
         const neverSignedIn = !acct.accountUuid;
         sessionList.appendChild(h('li', null, neverSignedIn
-          ? emptyState('user', acct.name + " isn't signed in yet", 'Open its Claude window and sign in, then start a Code session.',
+          ? emptyState('user', acct.name + " isn't signed in yet", 'Open its Claude window and sign in, then start a Code or Cowork session.',
             { label: 'Open ' + acct.name, onClick: () => openAccount(acct.id) })
-          : emptyState('inbox', 'No Code sessions yet', 'Sessions you start in ' + acct.name + "'s Code tab will show up here.")));
+          : emptyState('inbox', 'No sessions yet', 'Sessions you start in ' + acct.name + "'s Code and Cowork tabs will show up here.")));
+        return;
+      }
+      const ofKind = all.filter((s) => matchesKind(s, state.sessionKind));
+      if (ofKind.length === 0) {
+        const label = state.sessionKind === 'cowork' ? 'Cowork' : 'Code';
+        sessionList.appendChild(h('li', null, emptyState('inbox', 'No ' + label + ' sessions', acct.name + ' has no ' + label + ' sessions yet.',
+          { label: 'Show all', onClick: () => selectSessionKind('all') })));
         return;
       }
       // Archived sessions sink to the bottom; otherwise keep the app's order (most recent first).
-      const shown = all.filter((s) => matchesQuery(s, state.search))
+      const shown = ofKind.filter((s) => matchesQuery(s, state.search))
         .map((s, i) => ({ s, i }))
         .sort((x, y) => (x.s.isArchived ? 1 : 0) - (y.s.isArchived ? 1 : 0) || x.i - y.i)
         .map((x) => x.s);
@@ -2035,7 +2113,10 @@ function initPanel() {
     const title = s.title && String(s.title).trim() ? String(s.title) : 'Untitled session';
     const leaf = cwdLeaf(s.cwd);
     const model = modelLabel(s.model);
-    const keyBase = 'sess-' + s.sessionId;
+    const kind = sessionKind(s);
+    const keyBase = 'sess-' + kind + '-' + s.sessionId;
+    // A Cowork session belongs to its account's Claude while that is open.
+    const openText = kind === 'cowork' ? 'Quit ' + acct.name + "'s Claude before deleting it" : 'Close the session in Claude before deleting it';
 
     // A running session can be copied or moved: it is copied as it is now (see transfer()).
     const blockReason = others.length === 0 ? 'Add another account first.' : null;
@@ -2065,9 +2146,10 @@ function initPanel() {
 
     const li = h('li', {
       class: 'sess' + (s.isArchived ? ' is-archived' : '') + (busy ? ' is-busy' : ''),
-      dataset: { id: s.sessionId },
+      dataset: { id: s.sessionId, kind },
       attrs: {
-        'aria-label': title + (waitText ? ', ' + waitText.toLowerCase() : '') + (s.running ? ', running' : '') +
+        'aria-label': title + ', ' + (kind === 'cowork' ? 'Cowork' : 'Code') + ' session' +
+          (waitText ? ', ' + waitText.toLowerCase() : '') + (s.running && kind === 'code' ? ', running' : '') +
           (s.isArchived ? ', archived' : ''),
       },
     },
@@ -2078,10 +2160,15 @@ function initPanel() {
         text: waitText,
         title: waitKind === 'permission' ? 'Claude is waiting for your approval' : 'Claude is waiting for you',
       }) : null,
-      s.running ? h('span', { class: 'badge badge--success', text: 'running' }) : null,
+      s.running && kind === 'code' ? h('span', { class: 'badge badge--success', text: 'running' }) : null,
       s.isScratch ? h('span', { class: 'badge', text: 'scratch', title: 'Started without a project folder' }) : null,
       s.isArchived ? h('span', { class: 'badge', text: 'archived' }) : null,
-      s.hasTranscript === false ? h('span', { class: 'badge badge--warn', text: 'no transcript', title: 'No transcript file was found for this session' }) : null),
+      s.hasTranscript === false ? h('span', { class: 'badge badge--warn', text: 'no transcript', title: 'No transcript file was found for this session' }) : null,
+      h('span', {
+        class: 'badge badge--kind badge--' + kind,
+        text: kind === 'cowork' ? 'Cowork' : 'Code',
+        title: kind === 'cowork' ? 'Cowork session' : 'Code session',
+      })),
     h('div', { class: 'sess__meta' },
       leaf ? h('span', { class: 'sess__cwd', title: s.cwd }, icon('folder'), h('span', { class: 'sess__cwd-text', text: leaf })) : null,
       leaf ? h('span', { class: 'sep', text: '·', attrs: { 'aria-hidden': 'true' } }) : null,
@@ -2102,14 +2189,14 @@ function initPanel() {
         attrs: { 'aria-label': 'Show folder of ' + title },
         on: {
           click: async () => {
-            const res = await call('openSessionFolder', acct.id, s.sessionId);
+            const res = await call('openSessionFolder', acct.id, s.sessionId, kind);
             if (res && res.ok === false) toast('error', "Couldn't show the folder", res.error || '');
           },
         },
       }, icon('folder')),
       h('button', {
         class: 'icon-btn icon-btn--sm icon-btn--danger', type: 'button',
-        title: s.running ? 'Close the session in Claude before deleting it' : 'Delete session',
+        title: s.running ? openText : 'Delete session',
         disabled: !!s.running,
         dataset: { key: keyBase + '-delete' },
         attrs: { 'aria-label': 'Delete ' + title },
@@ -2141,6 +2228,9 @@ function initPanel() {
     if (!anchor) return;
     li.classList.add('has-open-menu');
     toggleMenu(anchor, () => {
+      if (sessionKind(s) === 'cowork') {
+        return [{ label: 'Hand over…', icon: 'move', hint: 'Code sessions only', disabled: true, onSelect: () => {} }];
+      }
       const target = handoverTarget(state.accounts, acct.id);
       let hint = null;
       if (target) hint = 'To ' + target.name;
@@ -2246,7 +2336,7 @@ function initPanel() {
       if (!t.accountUuid) {
         disabled = true;
         hint = 'Not signed in yet — open it and sign in first';
-      } else if (t.codeReady === false) {
+      } else if (t.codeReady === false && sessionKind(s) === 'code') {
         disabled = true;
         hint = "Hasn't opened the Code tab yet — open it once in Claude";
       } else if (t.limited) {
@@ -2262,20 +2352,26 @@ function initPanel() {
 
   async function transfer(from, s, to, mode) {
     const title = s.title && String(s.title).trim() ? String(s.title) : 'Untitled session';
+    const kind = sessionKind(s);
     if (mode === 'move') {
+      let body = '“' + title + '” will move from ' + from.name + ' to ' + to.name + '. The original entry is removed after the copy succeeds.';
+      if (s.running && kind === 'cowork') {
+        body = '“' + title + '” will move from ' + from.name + ' to ' + to.name + '.\n' + from.name +
+          "'s Claude is open, so Sessionmux copies the session as it is now and leaves the original there. Quit Claude and delete it if you no longer need it.";
+      } else if (s.running) {
+        body = '“' + title + '” will move from ' + from.name + ' to ' + to.name + '.\nThe session is open in ' + from.name +
+          '. Sessionmux copies it as it is now; the original stays open there until you close it. Anything Claude is still writing will not be in the copy.';
+      }
       const r = await confirmDialog({
         title: 'Move to ' + to.name + '?',
-        body: s.running
-          ? '“' + title + '” will move from ' + from.name + ' to ' + to.name + '.\nThe session is open in ' + from.name +
-            '. Sessionmux copies it as it is now; the original stays open there until you close it. Anything Claude is still writing will not be in the copy.'
-          : '“' + title + '” will move from ' + from.name + ' to ' + to.name + '. The original entry is removed after the copy succeeds.',
+        body,
         okLabel: 'Move',
       });
       if (!r.confirmed) return;
     }
     state.busySessions.add(s.sessionId);
     renderSessions();
-    const res = await call('transferSession', { fromId: from.id, toId: to.id, sessionId: s.sessionId, mode });
+    const res = await call('transferSession', { fromId: from.id, toId: to.id, sessionId: s.sessionId, mode, kind });
     state.busySessions.delete(s.sessionId);
     const msg = transferMessage(res || { ok: false, error: 'No response from Sessionmux.' }, mode, to.name, from.name);
     toast(msg.kind, msg.title, msg.body);
@@ -2285,16 +2381,19 @@ function initPanel() {
   }
 
   async function deleteSession(acct, s, title) {
+    const cowork = sessionKind(s) === 'cowork';
     const r = await confirmDialog({
       title: 'Delete session?',
-      body: '“' + title + '” will be removed from ' + acct.name + '.\nThe transcript in your .claude folder stays on disk.',
+      body: '“' + title + '” will be removed from ' + acct.name + '.\n' + (cowork
+        ? "Its files in Claude's data folder stay on disk."
+        : 'The transcript in your .claude folder stays on disk.'),
       okLabel: 'Delete',
       danger: true,
     });
     if (!r.confirmed) return;
     state.busySessions.add(s.sessionId);
     renderSessions();
-    const res = await call('deleteSession', acct.id, s.sessionId);
+    const res = await call('deleteSession', acct.id, s.sessionId, sessionKind(s));
     state.busySessions.delete(s.sessionId);
     if (res && res.ok === false) toast('error', "Couldn't delete session", res.error);
     else toast('success', 'Session deleted');

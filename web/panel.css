@@ -875,6 +875,11 @@ body {
 .chip__count { margin-left: 1px; }
 .chip[aria-checked="true"] .chip__count { background: var(--bg-active); border-color: transparent; color: var(--fg); }
 
+/* Session type filter (All · Code · Cowork): the segmented control at full width. */
+.sess-kinds { display: flex; }
+.sess-kinds .segmented__opt { flex: 1; justify-content: center; gap: 6px; }
+.segmented__count { font-size: 11px; opacity: 0.65; font-variant-numeric: tabular-nums; }
+
 .search {
   position: relative;
   display: flex;
@@ -986,6 +991,19 @@ body {
 .sess__meta .sep { color: var(--fg-subtle); flex: none; }
 .sess__time { flex: none; white-space: nowrap; }
 .sess__meta .badge { margin-left: auto; }
+
+/* Kind badge on session rows: the dot tells Code and Cowork sessions apart. */
+.badge--kind { gap: 5px; padding: 0 8px 0 7px; }
+.badge--kind::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--kind-dot, currentColor);
+  flex: none;
+}
+.badge--code { --kind-dot: var(--accent); }
+.badge--cowork { --kind-dot: var(--success); }
 
 .sess__actions {
   display: flex;
