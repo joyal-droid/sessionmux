@@ -38,7 +38,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       preview: ${{ steps.version.outputs.preview }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           # full history, so the tagged commit can be checked against its branch
@@ -123,7 +123,7 @@ jobs:
       # rustsec/audit-check reports the advisories it finds as a check run.
       checks: write
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
@@ -141,7 +141,7 @@ jobs:
       VERSION: ${{ needs.checks.outputs.version }}
       PREVIEW: ${{ needs.checks.outputs.preview }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
