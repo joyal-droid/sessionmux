@@ -1214,6 +1214,11 @@ impl Closer for Os {
 pub(crate) mod fake {
     use std::path::PathBuf;
     use std::process::Command;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Held by every stand-in while it exists: their windows compete for the front, so tests that
+    /// run stand-ins take turns.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
     const SOURCE: &str = include_str!("../../../tests/fixtures/macos/fakeclaude.c");
     /// The bundle id of the stand-in, so the system never mistakes it for the real Claude.
@@ -1226,6 +1231,7 @@ pub(crate) mod fake {
         pub(crate) root: PathBuf,
         pub(crate) bundle: PathBuf,
         _dir: tempfile::TempDir,
+        _turn: MutexGuard<'static, ()>,
     }
 
     fn plist() -> String {
@@ -1259,6 +1265,7 @@ pub(crate) mod fake {
         if !Command::new("cc").arg("--version").output().is_ok_and(|o| o.status.success()) {
             return Err("no C compiler (cc) on this machine".into());
         }
+        let turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
         let root = dir.path().canonicalize().map_err(|e| e.to_string())?;
         let bundle = root.join("Claude.app");
@@ -1277,7 +1284,7 @@ pub(crate) mod fake {
         if !out.status.success() {
             panic!("the stand-in Claude did not compile:\n{}", String::from_utf8_lossy(&out.stderr));
         }
-        Ok(FakeClaude { root, bundle, _dir: dir })
+        Ok(FakeClaude { root, bundle, _dir: dir, _turn: turn })
     }
 
     impl FakeClaude {
