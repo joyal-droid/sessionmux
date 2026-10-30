@@ -20,7 +20,8 @@
 // https://github.com/joyal-droid/sessionmux and the Sessionmux mark must stay visible in the user
 // interface of every copy and derivative; see docs/attribution.md.
 
-//! Code-tab session listing / transfer / deletion for Claude Desktop accounts.
+//! Code-tab session listing / transfer / deletion for Claude Desktop accounts. Cowork sessions
+//! are stored apart from Code sessions; see [`cowork`].
 //!
 //! Layout recap:
 //! ```text
@@ -37,7 +38,8 @@
 //! API:
 //! ```ignore
 //! impl Sessions {
-//!   pub fn list(&self, a:&SessionAccount) -> Vec<Session>
+//!   pub fn list(&self, a:&SessionAccount) -> Vec<Session>          // Code sessions only
+//!   pub fn list_all(&self, a:&SessionAccount) -> Vec<Session>      // Code and Cowork sessions
 //!   pub fn transfer(&self, from:&SessionAccount, to:&SessionAccount, session_id:&str, mode:&str) -> TransferResult
 //!   pub fn delete(&self, a:&SessionAccount, session_id:&str) -> Result<(), ApiError>
 //! }
@@ -61,6 +63,13 @@ use std::fmt;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+pub mod cowork;
+
+/// `Session.kind` of a Code-tab session.
+pub const KIND_CODE: &str = "code";
+/// `Session.kind` of a Cowork session.
+pub const KIND_COWORK: &str = "cowork";
 
 /// Extra reads of a session record that does not parse (it may be mid-write).
 const RECORD_READ_RETRIES: u32 = 5;
@@ -106,6 +115,12 @@ pub struct Session {
     pub running: bool,
     #[serde(rename = "hasTranscript")]
     pub has_transcript: bool,
+    /// [`KIND_CODE`] or [`KIND_COWORK`].
+    pub kind: &'static str,
+    /// The folder "Show folder" opens: the cwd of a Code session, the selected folder or the
+    /// outputs folder of a Cowork session.
+    #[serde(skip)]
+    pub folder: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -401,6 +416,24 @@ fn list_dirs(p: &Path) -> Vec<String> {
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect()
+}
+
+/// The most recently modified folder in `parent` (the first one when no time can be read).
+fn newest_dir(parent: &Path) -> Option<String> {
+    let dirs = list_dirs(parent);
+    let mut pick = dirs.first()?.clone();
+    if dirs.len() > 1 {
+        let mut best: Option<SystemTime> = None;
+        for d in &dirs {
+            if let Some(m) = std::fs::metadata(parent.join(d)).ok().and_then(|m| m.modified().ok()) {
+                if best.map(|b| m > b).unwrap_or(true) {
+                    best = Some(m);
+                    pick = d.clone();
+                }
+            }
+        }
+    }
+    Some(pick)
 }
 
 /// `path.resolve(p)`.
@@ -831,8 +864,20 @@ impl Sessions {
                 is_archived: rec.get("isArchived").map(OVal::truthy).unwrap_or(false),
                 completed_turns: OVal::js_number_or_zero(rec.get("completedTurns")).min(u64::from(u32::MAX)) as u32,
                 has_transcript,
+                kind: KIND_CODE,
+                folder: cwd.clone(),
                 cwd,
             });
+        }
+        out.sort_by_key(|x| std::cmp::Reverse(x.last_activity_at));
+        out
+    }
+
+    /// Code and Cowork sessions of an account, sorted by lastActivityAt desc.
+    pub fn list_all(&self, a: &SessionAccount) -> Vec<Session> {
+        let mut out = self.list(a);
+        if !a.data_dir.is_empty() {
+            out.extend(cowork::list(a));
         }
         out.sort_by_key(|x| std::cmp::Reverse(x.last_activity_at));
         out
@@ -924,22 +969,9 @@ impl Sessions {
             return Ok(TransferResult::fail(Some("target-never-opened-code"), None));
         };
         let to_acct_dir = to_dir.join("claude-code-sessions").join(&to_acct);
-        let orgs = list_dirs(&to_acct_dir);
-        if orgs.is_empty() {
+        let Some(to_org) = newest_dir(&to_acct_dir) else {
             return Ok(TransferResult::fail(Some("target-never-opened-code"), None));
-        }
-        let mut to_org = orgs[0].clone();
-        if orgs.len() > 1 {
-            let mut best: Option<std::time::SystemTime> = None;
-            for o in &orgs {
-                if let Some(m) = std::fs::metadata(to_acct_dir.join(o)).ok().and_then(|m| m.modified().ok()) {
-                    if best.map(|b| m > b).unwrap_or(true) {
-                        best = Some(m);
-                        to_org = o.clone();
-                    }
-                }
-            }
-        }
+        };
 
         // 3. New identity.
         let old_cli = record.get_str("cliSessionId").map(String::from);
@@ -1317,6 +1349,7 @@ mod tests {
             "completedTurns",
             "running",
             "hasTranscript",
+            "kind",
         ];
         want.sort();
         assert_eq!(k, want);

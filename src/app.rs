@@ -84,7 +84,8 @@ use crate::core::limits::{self, LimitHit, LimitKind, LimitSource, Limited};
 use crate::core::pipe::{self, Decision, Request, Responder, Server};
 use crate::core::relay::{self, Relay};
 use crate::core::sessions::{
-    pick_handover_target, valid_session_id, AccountView, SessionAccount, Sessions, TransferResult,
+    pick_handover_target, valid_session_id, AccountView, SessionAccount, Sessions, TransferResult, KIND_CODE,
+    KIND_COWORK,
 };
 use crate::platform::{
     self, Autostart, BubbleHost, Closer, Debugger, Desktop, EventLoop, Focus, FocusResult, ForwardError, GestureHost,
@@ -554,6 +555,7 @@ fn dispatch(req: &IpcRequest) -> Option<Value> {
     let id = req.id;
     let a0 = arg(req, 0).clone();
     let a1 = arg(req, 1).clone();
+    let a2 = arg(req, 2).clone();
     let name = req.name.as_str();
     let r: UResult<Option<Value>> = match name {
         "listAccounts" => {
@@ -587,8 +589,8 @@ fn dispatch(req: &IpcRequest) -> Option<Value> {
         "ignoreProfile" => state_call(|st| ignore_profile(st, &a0)).map(Some),
         "listSessions" => list_sessions(id, &a0).map(|_| None),
         "transferSession" => transfer_session(id, &a0).map(|_| None),
-        "deleteSession" => delete_session(id, &a0, &a1).map(|_| None),
-        "openSessionFolder" => open_session_folder(id, &a0, &a1).map(|_| None),
+        "deleteSession" => delete_session(id, &a0, &a1, &a2).map(|_| None),
+        "openSessionFolder" => open_session_folder(id, &a0, &a1, &a2).map(|_| None),
         "getSettings" => {
             return Some(
                 with_state(|st| {
@@ -1884,6 +1886,11 @@ fn check_session_id(v: &Value) -> UResult<String> {
     }
 }
 
+/// True when the panel names a Cowork session (`kind: "cowork"`); anything else is a Code session.
+fn is_cowork(kind: Option<&Value>) -> bool {
+    kind.and_then(Value::as_str) == Some(KIND_COWORK)
+}
+
 fn sessions_clone(st: &AppState) -> Sessions {
     Sessions { home: st.sessions.home.clone() }
 }
@@ -1893,7 +1900,7 @@ fn list_sessions(id: u64, acc_id: &Value) -> UResult<()> {
         let acc = find_account(st, acc_id)?;
         Ok((session_account(st, &acc)?, sessions_clone(st)))
     })?;
-    spawn_then(move || serde_json::to_value(sessions.list(&sa)).unwrap_or(json!([])), move |v| resolve(id, v));
+    spawn_then(move || serde_json::to_value(sessions.list_all(&sa)).unwrap_or(json!([])), move |v| resolve(id, v));
     Ok(())
 }
 
@@ -1902,6 +1909,9 @@ fn reason_text(reason: Option<&str>, to_name: &str) -> String {
         Some("running") => "This session is running. Stop it in Claude first.".into(),
         Some("target-never-opened-code") => {
             format!("{to_name} has never opened the Code tab. Open it there once, then try again.")
+        }
+        Some("target-never-opened") => {
+            format!("{to_name} has not used Code or Cowork yet. Open one of them there once, then try again.")
         }
         _ => "The session could not be transferred.".into(),
     }
@@ -1916,25 +1926,32 @@ fn transfer_session(id: u64, opts: &Value) -> UResult<()> {
         _ => return Err("Invalid transfer mode.".into()),
     };
     let session_id = check_session_id(opts.get("sessionId").unwrap_or(&Value::Null))?;
+    let cowork = is_cowork(opts.get("kind"));
     let from_id = opts.get("fromId").cloned().unwrap_or(Value::Null);
     let to_id = opts.get("toId").cloned().unwrap_or(Value::Null);
     if from_id == to_id {
         return Err("Pick a different account.".into());
     }
-    let (from_s, to_s, to_dir, to_name, sessions) = state_call_raw(|st| {
+    let (from_s, to_s, from_dir, to_dir, to_name, sessions) = state_call_raw(|st| {
         let from = find_account(st, &from_id)?;
         let to = find_account(st, &to_id)?;
         let fs = session_account(st, &from)?;
         let ts = session_account(st, &to)?;
-        Ok((fs, ts, proc_dir(&to), to.name.clone(), sessions_clone(st)))
+        Ok((fs, ts, proc_dir(&from), proc_dir(&to), to.name.clone(), sessions_clone(st)))
     })?;
     spawn_then(
         move || {
-            let mut to_s = to_s;
-            // The cached account list can be a poll behind; ask for the target's live state.
-            to_s.running =
-                claude_app::list_processes().iter().any(|p| claude_app::matches_data_dir(p, to_dir.as_deref()));
-            sessions.transfer(&from_s, &to_s, &session_id, &mode)
+            let (mut from_s, mut to_s) = (from_s, to_s);
+            // The cached account list can be a poll behind; ask for the live state.
+            let procs = claude_app::list_processes();
+            to_s.running = procs.iter().any(|p| claude_app::matches_data_dir(p, to_dir.as_deref()));
+            if cowork {
+                // Claude itself owns a Cowork session while it runs.
+                from_s.running = procs.iter().any(|p| claude_app::matches_data_dir(p, from_dir.as_deref()));
+                sessions.transfer_cowork(&from_s, &to_s, &session_id, &mode)
+            } else {
+                sessions.transfer(&from_s, &to_s, &session_id, &mode)
+            }
         },
         move |r| {
             with_state(request_poll);
@@ -1954,16 +1971,27 @@ fn transfer_session(id: u64, opts: &Value) -> UResult<()> {
     Ok(())
 }
 
-fn delete_session(id: u64, acc_id: &Value, session_id: &Value) -> UResult<()> {
+fn delete_session(id: u64, acc_id: &Value, session_id: &Value, kind: &Value) -> UResult<()> {
     let sid = check_session_id(session_id)?;
-    let (sa, sessions) = state_call_raw(|st| {
+    let cowork = is_cowork(Some(kind));
+    let (sa, dir, sessions) = state_call_raw(|st| {
         let acc = find_account(st, acc_id)?;
-        Ok((session_account(st, &acc)?, sessions_clone(st)))
+        Ok((session_account(st, &acc)?, proc_dir(&acc), sessions_clone(st)))
     })?;
     spawn_then(
-        move || match sessions.delete(&sa, &sid) {
-            Ok(()) => ok(),
-            Err(e) => api_fail(&e),
+        move || {
+            let r = if cowork {
+                let mut sa = sa;
+                sa.running =
+                    claude_app::list_processes().iter().any(|p| claude_app::matches_data_dir(p, dir.as_deref()));
+                sessions.delete_cowork(&sa, &sid)
+            } else {
+                sessions.delete(&sa, &sid)
+            };
+            match r {
+                Ok(()) => ok(),
+                Err(e) => api_fail(&e),
+            }
         },
         move |v| {
             with_state(request_poll);
@@ -1973,25 +2001,27 @@ fn delete_session(id: u64, acc_id: &Value, session_id: &Value) -> UResult<()> {
     Ok(())
 }
 
-fn open_session_folder(id: u64, acc_id: &Value, session_id: &Value) -> UResult<()> {
+fn open_session_folder(id: u64, acc_id: &Value, session_id: &Value, kind: &Value) -> UResult<()> {
     let sid = check_session_id(session_id)?;
+    let want = if is_cowork(Some(kind)) { KIND_COWORK } else { KIND_CODE };
     let (sa, sessions) = state_call_raw(|st| {
         let acc = find_account(st, acc_id)?;
         Ok((session_account(st, &acc)?, sessions_clone(st)))
     })?;
     spawn_then(
         move || {
-            let list = sessions.list(&sa);
-            let Some(s) = list.iter().find(|s| s.session_id == sid).filter(|s| !s.cwd.is_empty()) else {
+            let list = sessions.list_all(&sa);
+            let found = list.iter().find(|s| s.session_id == sid && s.kind == want);
+            let Some(s) = found.filter(|s| !s.folder.is_empty()) else {
                 return fail("Session folder not found.");
             };
-            if !Path::new(&s.cwd).exists() {
+            if !Path::new(&s.folder).exists() {
                 return fail("That folder no longer exists.");
             }
             if is_smoke() {
                 return ok();
             }
-            logged(<Os as Shell>::reveal(Path::new(&s.cwd)));
+            logged(<Os as Shell>::reveal(Path::new(&s.folder)));
             ok()
         },
         move |v| resolve(id, v),
